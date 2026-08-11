@@ -29,12 +29,15 @@ Download the DMG or zip from [the macdraw site](https://github.com/aadityakumars
 ```bash
 git clone https://github.com/aadityakumarsah/macdraw.git
 cd macdraw
-bash build.sh          # builds build/macdraw.app (ad-hoc signed)
-bash dist.sh           # also packages DMG + zip into dist/
+bash scripts/make_signing_identity.sh   # one-time: creates the self-signed signing cert
+bash build.sh          # builds build/macdraw.app
+bash dist.sh           # signs it + packages DMG & zip into dist/
 open build/macdraw.app
 ```
 
-Requires Xcode Command Line Tools (`xcode-select --install`) on macOS 13+.
+Requires Xcode Command Line Tools (`xcode-select --install`) on macOS 13+ and Homebrew OpenSSL 3 for the signing identity (`brew install openssl@3`).
+
+> **Why self-signed?** macOS 15+ refuses to run unsigned apps, and ad-hoc signed apps show a scary "damaged — move to bin" dialog after download. A self-signed signature is cryptographically valid but not Apple-trusted, so Gatekeeper shows the standard "unidentified developer" prompt instead — right-click → Open (once) and it runs. No Apple Developer account needed.
 
 ## Usage
 

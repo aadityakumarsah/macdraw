@@ -10,6 +10,15 @@ VERSION="1.0"
 echo "== building app =="
 ./build.sh
 
+echo "== signing with self-signed cert =="
+# Ad-hoc signed apps downloaded from the internet get flagged "damaged" by
+# Gatekeeper, and unsigned apps won't run at all on macOS 15+. A self-signed
+# code-signing identity (created once via scripts/make_signing_identity.sh)
+# gives a valid signature: Gatekeeper shows the standard "unidentified
+# developer" prompt, which right-click -> Open accepts.
+codesign --force --sign "macdraw-local-signing" build/macdraw.app
+codesign --verify --deep --strict build/macdraw.app && echo "signature OK"
+
 echo "== packaging =="
 rm -rf dist build/staging
 mkdir -p dist build/staging
