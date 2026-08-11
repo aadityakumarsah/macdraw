@@ -1,0 +1,174 @@
+import AppKit
+import Combine
+
+enum ShapeKind: String {
+    case rect
+    case diamond
+    case ellipse
+    case line
+    case arrow
+    case freedraw
+    case autoshape
+    case frame
+    case laser
+    case text
+    case image
+}
+
+enum Tool: String, CaseIterable {
+    case selection
+    case hand
+    case rectangle
+    case diamond
+    case ellipse
+    case arrow
+    case line
+    case freedraw
+    case text
+    case image
+    case eraser
+    case frame
+    case embeddable
+    case autoshape
+    case lasso
+    case laser
+    case bucketFill
+
+    var iconName: String {
+        switch self {
+        case .selection: return "selection"
+        case .hand: return "hand"
+        case .rectangle: return "rectangle"
+        case .diamond: return "diamond"
+        case .ellipse: return "ellipse"
+        case .arrow: return "arrow"
+        case .line: return "line"
+        case .freedraw: return "freedraw"
+        case .text: return "text"
+        case .image: return "image"
+        case .eraser: return "eraser"
+        case .frame: return "frame"
+        case .embeddable: return "embeddable"
+        case .autoshape: return "autoshape"
+        case .lasso: return "lasso"
+        case .laser: return "laser"
+        case .bucketFill: return "bucket-fill"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .selection: return "Select"
+        case .hand: return "Pan"
+        case .rectangle: return "Rectangle"
+        case .diamond: return "Diamond"
+        case .ellipse: return "Ellipse"
+        case .arrow: return "Arrow"
+        case .line: return "Line"
+        case .freedraw: return "Sketch"
+        case .text: return "Text"
+        case .image: return "Image"
+        case .eraser: return "Eraser"
+        case .frame: return "Frame"
+        case .embeddable: return "Embed"
+        case .autoshape: return "Magic shape"
+        case .lasso: return "Lasso"
+        case .laser: return "Laser"
+        case .bucketFill: return "Fill"
+        }
+    }
+
+    var shapeKind: ShapeKind? {
+        switch self {
+        case .rectangle: return .rect
+        case .diamond: return .diamond
+        case .ellipse: return .ellipse
+        case .arrow: return .arrow
+        case .line: return .line
+        case .freedraw: return .freedraw
+        case .autoshape: return .autoshape
+        case .frame, .embeddable: return .frame
+        case .laser: return .laser
+        default: return nil
+        }
+    }
+}
+
+struct Annotation {
+    var kind: ShapeKind
+    var rect: CGRect = .zero
+    var strokeColor: NSColor = Palette.black
+    var fillColor: NSColor?
+    var strokeWidth: CGFloat = 2
+    var points: [CGPoint] = []
+    var pointTimes: [Date] = []
+    var text: String = ""
+    var fontFamily: String = "Virgil"
+    var fontSize: CGFloat = 24
+    var image: NSImage?
+    var rounded: Bool = false
+    var dashed: Bool = false
+    var rotation: CGFloat = 0
+    var createdAt: Date = Date()
+}
+
+/// Solid backdrop behind the drawing — lets the user write on a clean
+/// white/black screen instead of whatever is behind the overlay.
+enum CanvasBackground: String {
+    case clear
+    case white
+    case black
+}
+
+final class CanvasState: ObservableObject {
+    @Published var tool: Tool = .rectangle
+    @Published var strokeColor: NSColor = Palette.black
+    @Published var fillColor: NSColor = Palette.red[1]
+    @Published var fillEnabled: Bool = false
+    @Published var strokeWidth: CGFloat = 3
+    @Published var fontFamily: String = "Virgil"
+    @Published var fontSize: CGFloat = 28
+    @Published var canvasBackground: CanvasBackground = .clear
+
+    /// When false (default), clicks on the canvas pass through to your other
+    /// apps. When true, the canvas captures mouse events for drawing.
+    @Published var drawingMode: Bool = false
+
+    /// The tool that was active before text mode — restored when the user
+    /// presses Esc to exit text editing.
+    var lastNonTextTool: Tool = .selection
+}
+
+struct ShortcutInfo {
+    let key: String
+    let tool: Tool
+}
+
+enum Shortcuts {
+    static let all: [ShortcutInfo] = [
+        ShortcutInfo(key: "v", tool: .selection),
+        ShortcutInfo(key: "h", tool: .hand),
+        ShortcutInfo(key: "r", tool: .rectangle),
+        ShortcutInfo(key: "y", tool: .diamond),
+        ShortcutInfo(key: "o", tool: .ellipse),
+        ShortcutInfo(key: "a", tool: .arrow),
+        ShortcutInfo(key: "l", tool: .line),
+        ShortcutInfo(key: "d", tool: .freedraw),
+        ShortcutInfo(key: "t", tool: .text),
+        ShortcutInfo(key: "i", tool: .image),
+        ShortcutInfo(key: "e", tool: .eraser),
+        ShortcutInfo(key: "f", tool: .frame),
+        ShortcutInfo(key: "g", tool: .autoshape),
+        ShortcutInfo(key: "s", tool: .lasso),
+        ShortcutInfo(key: "z", tool: .laser),
+        ShortcutInfo(key: "b", tool: .bucketFill),
+    ]
+
+    static func tool(for key: String) -> Tool? {
+        all.first { $0.key == key }?.tool
+    }
+
+    static func key(for tool: Tool) -> String? {
+        all.first { $0.tool == tool }?.key
+    }
+}
