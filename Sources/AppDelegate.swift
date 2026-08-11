@@ -19,6 +19,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey.start()
 
         setupStatusItem()
+
+        // First launch: open the overlay so it's obvious the app is running
+        // (macdraw is a background agent — no Dock icon, and otherwise users
+        // see nothing and think the launch failed).
+        let defaults = UserDefaults.standard
+        if !defaults.bool(forKey: "macdrawHasLaunchedBefore") {
+            defaults.set(true, forKey: "macdrawHasLaunchedBefore")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.island.show()
+            }
+        }
     }
 
     private func setupStatusItem() {
