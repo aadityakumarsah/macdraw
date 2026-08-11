@@ -25,6 +25,7 @@ mkdir -p dist build/staging
 
 rsync -a build/macdraw.app build/staging/
 ln -s /Applications build/staging/Applications
+cp "Resources/How to open macdraw.rtf" build/staging/
 
 echo "-- DMG --"
 hdiutil create -volname "macdraw $VERSION" \
