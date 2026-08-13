@@ -491,6 +491,16 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             case .freedraw, .laser, .autoshape:
                 c.points.append(adjustedP)
                 c.pointTimes.append(Date())
+                // Apply pressure sensitivity for freedraw (trackpad signature support)
+                if c.kind == .freedraw {
+                    let pressure = CGFloat(event.pressure)
+                    let baseWidth = state.strokeWidth
+                    // Scale stroke width based on pressure (0.5x to 1.5x)
+                    let minScale: CGFloat = 0.5
+                    let maxScale: CGFloat = 1.5
+                    let pressureScale = minScale + (maxScale - minScale) * pressure
+                    c.strokeWidth = baseWidth * pressureScale
+                }
             default:
                 break
             }
@@ -627,8 +637,15 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             c.rect = normalizedRect(from: c.points.first ?? dragStart, to: c.points.last ?? dragStart)
             guard distance(c.points.first ?? .zero, c.points.last ?? .zero) > 2 else { return }
         case .freedraw:
+            // Trackpad signature support: smooth the points for better handwriting
+            c.points = smooth(c.points)
             c.rect = boundingRect(of: c.points)
             guard c.points.count > 1 else { return }
+            // Auto-fill if shape is closed and fill mode is enabled
+            if state.fillEnabled && isClosedShape(c.points) {
+                c.fillColor = state.fillColor
+                c.fillOpacity = state.fillOpacity
+            }
         case .autoshape:
             guard c.points.count > 2 else { return }
             c.points = smooth(c.points)
@@ -1635,5 +1652,32 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             out = next
         }
         return out
+    }
+
+    /// Detects if a shape is closed (initial point meets final point or completes a boundary)
+    private func isClosedShape(_ pts: [CGPoint]) -> Bool {
+        guard pts.count >= 3 else { return false }
+        
+        let first = pts.first!
+        let last = pts.last!
+        
+        // Check if the first and last points are close enough
+        let threshold: CGFloat = 20.0
+        let distance = sqrt(pow(first.x - last.x, 2) + pow(first.y - last.y, 2))
+        
+        if distance < threshold {
+            return true
+        }
+        
+        // Additional check: if the shape forms a closed loop by checking if any point
+        // is close to the first point (meaning it completed a boundary)
+        for i in 1..<(pts.count - 1) {
+            let checkDistance = sqrt(pow(first.x - pts[i].x, 2) + pow(first.y - pts[i].y, 2))
+            if checkDistance < threshold {
+                return true
+            }
+        }
+        
+        return false
     }
 }

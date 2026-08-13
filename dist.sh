@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 # Builds a shareable release: ad-hoc signed .app, then packages it as a
 # drag-to-Applications DMG and a plain zip (for GitHub Releases etc).
 
-VERSION="1.0"
+VERSION="1.3"
 
 echo "== building app =="
 ./build.sh
