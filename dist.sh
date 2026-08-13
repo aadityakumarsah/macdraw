@@ -16,7 +16,7 @@ echo "== signing with self-signed cert =="
 # code-signing identity (created once via scripts/make_signing_identity.sh)
 # gives a valid signature: Gatekeeper shows the standard "unidentified
 # developer" prompt, which right-click -> Open accepts.
-codesign --force --sign "macdraw-local-signing" build/macdraw.app
+codesign --force --deep --sign "macdraw-local-signing" build/macdraw.app || codesign --force --deep --sign - build/macdraw.app
 codesign --verify --deep --strict build/macdraw.app && echo "signature OK"
 
 echo "== packaging =="

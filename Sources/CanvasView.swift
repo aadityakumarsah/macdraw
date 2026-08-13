@@ -24,6 +24,7 @@ private struct PersistedAnnotation: Codable {
     var x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
     var stroke: [CGFloat]
     var fill: [CGFloat]?
+    var fillOpacity: CGFloat
     var strokeWidth: CGFloat
     var points: [[CGFloat]]
     var text: String
@@ -34,6 +35,8 @@ private struct PersistedAnnotation: Codable {
     var dashed: Bool
     var rotation: CGFloat
     var createdAt: Date
+    var locked: Bool
+    var zIndex: Int
 }
 
 private func colorComponents(_ c: NSColor) -> [CGFloat] {
@@ -65,6 +68,7 @@ private extension Annotation {
             x: rect.minX, y: rect.minY, w: rect.width, h: rect.height,
             stroke: colorComponents(strokeColor),
             fill: fillColor.map { colorComponents($0) },
+            fillOpacity: fillOpacity,
             strokeWidth: strokeWidth,
             points: points.map { [$0.x, $0.y] },
             text: text,
@@ -74,16 +78,30 @@ private extension Annotation {
             rounded: rounded,
             dashed: dashed,
             rotation: rotation,
-            createdAt: createdAt
+            createdAt: createdAt,
+            locked: locked,
+            zIndex: zIndex
         )
     }
 
     static func restored(from p: PersistedAnnotation) -> Annotation {
-        Annotation(
+        var fillColor: NSColor?
+        if let fill = p.fill {
+            fillColor = color(fromComponents: fill)
+            // Apply opacity to the fill color
+            if let color = fillColor {
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
+                color.getRed(&r, green: &g, blue: &b, alpha: &a)
+                fillColor = NSColor(calibratedRed: r, green: g, blue: b, alpha: a * p.fillOpacity)
+            }
+        }
+        
+        return Annotation(
             kind: ShapeKind(rawValue: p.kind) ?? .rect,
             rect: CGRect(x: p.x, y: p.y, width: p.w, height: p.h),
             strokeColor: color(fromComponents: p.stroke),
-            fillColor: p.fill.map { color(fromComponents: $0) },
+            fillColor: fillColor,
+            fillOpacity: p.fillOpacity,
             strokeWidth: p.strokeWidth,
             points: p.points.compactMap { pt in
                 pt.count >= 2 ? CGPoint(x: pt[0], y: pt[1]) : nil
@@ -95,7 +113,9 @@ private extension Annotation {
             rounded: p.rounded,
             dashed: p.dashed,
             rotation: p.rotation,
-            createdAt: p.createdAt
+            createdAt: p.createdAt,
+            locked: p.locked,
+            zIndex: p.zIndex
         )
     }
 }
@@ -384,6 +404,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 pushUndo()
                 if state.fillEnabled {
                     annotations[i].fillColor = state.fillColor
+                    annotations[i].fillOpacity = state.fillOpacity
                 } else {
                     annotations[i].fillColor = nil
                 }
@@ -414,6 +435,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 rect: CGRect(origin: adjustedP, size: .zero),
                 strokeColor: state.strokeColor,
                 fillColor: state.fillEnabled ? state.fillColor : nil,
+                fillOpacity: state.fillOpacity,
                 strokeWidth: state.strokeWidth,
                 points: [adjustedP],
                 pointTimes: [Date()],
@@ -526,15 +548,35 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         } else if event.keyCode == 51 { // delete
             if !selected.isEmpty {
                 pushUndo()
-                for i in selected.sorted(by: >) {
+                // Don't delete locked annotations
+                let deletable = selected.filter { !annotations[$0].locked }
+                for i in deletable.sorted(by: >) {
                     annotations.remove(at: i)
                 }
-                selected = []
+                selected = Set(deletable)
                 needsDisplay = true
             }
         } else if event.modifierFlags.contains(.command),
                   event.charactersIgnoringModifiers?.lowercased() == "a" {
             selectAll()
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "l" {
+            // Lock/unlock selected annotations
+            for i in selected {
+                if annotations.indices.contains(i) {
+                    annotations[i].locked.toggle()
+                }
+            }
+            needsDisplay = true
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "f" {
+            // Bring to front
+            bringToFront()
+        } else if event.modifierFlags.contains(.command),
+                  event.modifierFlags.contains(.shift),
+                  event.charactersIgnoringModifiers?.lowercased() == "f" {
+            // Send to back
+            sendToBack()
         } else {
             super.keyDown(with: event)
         }
@@ -545,6 +587,30 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     func selectAll() {
         guard !annotations.isEmpty else { return }
         selected = Set(annotations.indices.filter { annotations[$0].kind != .laser })
+        needsDisplay = true
+    }
+
+    /// Brings selected annotations to the front (highest z-index)
+    func bringToFront() {
+        guard !selected.isEmpty else { return }
+        let maxZ = annotations.map { $0.zIndex }.max() ?? 0
+        for i in selected {
+            if annotations.indices.contains(i) {
+                annotations[i].zIndex = maxZ + 1
+            }
+        }
+        needsDisplay = true
+    }
+
+    /// Sends selected annotations to the back (lowest z-index)
+    func sendToBack() {
+        guard !selected.isEmpty else { return }
+        let minZ = annotations.map { $0.zIndex }.min() ?? 0
+        for i in selected {
+            if annotations.indices.contains(i) {
+                annotations[i].zIndex = max(0, minZ - 1)
+            }
+        }
         needsDisplay = true
     }
 
@@ -693,6 +759,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             updated.text = str
             updated.fontFamily = family
             updated.fontSize = size
+            updated.fillOpacity = state.fillOpacity
             annotations[idx] = updated
             needsDisplay = true
             return idx
@@ -701,9 +768,21 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             kind: .text,
             rect: r,
             strokeColor: state.strokeColor,
+            fillColor: nil,
+            fillOpacity: state.fillOpacity,
+            strokeWidth: 2,
+            points: [],
+            pointTimes: [],
             text: str,
             fontFamily: family,
-            fontSize: size
+            fontSize: size,
+            image: nil,
+            rounded: false,
+            dashed: false,
+            rotation: 0,
+            createdAt: Date(),
+            locked: false,
+            zIndex: 0
         ))
         needsDisplay = true
         return annotations.count - 1
@@ -731,9 +810,21 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 height: max(bounds.height, 24)
             ),
             strokeColor: .black,
+            fillColor: nil,
+            fillOpacity: state.fillOpacity,
+            strokeWidth: 2,
+            points: [],
+            pointTimes: [],
             text: emoji,
             fontFamily: "System",
-            fontSize: size
+            fontSize: size,
+            image: nil,
+            rounded: false,
+            dashed: false,
+            rotation: 0,
+            createdAt: Date(),
+            locked: false,
+            zIndex: 0
         ))
         selected = [annotations.count - 1]
         needsDisplay = true
@@ -769,7 +860,22 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 self.annotations.append(Annotation(
                     kind: .image,
                     rect: CGRect(origin: adjustedPoint, size: s),
-                    image: img
+                    strokeColor: .black,
+                    fillColor: nil,
+                    fillOpacity: state.fillOpacity,
+                    strokeWidth: 2,
+                    points: [],
+                    pointTimes: [],
+                    text: "",
+                    fontFamily: "Virgil",
+                    fontSize: 24,
+                    image: img,
+                    rounded: false,
+                    dashed: false,
+                    rotation: 0,
+                    createdAt: Date(),
+                    locked: false,
+                    zIndex: 0
                 ))
                 self.needsDisplay = true
             }
@@ -791,7 +897,22 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 self.annotations.append(Annotation(
                     kind: .image,
                     rect: CGRect(origin: adjustedPoint, size: s),
-                    image: img
+                    strokeColor: .black,
+                    fillColor: nil,
+                    fillOpacity: state.fillOpacity,
+                    strokeWidth: 2,
+                    points: [],
+                    pointTimes: [],
+                    text: "",
+                    fontFamily: "Virgil",
+                    fontSize: 24,
+                    image: img,
+                    rounded: false,
+                    dashed: false,
+                    rotation: 0,
+                    createdAt: Date(),
+                    locked: false,
+                    zIndex: 0
                 ))
                 self.needsDisplay = true
             }
@@ -932,7 +1053,9 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         t.translateX(by: canvasOffset.x, yBy: canvasOffset.y)
         t.concat()
 
-        for (i, a) in annotations.enumerated() {
+        // Sort annotations by z-index for proper layering
+        let sortedAnnotations = annotations.enumerated().sorted { $0.element.zIndex < $1.element.zIndex }
+        for (i, a) in sortedAnnotations {
             draw(annotation: a, index: i)
         }
 
@@ -977,7 +1100,11 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         default:
             let path = bezierPath(for: a)
             if let fill = a.fillColor, isClosed(a.kind) {
-                fill.setFill()
+                // Apply fill opacity
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a_comp: CGFloat = 1
+                fill.getRed(&r, green: &g, blue: &b, alpha: &a_comp)
+                let colorWithOpacity = NSColor(calibratedRed: r, green: g, blue: b, alpha: a_comp * a.fillOpacity)
+                colorWithOpacity.setFill()
                 path.fill()
             }
             a.strokeColor.setStroke()

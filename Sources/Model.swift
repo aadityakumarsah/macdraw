@@ -99,6 +99,7 @@ struct Annotation {
     var rect: CGRect = .zero
     var strokeColor: NSColor = Palette.black
     var fillColor: NSColor?
+    var fillOpacity: CGFloat = 1.0
     var strokeWidth: CGFloat = 2
     var points: [CGPoint] = []
     var pointTimes: [Date] = []
@@ -110,6 +111,8 @@ struct Annotation {
     var dashed: Bool = false
     var rotation: CGFloat = 0
     var createdAt: Date = Date()
+    var locked: Bool = false
+    var zIndex: Int = 0
 }
 
 /// Solid backdrop behind the drawing — lets the user write on a clean
@@ -125,6 +128,7 @@ final class CanvasState: ObservableObject {
     @Published var strokeColor: NSColor = Palette.black
     @Published var fillColor: NSColor = Palette.red[1]
     @Published var fillEnabled: Bool = false
+    @Published var fillOpacity: CGFloat = 0.3
     @Published var strokeWidth: CGFloat = 3
     @Published var fontFamily: String = "Virgil"
     @Published var fontSize: CGFloat = 28

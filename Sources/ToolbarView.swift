@@ -184,6 +184,11 @@ struct ToolbarView: View {
             quickPicks
             Divider().frame(height: 24)
             fillToggle
+            if state.fillEnabled {
+                Slider(value: $state.fillOpacity, in: 0.1...1.0, step: 0.1)
+                    .frame(width: 60)
+                    .help("Fill opacity")
+            }
             Slider(value: $state.strokeWidth, in: 1...16, step: 1)
                 .frame(width: 70)
                 .help("Stroke width")
