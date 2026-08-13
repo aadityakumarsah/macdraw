@@ -222,6 +222,14 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 self.editingFontFamily = family
             }
             .store(in: &cancellables)
+        // Live color updates while a text field is open
+        state.$strokeColor
+            .dropFirst()
+            .sink { [weak self] color in
+                guard let self, let field = self.editingField else { return }
+                field.textColor = color
+            }
+            .store(in: &cancellables)
         state.$canvasBackground
             .dropFirst()
             .sink { [weak self] _ in
@@ -276,20 +284,22 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         // In pass-through mode the cursor belongs to the apps below.
         guard state.drawingMode else { return }
         let p = convert(event.locationInWindow, from: nil)
+        // Adjust for canvas offset in hit testing
+        let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
         switch state.tool {
         case .selection:
             if let sel = selected.first, sel < annotations.count {
                 let a = annotations[sel]
-                if let h = handle(at: p, for: a) {
+                if let h = handle(at: adjustedP, for: a) {
                     setResizeCursor(for: h, annotation: a)
-                } else if rotateHandle(at: p, for: a) {
+                } else if rotateHandle(at: adjustedP, for: a) {
                     NSCursor.arrow.set()
-                } else if hitIndex(p) != nil {
+                } else if hitIndex(adjustedP) != nil {
                     NSCursor.openHand.set()
                 } else {
                     NSCursor.arrow.set()
                 }
-            } else if hitIndex(p) != nil {
+            } else if hitIndex(adjustedP) != nil {
                 NSCursor.openHand.set()
             } else {
                 NSCursor.arrow.set()
@@ -318,33 +328,35 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         let p = convert(event.locationInWindow, from: nil)
         switch state.tool {
         case .selection:
-            dragStart = p
-            if event.clickCount >= 2, let i = hitIndex(p), annotations[i].kind == .text {
+            // Adjust for canvas offset in selection tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            dragStart = adjustedP
+            if event.clickCount >= 2, let i = hitIndex(adjustedP), annotations[i].kind == .text {
                 // Double-click an existing text to re-edit it.
                 selected = [i]
-                beginTextEditing(at: p, editingIndex: i)
+                beginTextEditing(at: adjustedP, editingIndex: i)
                 return
             }
             if let sel = selected.first, sel < annotations.count {
                 let a = annotations[sel]
-                if rotateHandle(at: p, for: a) {
+                if rotateHandle(at: adjustedP, for: a) {
                     rotateIndex = sel
-                    rotateStartPoint = p
+                    rotateStartPoint = adjustedP
                     rotateBaseRotation = a.rotation
                     movingOriginals = [:]
-                } else if let h = handle(at: p, for: a) {
+                } else if let h = handle(at: adjustedP, for: a) {
                     // Dragging a handle of the currently selected shape resizes it.
                     resizeIndex = sel
                     resizeHandle = h
                     resizeOriginal = annotations[sel]
                     movingOriginals = [:]
-                } else if let i = hitIndex(p) {
+                } else if let i = hitIndex(adjustedP) {
                     selected = [i]
                     movingOriginals = [i: annotations[i]]
                 } else {
                     selected = []
                 }
-            } else if let i = hitIndex(p) {
+            } else if let i = hitIndex(adjustedP) {
                 selected = [i]
                 movingOriginals = [i: annotations[i]]
             } else {
@@ -355,14 +367,20 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             dragStart = p
             dragOriginOffset = canvasOffset
         case .lasso:
-            dragStart = p
-            lassoPoly = [p]
+            // Adjust for canvas offset in lasso tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            dragStart = adjustedP
+            lassoPoly = [adjustedP]
         case .eraser:
             pushUndo()
-            eraseStroke = [p]
-            erase(at: p)
+            // Adjust for canvas offset in eraser tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            eraseStroke = [adjustedP]
+            erase(at: adjustedP)
         case .bucketFill:
-            if let i = hitIndex(p) {
+            // Adjust for canvas offset in bucket fill tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            if let i = hitIndex(adjustedP) {
                 pushUndo()
                 if state.fillEnabled {
                     annotations[i].fillColor = state.fillColor
@@ -375,24 +393,29 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         case .text:
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKey()
-            if let i = hitIndex(p), annotations[i].kind == .text {
+            // Adjust for canvas offset when hitting text
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            if let i = hitIndex(adjustedP), annotations[i].kind == .text {
                 // Clicking an existing text edits it instead of creating a new one.
-                beginTextEditing(at: p, editingIndex: i)
+                beginTextEditing(at: adjustedP, editingIndex: i)
             } else {
-                beginTextEditing(at: p)
+                beginTextEditing(at: adjustedP)
             }
         case .image:
+            // Image tool needs the raw window point (will be converted in pickImage)
             pickImage(at: p)
         default:
-            dragStart = p
+            // Adjust coordinates by canvas offset to ensure drawing works correctly after panning
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            dragStart = adjustedP
             let kind = state.tool.shapeKind ?? .rect
             current = Annotation(
                 kind: kind,
-                rect: CGRect(origin: p, size: .zero),
+                rect: CGRect(origin: adjustedP, size: .zero),
                 strokeColor: state.strokeColor,
                 fillColor: state.fillEnabled ? state.fillColor : nil,
                 strokeWidth: state.strokeWidth,
-                points: [p],
+                points: [adjustedP],
                 pointTimes: [Date()],
                 rounded: state.tool == .embeddable,
                 dashed: state.tool == .frame
@@ -404,16 +427,18 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         let p = convert(event.locationInWindow, from: nil)
         switch state.tool {
         case .selection:
+            // Adjust for canvas offset in selection tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
             if let i = rotateIndex {
                 let a = annotations[i]
                 let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
                 let startAngle = atan2(rotateStartPoint.y - center.y, rotateStartPoint.x - center.x)
-                let currentAngle = atan2(p.y - center.y, p.x - center.x)
+                let currentAngle = atan2(adjustedP.y - center.y, adjustedP.x - center.x)
                 annotations[i].rotation = rotateBaseRotation + (currentAngle - startAngle)
             } else if let i = resizeIndex, let h = resizeHandle, let orig = resizeOriginal {
-                annotations[i] = resizedAnnotation(orig, handle: h, p: p)
+                annotations[i] = resizedAnnotation(orig, handle: h, p: adjustedP)
             } else if !movingOriginals.isEmpty {
-                let delta = p - dragStart
+                let delta = adjustedP - dragStart
                 for (i, orig) in movingOriginals {
                     annotations[i].rect.origin = orig.rect.origin + delta
                     annotations[i].points = orig.points.map { $0 + delta }
@@ -422,21 +447,27 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         case .hand:
             canvasOffset = dragOriginOffset + (p - dragStart)
         case .lasso:
-            lassoPoly.append(p)
+            // Adjust for canvas offset in lasso tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            lassoPoly.append(adjustedP)
         case .eraser:
-            eraseStroke.append(p)
-            erase(at: p)
+            // Adjust for canvas offset in eraser tool
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            eraseStroke.append(adjustedP)
+            erase(at: adjustedP)
         case .text:
             break
         default:
             guard var c = current else { return }
+            // Adjust point by canvas offset for drawing tools
+            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
             switch c.kind {
             case .rect, .diamond, .ellipse, .frame:
-                c.rect = normalizedRect(from: dragStart, to: p)
+                c.rect = normalizedRect(from: dragStart, to: adjustedP)
             case .arrow, .line:
-                c.points = [dragStart, p]
+                c.points = [dragStart, adjustedP]
             case .freedraw, .laser, .autoshape:
-                c.points.append(p)
+                c.points.append(adjustedP)
                 c.pointTimes.append(Date())
             default:
                 break
@@ -448,21 +479,23 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        // Adjust point by canvas offset for consistency
+        let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
         switch state.tool {
         case .selection:
             if rotateIndex != nil {
-                if distance(dragStart, p) > 1 {
+                if distance(dragStart, adjustedP) > 1 {
                     pushUndo()
                 }
                 rotateIndex = nil
             } else if resizeIndex != nil {
-                if distance(dragStart, p) > 1 {
+                if distance(dragStart, adjustedP) > 1 {
                     pushUndo()
                 }
                 resizeIndex = nil
                 resizeHandle = nil
                 resizeOriginal = nil
-            } else if !movingOriginals.isEmpty, distance(dragStart, p) > 1 {
+            } else if !movingOriginals.isEmpty, distance(dragStart, adjustedP) > 1 {
                 pushUndo()
             }
             movingOriginals = [:]
@@ -482,12 +515,11 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Esc — end text editing, or clear the selection
+        if event.keyCode == 53 { // Esc — end text editing, or switch to selection tool
             if isEditingText {
                 commitPendingText(selectAndPick: true)
             } else {
-                // Give free edit mode: hand cursor over anything, move/resize/rotate.
-                selected = []
+                // Switch to selection tool without clearing selection
                 state.tool = .selection
                 needsDisplay = true
             }
@@ -679,6 +711,8 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
     /// Inserts an emoji "logo" at the given canvas point (used by the "/" palette).
     func insertEmoji(_ emoji: String, at p: CGPoint) {
+        // Adjust for canvas offset
+        let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
         let size: CGFloat = 48
         let font = NSFont.systemFont(ofSize: size)
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
@@ -691,8 +725,8 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         annotations.append(Annotation(
             kind: .text,
             rect: CGRect(
-                x: p.x - bounds.width / 2,
-                y: p.y - bounds.height / 2,
+                x: adjustedP.x - bounds.width / 2,
+                y: adjustedP.y - bounds.height / 2,
                 width: max(bounds.width, 24),
                 height: max(bounds.height, 24)
             ),
@@ -706,25 +740,61 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     }
 
     private func pickImage(at p: CGPoint) {
+        // Store the window point for later conversion
+        let windowPoint = p
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]
         panel.allowsMultipleSelection = false
-        panel.begin { [weak self] response in
-            guard let self, response == .OK, let url = panel.url,
-                  let img = NSImage(contentsOf: url) else { return }
-            let maxW: CGFloat = 360
-            var s = img.size
-            if s.width > maxW {
-                let k = maxW / s.width
-                s = CGSize(width: maxW, height: s.height * k)
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.canCreateDirectories = false
+        panel.title = "Choose Image"
+        panel.prompt = "Choose"
+        
+        // Run as modal sheet on the main window
+        if let window = self.window {
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard let self, response == .OK, let url = panel.url,
+                      let img = NSImage(contentsOf: url) else { return }
+                let maxW: CGFloat = 360
+                var s = img.size
+                if s.width > maxW {
+                    let k = maxW / s.width
+                    s = CGSize(width: maxW, height: s.height * k)
+                }
+                // Convert window point to canvas coordinates at placement time
+                let canvasPoint = self.convert(windowPoint, from: nil)
+                let adjustedPoint = CGPoint(x: canvasPoint.x - self.canvasOffset.x, y: canvasPoint.y - self.canvasOffset.y)
+                self.pushUndo()
+                self.annotations.append(Annotation(
+                    kind: .image,
+                    rect: CGRect(origin: adjustedPoint, size: s),
+                    image: img
+                ))
+                self.needsDisplay = true
             }
-            self.pushUndo()
-            self.annotations.append(Annotation(
-                kind: .image,
-                rect: CGRect(origin: p, size: s),
-                image: img
-            ))
-            self.needsDisplay = true
+        } else {
+            // Fallback to non-sheet if no window
+            panel.begin { [weak self] response in
+                guard let self, response == .OK, let url = panel.url,
+                      let img = NSImage(contentsOf: url) else { return }
+                let maxW: CGFloat = 360
+                var s = img.size
+                if s.width > maxW {
+                    let k = maxW / s.width
+                    s = CGSize(width: maxW, height: s.height * k)
+                }
+                // Convert window point to canvas coordinates at placement time
+                let canvasPoint = self.convert(windowPoint, from: nil)
+                let adjustedPoint = CGPoint(x: canvasPoint.x - self.canvasOffset.x, y: canvasPoint.y - self.canvasOffset.y)
+                self.pushUndo()
+                self.annotations.append(Annotation(
+                    kind: .image,
+                    rect: CGRect(origin: adjustedPoint, size: s),
+                    image: img
+                ))
+                self.needsDisplay = true
+            }
         }
     }
 
@@ -1063,10 +1133,27 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
         switch a.kind {
         case .text:
-            let sx = newRect.width / max(1, orig.width)
-            let sy = newRect.height / max(1, orig.height)
-            a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
-            a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: a.fontSize * 1.4)
+            // Horizontal resize: change width only, keep font size constant
+            // Vertical resize: change font size based on height change
+            let horizontalHandles: [ResizeHandle] = [.midLeft, .midRight]
+            let verticalHandles: [ResizeHandle] = [.topMid, .bottomMid]
+            let cornerHandles: [ResizeHandle] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
+            
+            if horizontalHandles.contains(handle) {
+                // Only change width, keep font size
+                a.rect = CGRect(x: newRect.minX, y: orig.minY, width: newRect.width, height: orig.height)
+            } else if verticalHandles.contains(handle) {
+                // Only change font size, keep width
+                let sy = newRect.height / max(1, orig.height)
+                a.fontSize = max(6, min(300, a.fontSize * sy))
+                a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: a.fontSize * 1.4)
+            } else if cornerHandles.contains(handle) {
+                // Corner handles: change both
+                let sx = newRect.width / max(1, orig.width)
+                let sy = newRect.height / max(1, orig.height)
+                a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
+                a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: a.fontSize * 1.4)
+            }
         case .freedraw, .autoshape, .laser:
             let fixedX: CGFloat
             switch handle {
