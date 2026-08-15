@@ -104,6 +104,8 @@ struct ToolbarView: View {
 
                     drawToggle
 
+                    pressureControl
+
                     Button(action: onUndo) {
                         Image(systemName: "arrow.uturn.backward")
                             .frame(width: 32, height: 28)
@@ -174,6 +176,45 @@ struct ToolbarView: View {
         }
         .buttonStyle(.plain)
         .help(state.drawingMode ? "Pause drawing — clicks pass through" : "Start drawing — captures your clicks")
+    }
+
+    /// Pressure control: light = uniform constant-width lines, dynamic =
+    /// strokes that swell and taper like real ink. The active mode gets a
+    /// purple highlight.
+    private var pressureControl: some View {
+        HStack(spacing: 2) {
+            pressureButton(.light) {
+                WaveIcon(lineWidth: 1.3, amplitude: 0.5, color: state.pressureMode == .light ? .white : .primary)
+            }
+            pressureButton(.dynamic) {
+                WaveIcon(lineWidth: 3, amplitude: 1, color: state.pressureMode == .dynamic ? .white : .primary)
+            }
+        }
+        .padding(2)
+        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func pressureButton(_ mode: PressureMode, @ViewBuilder icon: () -> some View) -> some View {
+        Button {
+            state.pressureMode = mode
+        } label: {
+            icon()
+                .frame(width: 22, height: 14)
+                .frame(width: 30, height: 24)
+                .background(
+                    state.pressureMode == mode
+                        ? Color(red: 0.42, green: 0.4, blue: 0.86)
+                        : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(
+            mode == .light
+                ? "Light pressure — uniform, constant-width lines"
+                : "Dynamic pressure — strokes swell and taper like real ink"
+        )
     }
 
     // MARK: - row 2: colors, fill, width, palette, font
@@ -463,3 +504,29 @@ extension View {
         }
     }
 }
+
+/// Small sine-wave icon used by the pressure toggle — thin for light
+/// pressure, thick and taller for dynamic pressure.
+struct WaveIcon: View {
+    let lineWidth: CGFloat
+    let amplitude: CGFloat
+    let color: Color
+
+    var body: some View {
+        Canvas { ctx, size in
+            var path = Path()
+            let midY = size.height / 2
+            let amp = size.height * 0.26 * amplitude
+            path.move(to: CGPoint(x: 1, y: midY))
+            for x in stride(from: 0.0, through: size.width, by: 0.5) {
+                let t = x / size.width
+                path.addLine(to: CGPoint(
+                    x: x,
+                    y: midY - sin(t * .pi * 3) * amp
+                ))
+            }
+            ctx.stroke(path, with: .color(color), style: SwiftUI.StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+        }
+    }
+}
+

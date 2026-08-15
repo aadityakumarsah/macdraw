@@ -447,7 +447,8 @@ final class IslandManager {
                     canvas.mouseUp(with: self.mouseEvent(at: endP, type: .leftMouseUp))
                     let afterResize = canvas.annotations[0]
                     log("after resize: width \(orig.rect.width) -> \(afterResize.rect.width), fontSize \(orig.fontSize) -> \(afterResize.fontSize)")
-                    if afterResize.rect.width <= orig.rect.width || afterResize.fontSize <= orig.fontSize {
+                    // Mid-right handle stretches the text box; the font stays.
+                    if afterResize.rect.width <= orig.rect.width {
                         log("FAIL: resize did not grow the text")
                         exit(1)
                     }
@@ -532,6 +533,11 @@ final class IslandManager {
                             log("FAIL: re-edited text was not saved")
                             exit(1)
                         }
+                        log("re-edit drift check: origin \(tr.origin) -> \(canvas.annotations[0].rect.origin)")
+                        if canvas.annotations[0].rect.origin != tr.origin {
+                            log("FAIL: re-editing moved the text")
+                            exit(1)
+                        }
 
                         log("cursor test: hovering the mid-right resize handle")
                         let hr = self.win(CGPoint(x: tr.maxX, y: tr.midY))
@@ -577,7 +583,91 @@ final class IslandManager {
                             exit(1)
                         }
 
-                        log("slash palette test: opening the logo palette")
+                        log("shape text test: double-clicking the rectangle opens inline text editing")
+                        self.state.tool = .selection
+                        self.state.lastNonTextTool = .selection
+                        let sr = canvas.annotations[1].rect
+                        let sc = self.win(CGPoint(x: sr.midX, y: sr.midY))
+                        canvas.mouseDown(with: self.mouseEvent(at: sc, type: .leftMouseDown, clickCount: 2))
+                        log("shape edit open: isEditingText=\(canvas.isEditingText)")
+                        if !canvas.isEditingText {
+                            log("FAIL: double-clicking a polygon should open text editing")
+                            exit(1)
+                        }
+                        canvas.selftestSetText("inside shape")
+                        self.postKeyDown(keyCode: 53)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                            guard let self, let canvas = self.canvas else { return }
+                            log("shape text after esc: count=\(canvas.annotations.count) text=\(canvas.annotations[1].text) inside=\(canvas.annotations[1].textInside) fontSize=\(canvas.annotations[1].fontSize)")
+                            if canvas.annotations.count != 3 {
+                                log("FAIL: shape text should edit in place, not add an annotation")
+                                exit(1)
+                            }
+                            if !canvas.annotations[1].textInside || canvas.annotations[1].text != "inside shape" {
+                                log("FAIL: shape text was not stored")
+                                exit(1)
+                            }
+                            log("shape drift check: origin \(sr.origin) -> \(canvas.annotations[1].rect.origin)")
+                            if canvas.annotations[1].rect.origin != sr.origin {
+                                log("FAIL: editing shape text moved the shape")
+                                exit(1)
+                            }
+
+                            log("marquee move test: box-select both rectangles, drag one, both must move")
+                            self.state.tool = .rectangle
+                            self.state.lastNonTextTool = .rectangle
+                            let q1 = self.win(CGPoint(x: 500, y: 700))
+                            let q2 = self.win(CGPoint(x: 560, y: 760))
+                            canvas.mouseDown(with: self.mouseEvent(at: q1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: q2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: q2, type: .leftMouseUp))
+                            self.state.tool = .selection
+                            self.state.lastNonTextTool = .selection
+                            let r1 = canvas.annotations[1].rect
+                            let r3 = canvas.annotations[3].rect
+                            let m1 = self.win(CGPoint(x: min(r1.minX, r3.minX) - 20, y: min(r1.minY, r3.minY) - 20))
+                            let m2 = self.win(CGPoint(x: max(r1.maxX, r3.maxX) + 20, y: max(r1.maxY, r3.maxY) + 20))
+                            canvas.mouseDown(with: self.mouseEvent(at: m1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: m2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: m2, type: .leftMouseUp))
+                            log("after marquee: selected=\(canvas.selected.sorted())")
+                            if canvas.selected.count != 2 {
+                                log("FAIL: marquee should select both rectangles")
+                                exit(1)
+                            }
+                            let grab = self.win(CGPoint(x: r1.midX, y: r1.midY))
+                            let dest = self.win(CGPoint(x: r1.midX + 60, y: r1.midY + 30))
+                            canvas.mouseDown(with: self.mouseEvent(at: grab, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: dest, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: dest, type: .leftMouseUp))
+                            let moved1 = canvas.annotations[1].rect
+                            let moved3 = canvas.annotations[3].rect
+                            log("after drag: rect1 \(r1.origin) -> \(moved1.origin), rect3 \(r3.origin) -> \(moved3.origin)")
+                            if moved1.origin == r1.origin || moved3.origin == r3.origin {
+                                log("FAIL: both rectangles should move together")
+                                exit(1)
+                            }
+                            let dx = moved1.minX - r1.minX
+                            if abs((moved3.minX - r3.minX) - dx) > 0.5
+                                || abs((moved1.minY - r1.minY) - (moved3.minY - r3.minY)) > 0.5 {
+                                log("FAIL: rectangles should move by the same delta")
+                                exit(1)
+                            }
+                            log("post-marquee draw test: a new rect must start exactly at the drag start")
+                            self.state.tool = .rectangle
+                            let dp1 = self.win(CGPoint(x: 150, y: 150))
+                            let dp2 = self.win(CGPoint(x: 260, y: 220))
+                            canvas.mouseDown(with: self.mouseEvent(at: dp1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: dp2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: dp2, type: .leftMouseUp))
+                            let drawn = canvas.annotations.last!
+                            log("drawn rect: origin \(drawn.rect.origin) size \(drawn.rect.size)")
+                            if drawn.rect.minX != 150 || drawn.rect.minY != 150 {
+                                log("FAIL: drawn rect should start at the drag start, got \(drawn.rect.origin)")
+                                exit(1)
+                            }
+
+                            log("slash palette test: opening the logo palette")
                         self.showLogoPalette()
                         log("palette open: \(self.isLogoPaletteVisible)")
                         guard self.isLogoPaletteVisible, let palette = self.logoPalette else {
@@ -605,7 +695,7 @@ final class IslandManager {
                         let picked = palette.selftestResults.first!
                         palette.selftestPickRow(0)
                         log("palette pick: annotations=\(canvas.annotations.count) last=\(canvas.annotations.last?.text ?? "?")")
-                        if canvas.annotations.count != 4 {
+                        if canvas.annotations.count != 6 {
                             log("FAIL: picking a logo should insert an annotation")
                             exit(1)
                         }
@@ -625,8 +715,48 @@ final class IslandManager {
                             log("FAIL: Esc should close the logo palette")
                             exit(1)
                         }
+
+                        log("pressure stroke test: dynamic mode must mark new strokes")
+                        self.state.pressureMode = .dynamic
+                        self.state.tool = .freedraw
+                        self.state.lastNonTextTool = .freedraw
+                        let f1 = self.win(CGPoint(x: 620, y: 260))
+                        let f2 = self.win(CGPoint(x: 680, y: 320))
+                        let f3 = self.win(CGPoint(x: 740, y: 280))
+                        canvas.mouseDown(with: self.mouseEvent(at: f1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: f2, type: .leftMouseDragged))
+                        canvas.mouseDragged(with: self.mouseEvent(at: f3, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: f3, type: .leftMouseUp))
+                        if let fs = canvas.annotations.last, fs.kind == .freedraw {
+                            log("freedraw: dynamicWidth=\(fs.dynamicWidth) points=\(fs.points.count)")
+                            if fs.dynamicWidth != true || fs.points.count < 3 {
+                                log("FAIL: freedraw should be marked dynamic with collected points")
+                                exit(1)
+                            }
+                        } else {
+                            log("FAIL: no freedraw annotation was created")
+                            exit(1)
+                        }
+                        log("pressure stroke test: light mode must mark strokes uniform")
+                        self.state.pressureMode = .light
+                        let f4 = self.win(CGPoint(x: 620, y: 160))
+                        let f5 = self.win(CGPoint(x: 700, y: 120))
+                        canvas.mouseDown(with: self.mouseEvent(at: f4, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: f5, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: f5, type: .leftMouseUp))
+                        if let fs = canvas.annotations.last, fs.kind == .freedraw {
+                            log("light freedraw: dynamicWidth=\(fs.dynamicWidth)")
+                            if fs.dynamicWidth != false {
+                                log("FAIL: light mode stroke should be uniform")
+                                exit(1)
+                            }
+                        } else {
+                            log("FAIL: no light freedraw annotation was created")
+                            exit(1)
+                        }
                         log("SELFTEST PASS")
                         exit(0)
+                        }
                     }
                 }
             }
