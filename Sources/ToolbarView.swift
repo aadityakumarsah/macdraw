@@ -1,6 +1,18 @@
 import SwiftUI
 import AppKit
 
+/// The purple accent used across the whole toolbar for active states.
+let macdrawAccent = Color(red: 0.45, green: 0.41, blue: 0.92)
+
+let accentGradient = LinearGradient(
+    colors: [
+        Color(red: 0.48, green: 0.44, blue: 0.96),
+        Color(red: 0.36, green: 0.32, blue: 0.86),
+    ],
+    startPoint: .top,
+    endPoint: .bottom
+)
+
 struct ToolbarView: View {
     @ObservedObject var state: CanvasState
     let onClose: () -> Void
@@ -8,6 +20,8 @@ struct ToolbarView: View {
     let onClear: () -> Void
     let onActivate: () -> Void
     let onDeactivate: () -> Void
+    let onToggleCodeBlock: () -> Void
+    let onInsertSymbol: (String) -> Void
 
     enum ColorTarget {
         case stroke
@@ -15,6 +29,7 @@ struct ToolbarView: View {
     }
 
     @State private var showShortcuts = false
+    @State private var showShapes = false
     @State private var colorTarget: ColorTarget = .stroke
 
     var body: some View {
@@ -35,7 +50,12 @@ struct ToolbarView: View {
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        .fill(Color.black.opacity(0.1))
+                        .allowsHitTesting(false)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
                 )
                 .shadow(color: .black.opacity(0.35), radius: 14, y: 5)
         }
@@ -87,7 +107,7 @@ struct ToolbarView: View {
         HStack(spacing: 6) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(Tool.allCases, id: \.self) { tool in
+                    ForEach(Tool.allCases.filter { !Tool.shapePalette.contains($0) }, id: \.self) { tool in
                         ToolButton(tool: tool, active: state.tool == tool) {
                             if tool != .text {
                                 state.lastNonTextTool = tool
@@ -102,9 +122,26 @@ struct ToolbarView: View {
 
                     Divider().frame(height: 22)
 
+                    shapesPaletteButton
+
+                    Divider().frame(height: 22)
+
                     drawToggle
 
                     pressureControl
+
+                    Toggle(isOn: codeBlockBinding) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text("Code")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(macdrawAccent)
+                    .help("Code mode — on: new text is typed as syntax-highlighted code; off: plain text")
 
                     Button(action: onUndo) {
                         Image(systemName: "arrow.uturn.backward")
@@ -169,7 +206,9 @@ struct ToolbarView: View {
             .padding(.horizontal, 10)
             .frame(height: 28)
             .background(
-                state.drawingMode ? Color.accentColor : Color.primary.opacity(0.08),
+                state.drawingMode
+                    ? AnyShapeStyle(accentGradient)
+                    : AnyShapeStyle(Color.primary.opacity(0.08)),
                 in: RoundedRectangle(cornerRadius: 7, style: .continuous)
             )
             .contentShape(Rectangle())
@@ -203,8 +242,8 @@ struct ToolbarView: View {
                 .frame(width: 30, height: 24)
                 .background(
                     state.pressureMode == mode
-                        ? Color(red: 0.42, green: 0.4, blue: 0.86)
-                        : Color.clear,
+                        ? AnyShapeStyle(accentGradient)
+                        : AnyShapeStyle(Color.clear),
                     in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                 )
                 .contentShape(Rectangle())
@@ -215,6 +254,77 @@ struct ToolbarView: View {
                 ? "Light pressure — uniform, constant-width lines"
                 : "Dynamic pressure — strokes swell and taper like real ink"
         )
+    }
+
+    /// Two-way binding for the code-mode switch: flips the mode flag and
+    /// converts any selected text annotations to / from code blocks.
+    private var codeBlockBinding: Binding<Bool> {
+        Binding(
+            get: { state.codeBlockMode },
+            set: { newValue in
+                state.codeBlockMode = newValue
+                onToggleCodeBlock()
+            }
+        )
+    }
+
+    /// Opens the shape palette popover. Always shows a recognizable icon plus
+    /// a label — the active shape's icon when one is selected, otherwise a
+    /// generic grid glyph — so the navbar never hides the shapes.
+    private var shapesPaletteButton: some View {
+        Button {
+            showShapes.toggle()
+        } label: {
+            let activeShape = Tool.shapePalette.contains(state.tool) ? state.tool : nil
+            HStack(spacing: 5) {
+                Group {
+                    if let s = activeShape {
+                        Image(nsImage: SVGIconRenderer.image(named: s.iconName, tint: .white, target: 18))
+                            .resizable()
+                            .frame(width: 18, height: 18)
+                    } else {
+                        Image(systemName: "square.grid.2x2")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                }
+                Text(activeShape?.label ?? "Shapes")
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 8)
+            .frame(height: 30)
+            .background(background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                activeShape != nil
+                    ? RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.white.opacity(0.28), lineWidth: 1)
+                    : nil
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Shape palette — \(Tool.shapePalette.count) standardized shapes + symbols")
+        .popover(isPresented: $showShapes, arrowEdge: .bottom) {
+            ShapesPaletteView(state: state, onPick: {
+                showShapes = false
+            }, onInsertSymbol: { symbol in
+                showShapes = false
+                onInsertSymbol(symbol)
+            })
+        }
+    }
+
+    private var shapesBackground: Color {
+        (Tool.shapePalette.contains(state.tool) || showShapes)
+            ? macdrawAccent.opacity(0.4)
+            : Color.clear
+    }
+
+    private var background: Color {
+        showShapes
+            ? Color.white.opacity(0.12)
+            : shapesBackground
     }
 
     // MARK: - row 2: colors, fill, width, palette, font
@@ -430,20 +540,33 @@ struct ToolButton: View {
     let active: Bool
     let action: () -> Void
 
+    @State private var hovering = false
+
     var body: some View {
         Button(action: action) {
-            Image(nsImage: SVGIconRenderer.image(named: tool.iconName, tint: .white, target: 20))
+            Image(nsImage: SVGIconRenderer.image(named: tool.iconName, tint: .white, target: 22))
                 .resizable()
-                .frame(width: 20, height: 20)
-                .frame(width: 32, height: 28)
-                .background(
-                    active ? Color.white.opacity(0.2) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .frame(width: 22, height: 22)
+                .frame(width: 34, height: 30)
+                .background(background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    active
+                        ? RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Color.white.opacity(0.28), lineWidth: 1)
+                        : nil
                 )
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { hovering = $0 }
         .help(shortcutHelp(tool))
+    }
+
+    private var background: AnyShapeStyle {
+        if active {
+            return AnyShapeStyle(accentGradient)
+        }
+        return AnyShapeStyle(hovering ? Color.white.opacity(0.12) : Color.clear)
     }
 
     private func shortcutHelp(_ tool: Tool) -> String {
@@ -502,6 +625,175 @@ extension View {
         } else {
             self
         }
+    }
+}
+
+/// Grid palette of all the standardized shapes plus the "/" symbol icons,
+/// grouped into categories with a search bar on top. Picking a shape
+/// activates it as the current drawing tool; picking a symbol inserts it at
+/// the mouse position (like the "/" palette).
+struct ShapesPaletteView: View {
+    @ObservedObject var state: CanvasState
+    let onPick: () -> Void
+    let onInsertSymbol: (String) -> Void
+
+    @State private var hovering: Tool?
+    @State private var query = ""
+
+    private struct ShapeGroup {
+        let title: String
+        let tools: [Tool]
+    }
+
+    private let groups: [ShapeGroup] = [
+        ShapeGroup(title: "Basic", tools: [.rectangle, .diamond, .ellipse, .triangle, .rightTriangle, .line, .arrow]),
+        ShapeGroup(title: "Polygons", tools: [.parallelogram, .trapezoid, .pentagon, .hexagon, .octagon, .star, .star6, .cross]),
+        ShapeGroup(title: "Flowchart", tools: [.process, .predefinedProcess, .delay, .manualInput, .display]),
+        ShapeGroup(title: "Architecture", tools: [.cloud, .serverStack, .queue, .firewall, .cube]),
+        ShapeGroup(title: "Communication", tools: [.callout, .note]),
+        ShapeGroup(title: "Connectors", tools: [.doubleArrow, .curvedConnector, .orthogonal]),
+    ]
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 5)
+
+    private var visibleGroups: [ShapeGroup] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return groups }
+        return groups.compactMap { group in
+            let tools = group.tools.filter { $0.label.lowercased().contains(q) }
+            return tools.isEmpty ? nil : ShapeGroup(title: group.title, tools: tools)
+        }
+    }
+
+    private var visibleSymbols: [LogoItem] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return LogoCatalog.items }
+        return LogoCatalog.items.filter {
+            $0.name.lowercased().contains(q) || $0.symbol.contains(q)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+                TextField("Search shapes or symbols…", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+
+            ScrollView {
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                    ForEach(visibleGroups, id: \.title) { group in
+                        Section {
+                            ForEach(group.tools, id: \.self) { tool in
+                                shapeCell(for: tool)
+                            }
+                        } header: {
+                            Text(group.title.uppercased())
+                                .font(.system(size: 9, weight: .bold))
+                                .tracking(0.8)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 2)
+                        }
+                    }
+                    if !visibleSymbols.isEmpty {
+                        Section {
+                            ForEach(visibleSymbols, id: \.id) { item in
+                                symbolCell(for: item)
+                            }
+                        } header: {
+                            Text("SYMBOLS")
+                                .font(.system(size: 9, weight: .bold))
+                                .tracking(0.8)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 2)
+                        }
+                    }
+                }
+                .padding(12)
+            }
+        }
+        .frame(width: 356, height: 330)
+    }
+
+    private func shapeCell(for tool: Tool) -> some View {
+        Button {
+            if tool != .text {
+                state.lastNonTextTool = tool
+            }
+            state.tool = tool
+            onPick()
+        } label: {
+            VStack(spacing: 3) {
+                Image(nsImage: SVGIconRenderer.image(named: tool.iconName, tint: .white, target: 20))
+                    .resizable()
+                    .frame(width: 20, height: 20)
+                    .frame(width: 46, height: 32)
+                    .background(
+                        state.tool == tool
+                            ? AnyShapeStyle(accentGradient)
+                            : AnyShapeStyle(hovering == tool ? Color.primary.opacity(0.1) : Color.clear),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+                    .overlay(
+                        state.tool == tool
+                            ? RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.white.opacity(0.28), lineWidth: 1)
+                            : nil
+                    )
+                Text(tool.label)
+                    .font(.system(size: 8.5, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+                    .foregroundStyle(state.tool == tool ? Color.primary : .secondary)
+            }
+            .frame(width: 62)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 ? tool : nil }
+        .help(tool.label)
+    }
+
+    private func symbolCell(for item: LogoItem) -> some View {
+        Button {
+            onInsertSymbol(item.symbol)
+        } label: {
+            VStack(spacing: 3) {
+                if let img = tintedSymbolImage(named: item.symbol, pointSize: 20, color: .white) {
+                    Image(nsImage: img)
+                        .resizable()
+                        .frame(width: 20, height: 20)
+                        .frame(width: 46, height: 32)
+                        .background(
+                            Color.primary.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                } else {
+                    Rectangle()
+                        .fill(Color.clear)
+                        .frame(width: 46, height: 32)
+                }
+                Text(item.name)
+                    .font(.system(size: 8.5, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: 62)
+        }
+        .buttonStyle(.plain)
+        .help("\(item.name) — inserts at the pointer")
     }
 }
 

@@ -62,6 +62,10 @@ private struct PersistedAnnotation: Codable {
     var textInside: Bool?
     var textAnchor: String?
     var dynamicWidth: Bool?
+    var symbol: String?
+    var isCode: Bool?
+    var normalFontFamily: String?
+    var normalFontSize: CGFloat?
 }
 
 private func colorComponents(_ c: NSColor) -> [CGFloat] {
@@ -113,7 +117,11 @@ private extension Annotation {
             ry: ry,
             textInside: textInside,
             textAnchor: textAnchor.rawValue,
-            dynamicWidth: dynamicWidth
+            dynamicWidth: dynamicWidth,
+            symbol: symbol,
+            isCode: isCode,
+            normalFontFamily: normalFontFamily,
+            normalFontSize: normalFontSize
         )
     }
 
@@ -166,14 +174,18 @@ private extension Annotation {
             ry: ry,
             textInside: p.textInside ?? false,
             textAnchor: TextAnchor(rawValue: p.textAnchor ?? "") ?? .center,
-            dynamicWidth: p.dynamicWidth ?? false
+            dynamicWidth: p.dynamicWidth ?? false,
+            symbol: p.symbol,
+            isCode: p.isCode ?? false,
+            normalFontFamily: p.normalFontFamily,
+            normalFontSize: p.normalFontSize
         )
     }
 }
 
 /// Full-screen transparent overlay where the user draws annotations on top of
 /// whatever is on screen.
-final class CanvasView: NSView, NSTextFieldDelegate {
+final class CanvasView: NSView, NSTextViewDelegate {
     override var isFlipped: Bool { true }
 
     private let state: CanvasState
@@ -200,9 +212,20 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     private var marqueeStart: CGPoint?
     private var marqueeRect: CGRect = .zero
     private var eraseStroke: [CGPoint] = []
-    private var editingField: NSTextField?
+    private var editingView: NSTextView?
     private var editingIndex: Int?
     private var editingFontFamily: String?
+    /// The font this text used before code mode replaced it (used when
+    /// committing a brand-new code block so toggling it back restores it).
+    private var editingNormalFontFamily: String?
+    private var editingNormalFontSize: CGFloat?
+    /// True when the current edit pushed its undo snapshot up front (code
+    /// edits mutate the annotation live while typing, so the snapshot must
+    /// be taken before the first keystroke, not at commit).
+    private var editingUndoPushed = false
+    /// Guards live syntax highlighting against re-entrancy (setting the text
+    /// storage notifies the delegate again).
+    private var isHighlightingCode = false
     private var laserTimer: Timer?
     private var cursorTrackingArea: NSTrackingArea?
     private var cancellables = Set<AnyCancellable>()
@@ -280,7 +303,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         }
     }
 
-    var isEditingText: Bool { editingField != nil }
+    var isEditingText: Bool { editingView != nil }
 
     init(state: CanvasState) {
         self.state = state
@@ -290,8 +313,8 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         Publishers.CombineLatest(state.$fontSize, state.$fontFamily)
             .dropFirst()
             .sink { [weak self] size, family in
-                guard let self, let field = self.editingField else { return }
-                field.font = Fonts.nsFont(for: family, size: size)
+                guard let self, let tv = self.editingView, !self.isCodeEditingContext else { return }
+                tv.font = Fonts.nsFont(for: family, size: size)
                 self.editingFontFamily = family
             }
             .store(in: &cancellables)
@@ -299,21 +322,29 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         state.$strokeColor
             .dropFirst()
             .sink { [weak self] color in
-                guard let self, let field = self.editingField else { return }
-                field.textColor = color
+                guard let self, let tv = self.editingView, !self.isCodeEditingContext else { return }
+                tv.textColor = color
             }
             .store(in: &cancellables)
         // Picking a stroke color while shapes/text are selected recolors them
-        // immediately (and stays undoable).
+        // immediately (and stays undoable). Icon annotations are re-rendered
+        // with the new tint.
         state.$strokeColor
             .dropFirst()
             .sink { [weak self] color in
                 guard let self, !self.selected.isEmpty else { return }
                 self.pushUndo()
                 for i in self.selected where self.annotations.indices.contains(i) {
-                    if self.annotations[i].kind != .laser {
-                        self.annotations[i].strokeColor = color
+                    let a = self.annotations[i]
+                    if a.kind == .laser { continue }
+                    if a.kind == .image, let symbol = a.symbol {
+                        self.annotations[i].image = tintedSymbolImage(
+                            named: symbol,
+                            pointSize: 44,
+                            color: color
+                        )
                     }
+                    self.annotations[i].strokeColor = color
                 }
                 self.needsDisplay = true
             }
@@ -433,7 +464,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
     override func mouseDown(with event: NSEvent) {
         if state.tool != .text {
-            editingField?.resignFirstResponder()
+            editingView?.resignFirstResponder()
         }
         let p = convert(event.locationInWindow, from: nil)
         switch state.tool {
@@ -622,9 +653,14 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             // Adjust point by canvas offset for drawing tools
             let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
             switch c.kind {
-            case .rect, .diamond, .ellipse, .frame:
+            case .rect, .diamond, .ellipse, .frame,
+                 .triangle, .rightTriangle, .parallelogram, .trapezoid,
+                 .pentagon, .hexagon, .octagon, .star, .star6, .cross,
+                 .process, .predefinedProcess, .delay, .manualInput, .display,
+                 .cloud, .serverStack, .queue, .firewall, .cube,
+                 .callout, .note:
                 c.rect = normalizedRect(from: dragStart, to: adjustedP)
-            case .arrow, .line:
+            case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal:
                 c.points = [
                     snappedBoundaryPoint(dragStart),
                     snappedBoundaryPoint(adjustedP),
@@ -784,9 +820,14 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         guard var c = current else { return }
 
         switch c.kind {
-        case .rect, .diamond, .ellipse, .frame:
+        case .rect, .diamond, .ellipse, .frame,
+             .triangle, .rightTriangle, .parallelogram, .trapezoid,
+             .pentagon, .hexagon, .octagon, .star, .star6, .cross,
+             .process, .predefinedProcess, .delay, .manualInput, .display,
+             .cloud, .serverStack, .queue, .firewall, .cube,
+             .callout, .note:
             guard c.rect.width > 2 || c.rect.height > 2 else { return }
-        case .arrow, .line:
+        case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal:
             c.rect = normalizedRect(from: c.points.first ?? dragStart, to: c.points.last ?? dragStart)
             guard distance(c.points.first ?? .zero, c.points.last ?? .zero) > 2 else { return }
         case .freedraw:
@@ -821,103 +862,282 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     }
 
     private func beginTextEditing(at p: CGPoint, editingIndex: Int? = nil) {
-        guard editingField == nil else { return }
+        guard editingView == nil else { return }
         let existing: Annotation? = editingIndex.flatMap { idx in
             annotations.indices.contains(idx) ? annotations[idx] : nil
         }
-        let family = existing?.fontFamily ?? state.fontFamily
-        let size = existing?.fontSize ?? state.fontSize
+        let code = isCodeEditingContext
+        var family = existing?.fontFamily ?? state.fontFamily
+        var size = existing?.fontSize ?? state.fontSize
+        editingNormalFontFamily = family
+        editingNormalFontSize = size
+        if editingIndex == nil, code {
+            // New text in code-block mode starts monospaced and compact.
+            family = "Cascadia Code"
+            size = 15
+        }
         editingFontFamily = family
         self.editingIndex = editingIndex
         let editingPolygon = existing.map { $0.kind != .text } ?? false
-        let field = NSTextField(
-            frame: existing.map { a in
-                if a.kind == .text {
-                    // Overlay the field exactly on the existing text so
-                    // re-editing never moves or misaligns it.
-                    return CGRect(
-                        x: a.rect.minX,
-                        y: a.rect.minY,
-                        width: max(160, a.rect.width),
-                        height: max(34, a.rect.height)
-                    )
-                }
-                // Typing inside a polygon: field sits centered in the shape
-                // with a little padding, so the text never spills out.
-                let pad: CGFloat = 10
+        let codeWidth: CGFloat = (editingIndex == nil && code) ? 460 : 260
+        let rect = existing.map { a in
+            if a.kind == .text {
+                // Overlay the view exactly on the existing text so re-editing
+                // never moves or misaligns it.
                 return CGRect(
-                    x: a.rect.minX + pad,
-                    y: a.rect.minY + pad,
-                    width: max(60, a.rect.width - pad * 2),
-                    height: max(28, a.rect.height - pad * 2)
+                    x: a.rect.minX,
+                    y: a.rect.minY,
+                    width: max(160, a.rect.width),
+                    height: max(34, a.rect.height)
                 )
-            } ?? CGRect(x: p.x, y: p.y, width: 260, height: 34)
-        )
-        field.isBordered = false
-        field.drawsBackground = false
-        field.alignment = editingPolygon ? .center : .left
-        field.font = Fonts.nsFont(for: family, size: size)
-        field.textColor = existing?.strokeColor ?? state.strokeColor
-        // Multi-line editing, wrapping at the same width the annotation uses —
-        // the field grows downward as the text grows so it never scrolls away.
-        field.usesSingleLineMode = false
-        field.cell?.wraps = true
-        field.cell?.isScrollable = false
-        field.cell?.lineBreakMode = .byWordWrapping
+            }
+            // Typing inside a polygon: the view sits centered in the shape
+            // with a little padding, so the text never spills out.
+            let pad: CGFloat = 10
+            return CGRect(
+                x: a.rect.minX + pad,
+                y: a.rect.minY + pad,
+                width: max(60, a.rect.width - pad * 2),
+                height: max(28, a.rect.height - pad * 2)
+            )
+        } ?? CGRect(x: p.x, y: p.y, width: codeWidth, height: 34)
+
+        if code {
+            // Code edits update the annotation live while typing, so the undo
+            // snapshot must be taken up front — before the first keystroke —
+            // and the commit must not push another (polluted) one.
+            pushUndo()
+            editingUndoPushed = true
+        }
+        if editingIndex == nil, code {
+            // Eagerly create the code block on the canvas so it renders and
+            // grows live while typing — no need to wait for Esc.
+            annotations.append(Annotation(
+                kind: .text,
+                rect: rect,
+                strokeColor: state.strokeColor,
+                fillColor: nil,
+                fillOpacity: state.fillOpacity,
+                strokeWidth: 2,
+                points: [],
+                pointTimes: [],
+                text: "",
+                fontFamily: family,
+                fontSize: size,
+                image: nil,
+                rounded: false,
+                dashed: false,
+                rotation: 0,
+                createdAt: Date(),
+                locked: false,
+                zIndex: 0,
+                strokeStyle: .solid,
+                sloppiness: 0,
+                edgeRoughness: 0,
+                rx: state.cornerRadius,
+                ry: state.cornerRadiusY,
+                textInside: false,
+                textAnchor: .center,
+                dynamicWidth: false,
+                symbol: nil,
+                isCode: true,
+                normalFontFamily: editingNormalFontFamily,
+                normalFontSize: editingNormalFontSize
+            ))
+            self.editingIndex = annotations.count - 1
+        }
+
+        let tv = NSTextView(frame: rect)
+        tv.isRichText = false
+        tv.isEditable = true
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.font = Fonts.nsFont(for: family, size: size)
+        tv.textColor = existing?.strokeColor ?? state.strokeColor
+        tv.allowsUndo = true
+        // Plain, predictable editing: no autocorrect, quotes or dashes.
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.textContainer?.widthTracksTextView = true
+        tv.alignment = editingPolygon ? .center : .left
+        tv.wantsLayer = true
+        if code {
+            // The code "editor" look: translucent rounded block that stays
+            // readable on any backdrop, matching the committed code block.
+            let dark = state.canvasBackground == .black
+            tv.textContainerInset = NSSize(width: 8, height: 6)
+            tv.layer?.cornerRadius = 8
+            tv.layer?.backgroundColor = (dark
+                ? NSColor.white.withAlphaComponent(0.15)
+                : NSColor.black.withAlphaComponent(0.10)).cgColor
+            tv.layer?.borderWidth = 1
+            tv.layer?.borderColor = (dark
+                ? NSColor.white.withAlphaComponent(0.35)
+                : NSColor.black.withAlphaComponent(0.22)).cgColor
+        } else {
+            tv.layer?.cornerRadius = 4
+            tv.layer?.borderWidth = 1
+            tv.layer?.borderColor = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).cgColor
+        }
         if let existing, !existing.text.isEmpty {
-            field.stringValue = existing.text
-            // Fit the field's height to the existing text right away.
-            let attrs: [NSAttributedString.Key: Any] = [.font: field.font ?? Fonts.nsFont(for: family, size: size)]
+            tv.string = existing.text
+            // Fit the view's height to the existing text right away.
+            let attrs: [NSAttributedString.Key: Any] = [.font: tv.font ?? Fonts.nsFont(for: family, size: size)]
             let bounds = (existing.text as NSString).boundingRect(
-                with: CGSize(width: field.frame.width, height: .greatestFiniteMagnitude),
+                with: CGSize(width: rect.width, height: .greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 attributes: attrs
             )
-            var f = field.frame
-            f.size.height = max(f.height, ceil(bounds.height) + 6)
-            field.frame = f
+            var f = tv.frame
+            f.size.height = max(f.height, ceil(bounds.height) + 8)
+            tv.frame = f
         }
-        field.placeholderString = "Type…"
-        field.delegate = self
-        field.wantsLayer = true
-        field.layer?.borderColor = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).cgColor
-        field.layer?.borderWidth = 1
-        field.layer?.cornerRadius = 4
-        addSubview(field)
-        editingField = field
+        tv.delegate = self
+        addSubview(tv)
+        editingView = tv
         // Redraw now so the old text underneath the field disappears at once.
         needsDisplay = true
-        window?.makeFirstResponder(field)
-    }
-
-    /// Keeps the edit field tall enough to show everything being typed — the
-    /// field grows downward (the canvas is flipped) so nothing scrolls out of
-    /// view while writing.
-    func controlTextDidChange(_ obj: Notification) {
-        guard let field = editingField, let font = field.font else { return }
-        let bounds = (field.stringValue as NSString).boundingRect(
-            with: CGSize(width: field.frame.width, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: font]
-        )
-        var f = field.frame
-        let target = max(f.height, ceil(bounds.height) + 6)
-        if abs(target - f.height) > 0.5 {
-            f.size.height = target
-            field.frame = f
+        window?.makeFirstResponder(tv)
+        if code, !tv.string.isEmpty {
+            highlightCode(in: tv)
         }
     }
 
-    func controlTextDidEndEditing(_ obj: Notification) {
+    /// True while the open editing view belongs to a code block (either a new
+    /// one being typed in code mode, or a re-edit of an existing code block).
+    private var isCodeEditingContext: Bool {
+        if state.codeBlockMode { return true }
+        if let i = editingIndex, annotations.indices.contains(i) {
+            return annotations[i].isCode
+        }
+        return false
+    }
+
+    /// Re-applies syntax colors to the editing view (live highlighting while
+    /// typing in a code block).
+    private func highlightCode(in tv: NSTextView) {
+        guard !isHighlightingCode else { return }
+        isHighlightingCode = true
+        defer { isHighlightingCode = false }
+        let dark = state.canvasBackground == .black
+        let font = tv.font ?? Fonts.nsFont(for: "Cascadia Code", size: 15)
+        let styled = syntaxHighlighted(tv.string, font: font, dark: dark)
+        let sel = tv.selectedRange()
+        tv.textStorage?.setAttributedString(styled)
+        tv.setSelectedRange(sel)
+    }
+
+    /// Keeps the edit view tall enough to show everything being typed — it
+    /// grows downward (the canvas is flipped) so nothing scrolls out of view.
+    func textDidChange(_ notification: Notification) {
+        guard let tv = notification.object as? NSTextView, tv === editingView else { return }
+        if isCodeEditingContext {
+            highlightCode(in: tv)
+            // Mirror the text onto the canvas annotation in real time so the
+            // code block updates while typing, not only on Esc.
+            syncCodeAnnotation(tv)
+        }
+        guard let layoutManager = tv.layoutManager, let container = tv.textContainer else { return }
+        layoutManager.ensureLayout(for: container)
+        let used = layoutManager.usedRect(for: container)
+        var f = tv.frame
+        let target = max(34, ceil(used.height) + 10)
+        if abs(target - f.height) > 0.5 {
+            f.size.height = target
+            tv.frame = f
+            if isCodeEditingContext, let idx = editingIndex, annotations.indices.contains(idx) {
+                annotations[idx].rect.size.height = target
+                needsDisplay = true
+            }
+        }
+    }
+
+    /// Pushes the editing view's text onto its canvas annotation (code edits
+    /// render live while typing).
+    private func syncCodeAnnotation(_ tv: NSTextView) {
+        guard let idx = editingIndex, annotations.indices.contains(idx) else { return }
+        annotations[idx].text = tv.string
+        needsDisplay = true
+    }
+
+    func textDidEndEditing(_ notification: Notification) {
         commitTextEditing()
     }
 
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            commitPendingText(selectAndPick: true)
-            return true
+            if isCodeEditingContext {
+                let text = textView.string
+                let range = textView.selectedRange()
+                let ns = text as NSString
+                let prefix = ns.substring(to: range.location)
+                let lineStart = (prefix as NSString).range(of: "\n", options: .backwards).location
+                let line = lineStart == NSNotFound ? prefix : (prefix as NSString).substring(from: lineStart + 1)
+                var indent = String(line.prefix { $0 == " " || $0 == "\t" })
+                if line.trimmingCharacters(in: .whitespaces).hasSuffix("{") {
+                    indent += "    "
+                }
+                textView.insertText("\n" + indent, replacementRange: range)
+                return true
+            }
+            // Normal text: Enter just starts a new line — Esc or clicking
+            // away finishes the text.
+            return false
+        }
+        if commandSelector == #selector(NSResponder.insertTab(_:)) {
+            if isCodeEditingContext {
+                // Tab indents code instead of moving focus.
+                textView.insertText("\t", replacementRange: textView.selectedRange())
+                return true
+            }
+            return false
         }
         return false
+    }
+
+    /// Auto-closes code pairs while typing in a code block: `{` → `{}`,
+    /// `[` → `[]`, `(` → `()`, `"` → `""`, `'` → `''`, leaving the cursor
+    /// between the pair. Typing a closer that's already there just steps past
+    /// it, and typing an opener with a selection wraps that selection.
+    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        guard isCodeEditingContext, let replacement = replacementString, replacement.count == 1,
+              let c = replacement.first, autoPairChars.contains(c) else {
+            return true
+        }
+        let ns = textView.string as NSString
+        let insertAt = affectedCharRange.location
+        let next = insertAt + affectedCharRange.length
+        if next < ns.length, ns.substring(with: NSRange(location: next, length: 1)) == String(c) {
+            // The closer is already in place (typing `}` after `{}`) — just
+            // move the cursor past it instead of inserting a duplicate.
+            textView.setSelectedRange(NSRange(location: next + 1, length: 0))
+            return false
+        }
+        guard let closer = closingPair(for: c) else { return true }
+        if affectedCharRange.length > 0 {
+            let selectedText = ns.substring(with: affectedCharRange)
+            textView.insertText(String(c) + selectedText + String(closer), replacementRange: affectedCharRange)
+            textView.setSelectedRange(NSRange(location: insertAt + 1, length: selectedText.count))
+        } else {
+            textView.insertText(String(c) + String(closer), replacementRange: affectedCharRange)
+            textView.setSelectedRange(NSRange(location: insertAt + 1, length: 0))
+        }
+        return false
+    }
+
+    private var autoPairChars: Set<Character> { ["{", "}", "[", "]", "(", ")", "\"", "'"] }
+
+    private func closingPair(for opener: Character) -> Character? {
+        switch opener {
+        case "{": return "}"
+        case "[": return "]"
+        case "(": return ")"
+        case "\"": return "\""
+        case "'": return "'"
+        default: return nil
+        }
     }
 
     /// Commits any open text field (used when the overlay is dismissed).
@@ -932,9 +1152,48 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         }
     }
 
-    /// Self-test hook: sets the text of the open editing field.
+    /// Self-test hook: sets the text of the open editing view.
     func selftestSetText(_ s: String) {
-        editingField?.stringValue = s
+        guard let tv = editingView else { return }
+        tv.string = s
+        // The string setter doesn't post NSText.didChange, so run the live
+        // sync explicitly to match what real typing produces.
+        if isCodeEditingContext {
+            syncCodeAnnotation(tv)
+        }
+    }
+
+    /// Self-test hook: moves the cursor in the open editing view.
+    func selftestSetCursor(location: Int) {
+        editingView?.setSelectedRange(NSRange(location: location, length: 0))
+    }
+
+    /// Self-test hook: number of characters selected in the open editing
+    /// view (0 when none is open).
+    func selftestEditingSelectionLength() -> Int {
+        guard let tv = editingView else { return 0 }
+        return tv.selectedRange().length
+    }
+
+    /// Self-test hook: the current text of the open editing view.
+    func selftestEditingString() -> String {
+        editingView?.string ?? ""
+    }
+
+    /// Self-test hook: selects the given annotations (as a click would).
+    func selftestSelect(_ indices: [Int]) {
+        selected = Set(indices)
+        needsDisplay = true
+    }
+
+    /// Self-test hook: the drawable path for an annotation (as rendered).
+    func selftestPath(for a: Annotation) -> NSBezierPath? {
+        bezierPath(for: a)
+    }
+
+    /// Selects all the text in the open editing view (Cmd+A).
+    func selectAllInEditingField() {
+        editingView?.selectAll(nil)
     }
 
     /// Commits the open text field. Returns the index of the committed text
@@ -942,16 +1201,15 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     /// committed (empty new text, or an emptied re-edit deletes the annotation).
     @discardableResult
     private func commitTextEditing() -> Int? {
-        guard let field = editingField else { return nil }
-        // Leave text mode on every commit path (Esc, Enter, click-away,
-        // overlay close) so the next click doesn't open a new text field.
+        guard let tv = editingView else { return nil }
+        // Leave text mode on every commit path (Esc, click-away, overlay
+        // close) so the next click doesn't open a new text field.
         state.tool = state.lastNonTextTool
-        editingField = nil
-        field.resignFirstResponder()
+        editingView = nil
         window?.makeFirstResponder(self)
-        let str = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let str = tv.string.trimmingCharacters(in: .whitespacesAndNewlines)
         let family = editingFontFamily ?? state.fontFamily
-        let size = field.font?.pointSize ?? state.fontSize
+        let size = tv.font?.pointSize ?? state.fontSize
         // Fresh polygons have no text yet — let the toolbar font size apply.
         let targetSize: CGFloat
         if let idx = editingIndex, annotations.indices.contains(idx),
@@ -963,13 +1221,19 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         let idx = editingIndex
         editingIndex = nil
         editingFontFamily = nil
-        field.removeFromSuperview()
+        let undoPushed = editingUndoPushed
+        editingUndoPushed = false
+        let normalFamily = editingNormalFontFamily
+        let normalSize = editingNormalFontSize
+        editingNormalFontFamily = nil
+        editingNormalFontSize = nil
+        tv.removeFromSuperview()
 
         // Clearing an existing text deletes the annotation; clearing a
         // polygon's text just removes the text from inside it.
         if str.isEmpty {
             if let idx, annotations.indices.contains(idx) {
-                pushUndo()
+                if !undoPushed { pushUndo() }
                 if annotations[idx].kind == .text {
                     annotations.remove(at: idx)
                     selected = []
@@ -982,17 +1246,17 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             return nil
         }
 
-        let font = field.font ?? Fonts.nsFont(for: family, size: size)
-        let width = max(60, field.frame.width)
+        let font = tv.font ?? Fonts.nsFont(for: family, size: size)
+        let width = max(60, tv.frame.width)
         let attrs: [NSAttributedString.Key: Any] = [.font: font]
         let bounds = (str as NSString).boundingRect(
             with: NSSize(width: width, height: 100_000),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: attrs
         )
-        var r = field.frame
+        var r = tv.frame
         r.size = CGSize(width: width, height: max(bounds.height, size * 1.4))
-        pushUndo()
+        if !undoPushed { pushUndo() }
         if let idx, annotations.indices.contains(idx) {
             var updated = annotations[idx]
             if updated.kind == .text {
@@ -1037,49 +1301,106 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             rotation: 0,
             createdAt: Date(),
             locked: false,
-            zIndex: 0
+            zIndex: 0,
+            strokeStyle: .solid,
+            sloppiness: 0,
+            edgeRoughness: 0,
+            rx: state.cornerRadius,
+            ry: state.cornerRadiusY,
+            textInside: false,
+            textAnchor: .center,
+            dynamicWidth: false,
+            symbol: nil,
+            isCode: state.codeBlockMode,
+            normalFontFamily: state.codeBlockMode ? normalFamily : nil,
+            normalFontSize: state.codeBlockMode ? normalSize : nil
         ))
+        // Code blocks start monospaced at a readable size.
+        if state.codeBlockMode {
+            annotations[annotations.count - 1].fontFamily = "Cascadia Code"
+            annotations[annotations.count - 1].fontSize = 15
+        }
         needsDisplay = true
         return annotations.count - 1
     }
 
-    /// Inserts an emoji "logo" at the given canvas point (used by the "/" palette).
-    func insertEmoji(_ emoji: String, at p: CGPoint) {
+    /// Converts the selected text annotations into (or back from) syntax-
+    /// highlighted code blocks. Used by the "Code block" toolbar button.
+    func toggleCodeBlock() {
+        let textIdx = selected.filter { idx in
+            annotations.indices.contains(idx) && annotations[idx].kind == .text
+        }
+        guard !textIdx.isEmpty else { return }
+        pushUndo()
+        for idx in textIdx {
+            annotations[idx].isCode.toggle()
+            if annotations[idx].isCode {
+                // Remember what this text looked like before it became code,
+                // so toggling back restores it exactly — never a jump to the
+                // toolbar's current font, which makes text "disappear".
+                if annotations[idx].normalFontFamily == nil {
+                    annotations[idx].normalFontFamily = annotations[idx].fontFamily
+                    annotations[idx].normalFontSize = annotations[idx].fontSize
+                }
+                annotations[idx].fontFamily = "Cascadia Code"
+                if annotations[idx].fontSize > 18 {
+                    annotations[idx].fontSize = 15
+                }
+                if annotations[idx].rect.width < 420 {
+                    annotations[idx].rect.size.width = 420
+                }
+            } else {
+                annotations[idx].fontFamily = annotations[idx].normalFontFamily ?? state.fontFamily
+                annotations[idx].fontSize = annotations[idx].normalFontSize ?? state.fontSize
+                annotations[idx].normalFontFamily = nil
+                annotations[idx].normalFontSize = nil
+            }
+        }
+        needsDisplay = true
+    }
+
+    /// Inserts an SF Symbol icon at the given canvas point (used by the "/"
+    /// palette), tinted with the current stroke color.
+    func insertSymbol(_ symbol: String, at p: CGPoint) {
         // Adjust for canvas offset
         let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
-        let size: CGFloat = 48
-        let font = NSFont.systemFont(ofSize: size)
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        let bounds = (emoji as NSString).boundingRect(
-            with: NSSize(width: 300, height: 300),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: attrs
-        )
+        guard let image = tintedSymbolImage(named: symbol, pointSize: 44, color: state.strokeColor) else { return }
+        let size = image.size
         pushUndo()
         annotations.append(Annotation(
-            kind: .text,
+            kind: .image,
             rect: CGRect(
-                x: adjustedP.x - bounds.width / 2,
-                y: adjustedP.y - bounds.height / 2,
-                width: max(bounds.width, 24),
-                height: max(bounds.height, 24)
+                x: adjustedP.x - size.width / 2,
+                y: adjustedP.y - size.height / 2,
+                width: size.width,
+                height: size.height
             ),
-            strokeColor: .black,
+            strokeColor: state.strokeColor,
             fillColor: nil,
             fillOpacity: state.fillOpacity,
             strokeWidth: 2,
             points: [],
             pointTimes: [],
-            text: emoji,
+            text: "",
             fontFamily: "System",
-            fontSize: size,
-            image: nil,
+            fontSize: 44,
+            image: image,
             rounded: false,
             dashed: false,
             rotation: 0,
             createdAt: Date(),
             locked: false,
-            zIndex: 0
+            zIndex: annotations.count,
+            strokeStyle: .solid,
+            sloppiness: 0,
+            edgeRoughness: 0,
+            rx: state.cornerRadius,
+            ry: state.cornerRadiusY,
+            textInside: false,
+            textAnchor: .center,
+            dynamicWidth: false,
+            symbol: symbol,
+            isCode: false
         ))
         selected = [annotations.count - 1]
         needsDisplay = true
@@ -1352,7 +1673,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     private func draw(annotation a: Annotation, index: Int) {
         // While its edit field is open, don't draw the annotation's old
         // content underneath it — the field replaces the text until commit.
-        if editingField != nil, editingIndex == index {
+        if editingView != nil, editingIndex == index {
             if a.kind == .text { return }
         }
         let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
@@ -1396,15 +1717,19 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                     strokeDotted(path: path, color: a.strokeColor, width: a.strokeWidth)
                 }
             }
-            if a.kind == .arrow, let end = a.points.last {
-                let from = a.points.count > 1 ? a.points[a.points.count - 2] : end
-                drawArrowhead(at: end, from: from, color: a.strokeColor, width: a.strokeWidth)
+            if a.kind == .arrow || a.kind == .doubleArrow || a.kind == .curvedConnector || a.kind == .orthogonal {
+                if let seg = lastSegment(of: path) {
+                    drawArrowhead(at: seg.end, from: seg.start, color: a.strokeColor, width: a.strokeWidth)
+                }
+                if a.kind == .doubleArrow, let seg = firstSegment(of: path) {
+                    drawArrowhead(at: seg.start, from: seg.end, color: a.strokeColor, width: a.strokeWidth)
+                }
             }
             // Text attached to a polygon — drawn inside the rotation transform,
             // so it moves / rotates / scales together with the shape. Skipped
             // while its edit field is open (the field shows the text instead).
             if a.textInside, !a.text.isEmpty, isClosed(a.kind),
-               !(editingField != nil && editingIndex == index) {
+               !(editingView != nil && editingIndex == index) {
                 drawTextInShape(a)
             }
         }
@@ -1709,7 +2034,7 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                 a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
                 a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: a.fontSize * 1.4)
             }
-        case .freedraw, .autoshape, .laser:
+        case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal:
             let fixedX: CGFloat
             switch handle {
             case .topLeft, .midLeft, .bottomLeft: fixedX = orig.maxX
@@ -1832,6 +2157,10 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     }
 
     private func drawText(_ a: Annotation) {
+        if a.isCode {
+            drawCodeBlock(a)
+            return
+        }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: Fonts.nsFont(for: a.fontFamily, size: a.fontSize),
             .foregroundColor: a.strokeColor,
@@ -1841,6 +2170,168 @@ final class CanvasView: NSView, NSTextFieldDelegate {
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: attrs
         )
+    }
+
+    /// Code blocks: translucent rounded background (visible on white and
+    /// black backdrops) with syntax-highlighted monospaced text.
+    private func drawCodeBlock(_ a: Annotation) {
+        let dark = state.canvasBackground == .black
+        let pad: CGFloat = 14
+        let bgRect = a.rect.insetBy(dx: -pad, dy: -pad)
+        let bg = NSBezierPath(roundedRect: bgRect, xRadius: 8, yRadius: 8)
+        let fill = dark
+            ? NSColor.white.withAlphaComponent(0.12)
+            : NSColor.black.withAlphaComponent(0.08)
+        fill.setFill()
+        bg.fill()
+        let border = dark
+            ? NSColor.white.withAlphaComponent(0.3)
+            : NSColor.black.withAlphaComponent(0.18)
+        border.setStroke()
+        bg.lineWidth = 1
+        bg.stroke()
+
+        let font = Fonts.nsFont(for: "Cascadia Code", size: a.fontSize)
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byWordWrapping
+        let styled = syntaxHighlighted(a.text, font: font, dark: dark)
+        styled.draw(
+            with: a.rect,
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+    }
+
+    /// Lightweight tokenizer that colors keywords, types, functions, strings,
+    /// comments and numbers — with palettes tuned for light and dark backdrops.
+    private func syntaxHighlighted(_ text: String, font: NSFont, dark: Bool) -> NSAttributedString {
+        struct Palette {
+            let plain: NSColor
+            let keyword: NSColor
+            let type: NSColor
+            let function: NSColor
+            let string: NSColor
+            let number: NSColor
+            let comment: NSColor
+        }
+        let palette = dark
+            ? Palette(
+                plain: NSColor(calibratedWhite: 0.93, alpha: 1),
+                keyword: NSColor(calibratedRed: 0.36, green: 0.62, blue: 0.9, alpha: 1),
+                type: NSColor(calibratedRed: 0.32, green: 0.78, blue: 0.7, alpha: 1),
+                function: NSColor(calibratedRed: 0.86, green: 0.86, blue: 0.63, alpha: 1),
+                string: NSColor(calibratedRed: 0.82, green: 0.56, blue: 0.47, alpha: 1),
+                number: NSColor(calibratedRed: 0.71, green: 0.82, blue: 0.65, alpha: 1),
+                comment: NSColor(calibratedRed: 0.45, green: 0.6, blue: 0.36, alpha: 1)
+            )
+            : Palette(
+                plain: NSColor(calibratedWhite: 0.12, alpha: 1),
+                keyword: NSColor(calibratedRed: 0.65, green: 0.1, blue: 0.82, alpha: 1),
+                type: NSColor(calibratedRed: 0.1, green: 0.48, blue: 0.6, alpha: 1),
+                function: NSColor(calibratedRed: 0.45, green: 0.33, blue: 0.13, alpha: 1),
+                string: NSColor(calibratedRed: 0.62, green: 0.13, blue: 0.13, alpha: 1),
+                number: NSColor(calibratedRed: 0.04, green: 0.47, blue: 0.3, alpha: 1),
+                comment: NSColor(calibratedRed: 0.29, green: 0.52, blue: 0.3, alpha: 1)
+            )
+        let keywords: Set<String> = [
+            "fn", "func", "function", "def", "let", "var", "const", "if", "else",
+            "for", "while", "do", "return", "import", "from", "class", "struct",
+            "enum", "public", "private", "static", "new", "try", "catch", "throw",
+            "throws", "async", "await", "switch", "case", "break", "continue",
+            "default", "in", "of", "type", "interface", "extends", "implements",
+            "super", "this", "self", "nil", "null", "true", "false", "and", "or",
+            "not", "with", "as", "guard", "defer", "init", "deinit", "override",
+            "mutating", "protocol", "extension", "where", "yield", "print", "export",
+        ]
+        let types: Set<String> = [
+            "int", "float", "double", "string", "str", "bool", "boolean", "char",
+            "void", "any", "never", "number", "object", "array", "list", "dict",
+            "map", "set", "tuple", "byte", "short", "long", "uint", "i8", "i16",
+            "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "Date", "Data",
+            "URL", "UUID", "Error", "Result", "Promise", "Vec", "Option",
+        ]
+        let chars = Array(text)
+        let result = NSMutableAttributedString()
+        var i = 0
+        let n = chars.count
+        func appendPlain(_ s: Substring) {
+            if s.isEmpty { return }
+            result.append(NSAttributedString(string: String(s), attributes: [
+                .font: font, .foregroundColor: palette.plain,
+            ]))
+        }
+        while i < n {
+            let c = chars[i]
+            // Line comment
+            if c == "/", i + 1 < n, chars[i + 1] == "/" {
+                var j = i
+                while j < n, chars[j] != "\n" { j += 1 }
+                result.append(NSAttributedString(string: String(chars[i..<j]), attributes: [
+                    .font: font, .foregroundColor: palette.comment,
+                ]))
+                i = j
+                continue
+            }
+            // String literal
+            if c == "\"" || c == "'" {
+                let quote = c
+                var j = i + 1
+                while j < n {
+                    if chars[j] == "\\" { j += 2; continue }
+                    if chars[j] == quote { j += 1; break }
+                    j += 1
+                }
+                result.append(NSAttributedString(string: String(chars[i..<j]), attributes: [
+                    .font: font, .foregroundColor: palette.string,
+                ]))
+                i = j
+                continue
+            }
+            // Number
+            if c.isNumber || (c == "." && i + 1 < n && chars[i + 1].isNumber) {
+                var j = i
+                while j < n, chars[j].isNumber || chars[j] == "." || chars[j] == "_"
+                    || "xXbB".contains(chars[j]) {
+                    j += 1
+                }
+                result.append(NSAttributedString(string: String(chars[i..<j]), attributes: [
+                    .font: font, .foregroundColor: palette.number,
+                ]))
+                i = j
+                continue
+            }
+            // Identifier
+            if c.isLetter || c == "_" {
+                var j = i
+                while j < n, chars[j].isLetter || chars[j].isNumber || chars[j] == "_" { j += 1 }
+                let word = String(chars[i..<j])
+                let color: NSColor
+                if keywords.contains(word) {
+                    color = palette.keyword
+                } else if types.contains(word) {
+                    color = palette.type
+                } else if j < n, chars[j] == "(" {
+                    color = palette.function
+                } else {
+                    color = palette.plain
+                }
+                result.append(NSAttributedString(string: word, attributes: [
+                    .font: font, .foregroundColor: color,
+                ]))
+                i = j
+                continue
+            }
+            // Whitespace + punctuation run
+            var j = i
+            while j < n {
+                let ch = chars[j]
+                if ch.isLetter || ch.isNumber || ch == "_" || ch == "\"" || ch == "'" { break }
+                if ch == "/", j + 1 < n, chars[j + 1] == "/" { break }
+                j += 1
+            }
+            appendPlain(text[text.index(text.startIndex, offsetBy: i)..<text.index(text.startIndex, offsetBy: j)])
+            i = j
+        }
+        return result
     }
 
     /// Text anchored inside a polygon: centered, wrapped to the shape's width,
@@ -2004,6 +2495,24 @@ final class CanvasView: NSView, NSTextFieldDelegate {
         case .arrow, .line:
             let pts = a.points
             guard pts.count > 1 else { return NSBezierPath() }
+            let s = pts[0]
+            let e = pts[pts.count - 1]
+            let margin = 8 + a.strokeWidth / 2
+            let obstacles = connectorObstacles(for: a, margin: margin)
+            if straightIsBlocked(s, e, obstacles: obstacles),
+               let route = connectorRoute(
+                   from: s, to: e,
+                   startOwner: connectorOwner(at: s),
+                   endOwner: connectorOwner(at: e),
+                   obstacles: obstacles
+               ) {
+                let path = NSBezierPath()
+                path.move(to: route[0])
+                for p in route.dropFirst() {
+                    path.line(to: p)
+                }
+                return path
+            }
             if rough {
                 return roughLine(from: pts[0], to: pts[pts.count - 1], slop: slop, edge: edge, seed: seed)
             }
@@ -2037,6 +2546,320 @@ final class CanvasView: NSView, NSTextFieldDelegate {
                     controlPoint2: cur
                 )
             }
+            path.close()
+            return path
+        case .doubleArrow, .curvedConnector, .orthogonal:
+            let pts = a.points
+            guard pts.count > 1 else { return NSBezierPath() }
+            let s = pts[0]
+            let e = pts[pts.count - 1]
+            let margin = 8 + a.strokeWidth / 2
+            let obstacles = connectorObstacles(for: a, margin: margin)
+            var blocked = false
+            switch a.kind {
+            case .doubleArrow:
+                blocked = straightIsBlocked(s, e, obstacles: obstacles)
+            case .orthogonal:
+                blocked = straightIsBlocked(s, e, obstacles: obstacles)
+                    || straightIsBlocked(s, CGPoint(x: e.x, y: s.y), obstacles: obstacles)
+                    || straightIsBlocked(CGPoint(x: e.x, y: s.y), e, obstacles: obstacles)
+            default:
+                let p0 = s
+                let p1 = e
+                let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
+                let dx = p1.x - p0.x
+                let dy = p1.y - p0.y
+                let len = max(1, sqrt(dx * dx + dy * dy))
+                let n = CGPoint(x: -dy / len, y: dx / len)
+                let c1 = CGPoint(
+                    x: p0.x + (mid.x - p0.x) * 0.55 + n.x * len * 0.22,
+                    y: p0.y + (mid.y - p0.y) * 0.55 + n.y * len * 0.22
+                )
+                let c2 = CGPoint(
+                    x: p1.x + (mid.x - p1.x) * 0.55 - n.x * len * 0.22,
+                    y: p1.y + (mid.y - p1.y) * 0.55 - n.y * len * 0.22
+                )
+                blocked = curveIsBlocked(p0, c1, c2, p1, obstacles: obstacles)
+            }
+            if blocked,
+               let route = connectorRoute(
+                   from: s, to: e,
+                   startOwner: connectorOwner(at: s),
+                   endOwner: connectorOwner(at: e),
+                   obstacles: obstacles
+               ) {
+                let path = NSBezierPath()
+                path.move(to: route[0])
+                for p in route.dropFirst() {
+                    path.line(to: p)
+                }
+                return path
+            }
+            switch a.kind {
+            case .doubleArrow, .orthogonal:
+                let path = NSBezierPath()
+                path.move(to: pts[0])
+                var prev = pts[0]
+                for p in pts.dropFirst() {
+                    if a.kind == .orthogonal {
+                        path.line(to: CGPoint(x: p.x, y: prev.y))
+                        path.line(to: p)
+                    } else {
+                        path.line(to: p)
+                    }
+                    prev = p
+                }
+                return path
+            default:
+                // S-curve connector between the first and last point.
+                let p0 = pts[0]
+                let p1 = pts[pts.count - 1]
+                let mid = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
+                let dx = p1.x - p0.x
+                let dy = p1.y - p0.y
+                let len = max(1, sqrt(dx * dx + dy * dy))
+                let n = CGPoint(x: -dy / len, y: dx / len)
+                let off = n.x * len * 0.22
+                let offY = n.y * len * 0.22
+                let c1 = CGPoint(
+                    x: p0.x + (mid.x - p0.x) * 0.55 + off,
+                    y: p0.y + (mid.y - p0.y) * 0.55 + offY
+                )
+                let c2 = CGPoint(
+                    x: p1.x + (mid.x - p1.x) * 0.55 - off,
+                    y: p1.y + (mid.y - p1.y) * 0.55 - offY
+                )
+                let path = NSBezierPath()
+                path.move(to: p0)
+                path.curve(to: p1, controlPoint1: c1, controlPoint2: c2)
+                return path
+            }
+        case .triangle:
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.midX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX, y: r.maxY))
+            path.close()
+            return path
+        case .rightTriangle:
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX, y: r.maxY))
+            path.close()
+            return path
+        case .parallelogram, .manualInput:
+            let s = r.width * 0.22
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX + s, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX - s, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            path.close()
+            return path
+        case .trapezoid:
+            let s = r.width * 0.18
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX + s, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX - s, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            path.close()
+            return path
+        case .display:
+            let s = r.width * 0.18
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX - s, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX, y: r.maxY))
+            path.close()
+            return path
+        case .pentagon, .hexagon, .octagon, .star, .star6:
+            let c = CGPoint(x: r.midX, y: r.midY)
+            let radius = min(r.width, r.height) / 2
+            let sides: Int
+            switch a.kind {
+            case .pentagon: sides = 5
+            case .hexagon: sides = 6
+            case .octagon: sides = 8
+            case .star: sides = 10
+            default: sides = 12
+            }
+            let inner = a.kind == .star || a.kind == .star6 ? radius * (a.kind == .star ? 0.4 : 0.5) : radius
+            let path = NSBezierPath()
+            let startAngle: CGFloat = a.kind == .star || a.kind == .star6 ? -90 : 90
+            for i in 0..<sides {
+                let angle = startAngle + CGFloat(i) * 360 / CGFloat(sides)
+                let rad = (i % 2 == 1 && (a.kind == .star || a.kind == .star6)) ? inner : radius
+                let radian = angle * .pi / 180
+                let p = CGPoint(x: c.x + rad * cos(radian), y: c.y + rad * sin(radian))
+                if i == 0 { path.move(to: p) } else { path.line(to: p) }
+            }
+            path.close()
+            return path
+        case .cross:
+            let t = min(r.width, r.height) * 0.34
+            let c = CGPoint(x: r.midX, y: r.midY)
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: c.x - t / 2, y: r.minY))
+            path.line(to: CGPoint(x: c.x + t / 2, y: r.minY))
+            path.line(to: CGPoint(x: c.x + t / 2, y: c.y - t / 2))
+            path.line(to: CGPoint(x: r.maxX, y: c.y - t / 2))
+            path.line(to: CGPoint(x: r.maxX, y: c.y + t / 2))
+            path.line(to: CGPoint(x: c.x + t / 2, y: c.y + t / 2))
+            path.line(to: CGPoint(x: c.x + t / 2, y: r.maxY))
+            path.line(to: CGPoint(x: c.x - t / 2, y: r.maxY))
+            path.line(to: CGPoint(x: c.x - t / 2, y: c.y + t / 2))
+            path.line(to: CGPoint(x: r.minX, y: c.y + t / 2))
+            path.line(to: CGPoint(x: r.minX, y: c.y - t / 2))
+            path.line(to: CGPoint(x: c.x - t / 2, y: c.y - t / 2))
+            path.close()
+            return path
+        case .process:
+            let path = NSBezierPath()
+            let rad = min(r.width, r.height) * 0.15
+            path.appendRoundedRect(r, xRadius: rad, yRadius: rad)
+            return path
+        case .predefinedProcess:
+            let path = NSBezierPath()
+            path.appendRect(r)
+            let bx = r.width * 0.11
+            path.move(to: CGPoint(x: r.minX + bx, y: r.minY))
+            path.line(to: CGPoint(x: r.minX + bx, y: r.maxY))
+            path.move(to: CGPoint(x: r.maxX - bx, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX - bx, y: r.maxY))
+            return path
+        case .delay:
+            let rad = min(r.height / 2, r.width * 0.42)
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX, y: r.maxY))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY))
+            path.line(to: CGPoint(x: r.minX, y: r.minY))
+            path.quadCurve(
+                to: CGPoint(x: r.minX, y: r.maxY),
+                controlPoint: CGPoint(x: r.minX - rad, y: r.midY)
+            )
+            return path
+        case .cloud:
+            let c = CGPoint(x: r.midX, y: r.midY)
+            let s = min(r.width, r.height) * 0.5
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: c.x - 0.85 * s, y: c.y - 0.1 * s))
+            path.quadCurve(
+                to: CGPoint(x: c.x - 0.6 * s, y: c.y - 0.6 * s),
+                controlPoint: CGPoint(x: c.x - 1.25 * s, y: c.y - 0.4 * s)
+            )
+            path.quadCurve(
+                to: CGPoint(x: c.x + 0.05 * s, y: c.y - 0.7 * s),
+                controlPoint: CGPoint(x: c.x - 0.3 * s, y: c.y - 1.05 * s)
+            )
+            path.quadCurve(
+                to: CGPoint(x: c.x + 0.55 * s, y: c.y - 0.55 * s),
+                controlPoint: CGPoint(x: c.x + 0.3 * s, y: c.y - 1.0 * s)
+            )
+            path.quadCurve(
+                to: CGPoint(x: c.x + 0.8 * s, y: c.y - 0.05 * s),
+                controlPoint: CGPoint(x: c.x + 1.0 * s, y: c.y - 0.7 * s)
+            )
+            path.quadCurve(
+                to: CGPoint(x: c.x + 0.4 * s, y: c.y + 0.5 * s),
+                controlPoint: CGPoint(x: c.x + 1.15 * s, y: c.y + 0.25 * s)
+            )
+            path.quadCurve(
+                to: CGPoint(x: c.x - 0.35 * s, y: c.y + 0.55 * s),
+                controlPoint: CGPoint(x: c.x + 0.1 * s, y: c.y + 0.9 * s)
+            )
+            path.quadCurve(
+                to: CGPoint(x: c.x - 0.85 * s, y: c.y + 0.1 * s),
+                controlPoint: CGPoint(x: c.x - 0.65 * s, y: c.y + 0.8 * s)
+            )
+            path.close()
+            return path
+        case .serverStack:
+            let path = NSBezierPath()
+            let slot = r.height / 3
+            let inset = min(r.width * 0.06, slot * 0.3)
+            let rad = min(r.width, slot) * 0.08
+            for k in 0..<3 {
+                let y = r.minY + slot * CGFloat(k)
+                let rect = CGRect(x: r.minX + inset, y: y + inset * 0.5, width: r.width - inset * 2, height: slot - inset)
+                path.appendRoundedRect(rect, xRadius: rad, yRadius: rad)
+                let midX = r.midX
+                path.move(to: CGPoint(x: midX - r.width * 0.18, y: rect.midY))
+                path.line(to: CGPoint(x: midX + r.width * 0.18, y: rect.midY))
+            }
+            return path
+        case .queue:
+            let path = NSBezierPath()
+            let rad = min(r.height * 0.12, r.width * 0.14)
+            path.appendRoundedRect(r, xRadius: rad, yRadius: rad)
+            let gap = r.height / 4
+            for k in 0..<3 {
+                let center = CGPoint(x: r.minX - rad * 2.4, y: r.minY + gap + gap * CGFloat(k))
+                path.appendOval(in: CGRect(
+                    x: center.x - rad, y: center.y - rad,
+                    width: rad * 2, height: rad * 2
+                ))
+            }
+            return path
+        case .firewall:
+            let path = NSBezierPath()
+            path.appendRect(r)
+            let brickH = r.height / 2
+            path.move(to: CGPoint(x: r.minX, y: r.minY + brickH))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY + brickH))
+            let brickW = r.width / 3
+            path.move(to: CGPoint(x: r.minX + brickW, y: r.minY))
+            path.line(to: CGPoint(x: r.minX + brickW, y: r.minY + brickH))
+            path.move(to: CGPoint(x: r.minX + brickW / 2, y: r.minY + brickH))
+            path.line(to: CGPoint(x: r.minX + brickW / 2, y: r.maxY))
+            path.move(to: CGPoint(x: r.minX + brickW * 1.5, y: r.minY + brickH))
+            path.line(to: CGPoint(x: r.minX + brickW * 1.5, y: r.maxY))
+            return path
+        case .cube:
+            let d = r.width * 0.16
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX, y: r.maxY))
+            path.close()
+            path.move(to: CGPoint(x: r.minX, y: r.minY))
+            path.line(to: CGPoint(x: r.minX + d, y: r.minY - d))
+            path.line(to: CGPoint(x: r.maxX + d, y: r.minY - d))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY))
+            path.move(to: CGPoint(x: r.maxX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX + d, y: r.minY - d))
+            path.line(to: CGPoint(x: r.maxX + d, y: r.maxY - d))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY))
+            return path
+        case .callout:
+            let path = NSBezierPath()
+            let rad = min(r.width, r.height) * 0.1
+            let tailY = r.maxY - r.height * 0.28
+            path.move(to: CGPoint(x: r.minX + rad, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX - rad, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY + rad))
+            path.line(to: CGPoint(x: r.maxX, y: r.maxY - rad))
+            path.line(to: CGPoint(x: r.maxX - rad, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX + r.width * 0.22, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX + r.width * 0.1, y: r.maxY + r.height * 0.32))
+            path.line(to: CGPoint(x: r.minX + r.width * 0.04, y: tailY))
+            path.line(to: CGPoint(x: r.minX, y: tailY))
+            path.line(to: CGPoint(x: r.minX, y: r.minY + rad))
+            path.close()
+            return path
+        case .note:
+            let fold = min(r.width, r.height) * 0.22
+            let path = NSBezierPath()
+            path.move(to: CGPoint(x: r.minX, y: r.maxY))
+            path.line(to: CGPoint(x: r.minX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY))
+            path.line(to: CGPoint(x: r.maxX, y: r.minY + fold))
+            path.line(to: CGPoint(x: r.maxX - fold, y: r.minY + fold))
+            path.line(to: CGPoint(x: r.maxX - fold, y: r.maxY))
             path.close()
             return path
         default:
@@ -2329,6 +3152,218 @@ final class CanvasView: NSView, NSTextFieldDelegate {
     /// dragging their endpoints. `selfIndex` excludes the shape being edited.
     private let snapThreshold: CGFloat = 10
 
+    // MARK: - connector routing
+
+    /// The closed shape a connector end is attached to (within snap distance),
+    /// with the outward-facing normal at the attachment point. The connector
+    /// must leave / enter its shape perpendicular to the shape's edge.
+    private struct ConnectorOwner {
+        var normal: CGPoint
+    }
+
+    private func connectorOwner(at p: CGPoint) -> ConnectorOwner? {
+        var bestIndex: Int?
+        var bestDist = CGFloat.greatestFiniteMagnitude
+        for (i, a) in annotations.enumerated() {
+            guard isClosed(a.kind), a.kind != .laser, a.rect.width > 0, a.rect.height > 0 else { continue }
+            let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
+            let local = rotatedPoint(p, around: center, by: -a.rotation)
+            let d = distancePointToRect(local, a.rect)
+            if d < snapThreshold && d < bestDist {
+                bestDist = d
+                bestIndex = i
+            }
+        }
+        guard let bestIndex else { return nil }
+        let a = annotations[bestIndex]
+        let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
+        let local = rotatedPoint(p, around: center, by: -a.rotation)
+        let boundary = flattenedPoints(bezierPath(for: a), step: 3)
+        guard !boundary.isEmpty else { return nil }
+        var bestPt = boundary[0]
+        var bestD = distance(local, bestPt)
+        for q in boundary.dropFirst() {
+            let d = distance(local, q)
+            if d < bestD {
+                bestD = d
+                bestPt = q
+            }
+        }
+        var tangent = CGPoint.zero
+        if let qi = boundary.firstIndex(of: bestPt) {
+            let prev = boundary[(qi - 1 + boundary.count) % boundary.count]
+            let next = boundary[(qi + 1) % boundary.count]
+            tangent = CGPoint(x: next.x - prev.x, y: next.y - prev.y)
+        }
+        let len = max(0.001, sqrt(tangent.x * tangent.x + tangent.y * tangent.y))
+        var normal = CGPoint(x: -tangent.y / len, y: tangent.x / len)
+        let toCenter = CGPoint(x: center.x - local.x, y: center.y - local.y)
+        if normal.x * toCenter.x + normal.y * toCenter.y < 0 {
+            normal = CGPoint(x: -normal.x, y: -normal.y)
+        }
+        return ConnectorOwner(normal: rotatedPoint(normal, around: .zero, by: a.rotation))
+    }
+
+    /// Rects that block a connector's straight path: every closed shape plus
+    /// text/image blocks, inflated by a clearance margin. The connector
+    /// itself is never its own obstacle.
+    private func connectorObstacles(for a: Annotation, margin: CGFloat) -> [CGRect] {
+        var out: [CGRect] = []
+        for other in annotations {
+            if other.kind == a.kind,
+               other.rect == a.rect,
+               other.points == a.points,
+               other.rotation == a.rotation,
+               other.strokeWidth == a.strokeWidth {
+                continue
+            }
+            guard (isClosed(other.kind) || other.kind == .text || other.kind == .image), other.kind != .laser else { continue }
+            out.append(other.rect.insetBy(dx: -margin, dy: -margin))
+        }
+        return out
+    }
+
+    private func straightIsBlocked(_ from: CGPoint, _ to: CGPoint, obstacles: [CGRect]) -> Bool {
+        let mnX = min(from.x, to.x), mxX = max(from.x, to.x)
+        let mnY = min(from.y, to.y), mxY = max(from.y, to.y)
+        for ob in obstacles where mxX >= ob.minX && mnX <= ob.maxX && mxY >= ob.minY && mnY <= ob.maxY {
+            return true
+        }
+        return false
+    }
+
+    private func curveIsBlocked(_ p0: CGPoint, _ c1: CGPoint, _ c2: CGPoint, _ p1: CGPoint, obstacles: [CGRect]) -> Bool {
+        for k in 1...12 {
+            let f = CGFloat(k) / 12
+            let q = cubicPoint(p0, c1, c2, p1, t: f)
+            for ob in obstacles where q.x >= ob.minX && q.x <= ob.maxX && q.y >= ob.minY && q.y <= ob.maxY {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func routeCollides(_ pts: [CGPoint], obstacles: [CGRect]) -> Bool {
+        for k in 0..<(pts.count - 1) {
+            if straightIsBlocked(pts[k], pts[k + 1], obstacles: obstacles) { return true }
+        }
+        return false
+    }
+
+    /// Finds an orthogonal path from `start` to `end` that clears every
+    /// obstacle, leaving both ends perpendicular to the edge of the shape
+    /// they are attached to. Returns nil when no clean route exists.
+    private func connectorRoute(
+        from start: CGPoint,
+        to end: CGPoint,
+        startOwner: ConnectorOwner?,
+        endOwner: ConnectorOwner?,
+        obstacles: [CGRect]
+    ) -> [CGPoint]? {
+        let legLengths: [CGFloat] = [32, 56, 88, 128, 176]
+        for leg in legLengths {
+            let a = startOwner.map { CGPoint(x: start.x + $0.normal.x * leg, y: start.y + $0.normal.y * leg) } ?? start
+            let b = endOwner.map { CGPoint(x: end.x + $0.normal.x * leg, y: end.y + $0.normal.y * leg) } ?? end
+            var candidates: [[CGPoint]] = []
+            let mx = (a.x + b.x) / 2
+            let my = (a.y + b.y) / 2
+            // Horizontal-first and vertical-first bends, plus parallel
+            // offsets so routes can dodge obstacles sitting beside the
+            // direct line.
+            for y in [a.y, b.y, my, my - 60, my + 60, my - 120, my + 120] {
+                candidates.append([a, CGPoint(x: a.x, y: y), CGPoint(x: b.x, y: y), b])
+            }
+            for x in [a.x, b.x, mx, mx - 60, mx + 60, mx - 120, mx + 120] {
+                candidates.append([a, CGPoint(x: x, y: b.y), CGPoint(x: x, y: a.y), b])
+            }
+            candidates.sort { pathLength($0) < pathLength($1) }
+            for cand in candidates {
+                var full: [CGPoint] = [start]
+                for q in cand where distance(full.last!, q) > 0.5 {
+                    full.append(q)
+                }
+                if distance(full.last!, end) > 0.5 { full.append(end) }
+                if !routeCollides(full, obstacles: obstacles) {
+                    return full
+                }
+            }
+        }
+        return nil
+    }
+
+    private func pathLength(_ pts: [CGPoint]) -> CGFloat {
+        var len: CGFloat = 0
+        for k in 0..<(pts.count - 1) {
+            len += distance(pts[k], pts[k + 1])
+        }
+        return len
+    }
+
+    /// Direction of the path's final segment — follows curves along their end
+    /// tangent so arrowheads stay glued to the line.
+    private func lastSegment(of path: NSBezierPath) -> (start: CGPoint, end: CGPoint)? {
+        var prev = CGPoint.zero
+        var havePrev = false
+        var last: (start: CGPoint, end: CGPoint)?
+        for i in 0..<path.elementCount {
+            let pts = UnsafeMutablePointer<NSPoint>.allocate(capacity: 3)
+            defer { pts.deallocate() }
+            switch path.element(at: i, associatedPoints: pts) {
+            case .moveTo:
+                prev = pts[0]
+                havePrev = true
+            case .lineTo:
+                if havePrev { last = (prev, pts[0]) }
+                prev = pts[0]
+            case .curveTo, .cubicCurveTo:
+                if havePrev {
+                    let tangent = CGPoint(x: pts[2].x - pts[1].x, y: pts[2].y - pts[1].y)
+                    last = (CGPoint(x: pts[2].x - tangent.x, y: pts[2].y - tangent.y), pts[2])
+                }
+                prev = pts[2]
+            case .quadraticCurveTo:
+                if havePrev {
+                    let tangent = CGPoint(x: pts[1].x - pts[0].x, y: pts[1].y - pts[0].y)
+                    last = (CGPoint(x: pts[1].x - tangent.x, y: pts[1].y - tangent.y), pts[1])
+                }
+                prev = pts[1]
+            default:
+                break
+            }
+        }
+        return last
+    }
+
+    /// Direction of the path's first segment.
+    private func firstSegment(of path: NSBezierPath) -> (start: CGPoint, end: CGPoint)? {
+        var prev = CGPoint.zero
+        var havePrev = false
+        for i in 0..<path.elementCount {
+            let pts = UnsafeMutablePointer<NSPoint>.allocate(capacity: 3)
+            defer { pts.deallocate() }
+            switch path.element(at: i, associatedPoints: pts) {
+            case .moveTo:
+                prev = pts[0]
+                havePrev = true
+            case .lineTo:
+                if havePrev { return (prev, pts[0]) }
+            case .curveTo, .cubicCurveTo:
+                if havePrev { return (prev, pts[2]) }
+            case .quadraticCurveTo:
+                if havePrev { return (prev, pts[1]) }
+            default:
+                break
+            }
+        }
+        return nil
+    }
+
+    private func distancePointToRect(_ p: CGPoint, _ r: CGRect) -> CGFloat {
+        let dx = max(r.minX - p.x, 0, p.x - r.maxX)
+        let dy = max(r.minY - p.y, 0, p.y - r.maxY)
+        return sqrt(dx * dx + dy * dy)
+    }
+
     private func snappedBoundaryPoint(_ p: CGPoint, selfIndex: Int? = nil) -> CGPoint {
         var bestDist = CGFloat.greatestFiniteMagnitude
         var bestPoint = p
@@ -2355,7 +3390,12 @@ final class CanvasView: NSView, NSTextFieldDelegate {
 
     private func isClosed(_ kind: ShapeKind) -> Bool {
         switch kind {
-        case .rect, .diamond, .ellipse, .frame, .autoshape:
+        case .rect, .diamond, .ellipse, .frame, .autoshape,
+             .triangle, .rightTriangle, .parallelogram, .trapezoid,
+             .pentagon, .hexagon, .octagon, .star, .star6, .cross,
+             .process, .predefinedProcess, .delay, .manualInput, .display,
+             .cloud, .serverStack, .queue, .firewall, .cube,
+             .callout, .note:
             return true
         default:
             return false

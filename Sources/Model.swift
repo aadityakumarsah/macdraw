@@ -13,6 +13,36 @@ enum ShapeKind: String {
     case laser
     case text
     case image
+    // Polygon library
+    case triangle
+    case rightTriangle
+    case parallelogram
+    case trapezoid
+    case pentagon
+    case hexagon
+    case octagon
+    case star
+    case star6
+    case cross
+    // Flowchart
+    case process
+    case predefinedProcess
+    case delay
+    case manualInput
+    case display
+    // Architecture
+    case cloud
+    case serverStack
+    case queue
+    case firewall
+    case cube
+    // Communication
+    case callout
+    case note
+    // Connectors
+    case doubleArrow
+    case curvedConnector
+    case orthogonal
 }
 
 /// How the outline of a shape is stroked.
@@ -56,6 +86,41 @@ enum Tool: String, CaseIterable {
     case lasso
     case laser
     case bucketFill
+    case triangle
+    case rightTriangle
+    case parallelogram
+    case trapezoid
+    case pentagon
+    case hexagon
+    case octagon
+    case star
+    case star6
+    case cross
+    case process
+    case predefinedProcess
+    case delay
+    case manualInput
+    case display
+    case cloud
+    case serverStack
+    case queue
+    case firewall
+    case cube
+    case callout
+    case note
+    case doubleArrow
+    case curvedConnector
+    case orthogonal
+
+    /// Tools that draw rect-based shapes, shown in the shape palette.
+    static let shapePalette: [Tool] = [
+        .rectangle, .diamond, .ellipse, .triangle, .rightTriangle,
+        .parallelogram, .trapezoid, .pentagon, .hexagon, .octagon,
+        .star, .star6, .cross, .process, .predefinedProcess, .delay,
+        .manualInput, .display, .cloud, .serverStack, .queue,
+        .firewall, .cube, .callout, .note, .arrow, .line,
+        .doubleArrow, .curvedConnector, .orthogonal,
+    ]
 
     var iconName: String {
         switch self {
@@ -76,6 +141,31 @@ enum Tool: String, CaseIterable {
         case .lasso: return "lasso"
         case .laser: return "laser"
         case .bucketFill: return "bucket-fill"
+        case .triangle: return "triangle"
+        case .rightTriangle: return "right-triangle"
+        case .parallelogram: return "parallelogram"
+        case .trapezoid: return "trapezoid"
+        case .pentagon: return "pentagon"
+        case .hexagon: return "hexagon"
+        case .octagon: return "octagon"
+        case .star: return "star"
+        case .star6: return "star6"
+        case .cross: return "cross"
+        case .process: return "process"
+        case .predefinedProcess: return "predefined-process"
+        case .delay: return "delay"
+        case .manualInput: return "manual-input"
+        case .display: return "display"
+        case .cloud: return "cloud"
+        case .serverStack: return "server-stack"
+        case .queue: return "queue"
+        case .firewall: return "firewall"
+        case .cube: return "cube"
+        case .callout: return "callout"
+        case .note: return "note"
+        case .doubleArrow: return "double-arrow"
+        case .curvedConnector: return "curved-connector"
+        case .orthogonal: return "orthogonal"
         }
     }
 
@@ -98,6 +188,31 @@ enum Tool: String, CaseIterable {
         case .lasso: return "Lasso"
         case .laser: return "Laser"
         case .bucketFill: return "Fill"
+        case .triangle: return "Triangle"
+        case .rightTriangle: return "Right triangle"
+        case .parallelogram: return "Parallelogram"
+        case .trapezoid: return "Trapezoid"
+        case .pentagon: return "Pentagon"
+        case .hexagon: return "Hexagon"
+        case .octagon: return "Octagon"
+        case .star: return "Star"
+        case .star6: return "6-point star"
+        case .cross: return "Cross"
+        case .process: return "Process"
+        case .predefinedProcess: return "Predefined process"
+        case .delay: return "Delay"
+        case .manualInput: return "Manual input"
+        case .display: return "Display"
+        case .cloud: return "Cloud"
+        case .serverStack: return "Server stack"
+        case .queue: return "Queue"
+        case .firewall: return "Firewall"
+        case .cube: return "Cube"
+        case .callout: return "Callout"
+        case .note: return "Note"
+        case .doubleArrow: return "Double arrow"
+        case .curvedConnector: return "Curved connector"
+        case .orthogonal: return "Orthogonal line"
         }
     }
 
@@ -112,6 +227,31 @@ enum Tool: String, CaseIterable {
         case .autoshape: return .autoshape
         case .frame, .embeddable: return .frame
         case .laser: return .laser
+        case .triangle: return .triangle
+        case .rightTriangle: return .rightTriangle
+        case .parallelogram: return .parallelogram
+        case .trapezoid: return .trapezoid
+        case .pentagon: return .pentagon
+        case .hexagon: return .hexagon
+        case .octagon: return .octagon
+        case .star: return .star
+        case .star6: return .star6
+        case .cross: return .cross
+        case .process: return .process
+        case .predefinedProcess: return .predefinedProcess
+        case .delay: return .delay
+        case .manualInput: return .manualInput
+        case .display: return .display
+        case .cloud: return .cloud
+        case .serverStack: return .serverStack
+        case .queue: return .queue
+        case .firewall: return .firewall
+        case .cube: return .cube
+        case .callout: return .callout
+        case .note: return .note
+        case .doubleArrow: return .doubleArrow
+        case .curvedConnector: return .curvedConnector
+        case .orthogonal: return .orthogonal
         default: return nil
         }
     }
@@ -152,6 +292,16 @@ struct Annotation {
     /// True when this stroke renders with variable width — velocity-driven
     /// calligraphic swell and taper — instead of uniform thickness.
     var dynamicWidth: Bool = false
+    /// SF Symbol name for icon annotations (inserted from the "/" palette) —
+    /// lets recoloring re-render the tinted icon.
+    var symbol: String? = nil
+    /// True when this text renders as a syntax-highlighted code block with a
+    /// translucent background.
+    var isCode: Bool = false
+    /// Font this text used before it became a code block — restored exactly
+    /// when toggling back to normal text (nil = never converted).
+    var normalFontFamily: String? = nil
+    var normalFontSize: CGFloat? = nil
 }
 
 /// Solid backdrop behind the drawing — lets the user write on a clean
@@ -178,6 +328,10 @@ final class CanvasState: ObservableObject {
     @Published var pressureMode: PressureMode = .dynamic
     @Published var cornerRadius: CGFloat = 10
     @Published var cornerRadiusY: CGFloat = 10
+
+    /// When on, newly typed text becomes a syntax-highlighted code block
+    /// (monospaced font, translucent background).
+    @Published var codeBlockMode: Bool = false
 
     /// When false (default), clicks on the canvas pass through to your other
     /// apps. When true, the canvas captures mouse events for drawing.

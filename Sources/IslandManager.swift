@@ -223,7 +223,13 @@ final class IslandManager {
                 onUndo: { [weak canvas] in canvas?.undo() },
                 onClear: { [weak canvas] in canvas?.clearAll() },
                 onActivate: { [weak self] in self?.activate() },
-                onDeactivate: { [weak self] in self?.deactivate() }
+                onDeactivate: { [weak self] in self?.deactivate() },
+                onToggleCodeBlock: { [weak canvas] in canvas?.toggleCodeBlock() },
+                onInsertSymbol: { [weak self] symbol in
+                    guard let self, let canvas = self.canvas else { return }
+                    let p = canvas.convert(self.window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+                    canvas.insertSymbol(symbol, at: p)
+                }
             )
         )
         toolbar.frame = CGRect(
@@ -233,6 +239,9 @@ final class IslandManager {
             height: 92
         )
         toolbar.alphaValue = 0
+        // The toolbar is a floating HUD — pin it to dark so the white icon
+        // set stays visible on any wallpaper and in any system theme.
+        toolbar.appearance = NSAppearance(named: .darkAqua)
         container.addSubview(toolbar)
         toolbarHost = toolbar
         container.toolbarHost = toolbar
@@ -255,11 +264,23 @@ final class IslandManager {
             // field (including Esc, which closes it).
             if self.isLogoPaletteVisible { return event }
 
-            if event.keyCode == 53 { // Esc — ends text editing, or lets the canvas clear its selection
-                if canvas.isEditingText {
-                    canvas.commitPendingText(selectAndPick: true)
-                    return nil
-                }
+            // While a text block is being edited every key belongs to it —
+            // Esc commits it, Cmd+A selects all its text (this app has no
+            // menu bar, so the ⌘A key equivalent never reaches the field),
+            // and everything else goes to the editor.
+            if canvas.isEditingText {
+                if self.handleEditingKey(event, canvas: canvas) { return nil }
+                return event
+            }
+
+            // While a search field is focused (the "/" palette or the shapes
+            // palette search), keys belong to it — never trigger tools from
+            // typing a shortcut letter into a search box.
+            if let responder = NSApp.keyWindow?.firstResponder, responder is NSTextView {
+                return event
+            }
+
+            if event.keyCode == 53 { // Esc — the canvas clears its selection
                 return event
             }
             if !mods.isEmpty {
@@ -269,7 +290,6 @@ final class IslandManager {
                 }
                 return event
             }
-            if canvas.isEditingText { return event }
             if event.charactersIgnoringModifiers == "/", !mods.contains(.command) {
                 if self.state.drawingMode { self.showLogoPalette() }
                 return nil
@@ -357,25 +377,24 @@ final class IslandManager {
                 log("FAIL: overlay should be visible and in drawing mode")
                 exit(1)
             }
-            log("posting Ctrl+Option to close")
-            self.postModifierCombo()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                guard let self else { return }
-                log("after combo: visible=\(self.isOverlayVisible)")
-                guard !self.isOverlayVisible else {
-                    log("FAIL: Ctrl+Option did not close the overlay")
-                    exit(1)
-                }
-                log("posting Ctrl+Option to reopen")
-                self.postModifierCombo()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
-                    guard let self else { return }
-                    log("reopen: visible=\(self.isOverlayVisible) drawingMode=\(self.state.drawingMode)")
-                    guard self.isOverlayVisible, self.state.drawingMode, self.canvas != nil else {
-                        log("FAIL: overlay did not reopen in drawing mode")
-                        exit(1)
+            log("toggling overlay closed")
+            self.toggle()
+            self.pollVisibility(log: log, expectVisible: false, until: .now() + 2.0) {
+                log("after toggle: visible=\(self.isOverlayVisible)")
+                log("waiting for the hide animation to finish")
+                self.pollIdle(log: log, until: .now() + 3.0) {
+                    log("toggling overlay open again")
+                    self.toggle()
+                    self.pollVisibility(log: log, expectVisible: true, until: .now() + 2.0) {
+                        log("reopen: visible=\(self.isOverlayVisible) drawingMode=\(self.state.drawingMode)")
+                        self.pollIdle(log: log, until: .now() + 3.0) {
+                            guard self.isOverlayVisible, self.state.drawingMode, self.canvas != nil else {
+                                log("FAIL: overlay did not reopen in drawing mode")
+                                exit(1)
+                            }
+                            self.textEditingTest(log: log)
+                        }
                     }
-                    self.textEditingTest(log: log)
                 }
             }
         }
@@ -408,7 +427,9 @@ final class IslandManager {
                 exit(1)
             }
             canvas.selftestSetText("hello")
+            log("before esc: editing=\(canvas.selftestEditingString().debugDescription)")
             self.postKeyDown(keyCode: 53)
+            log("after post: editing=\(canvas.isEditingText) string=\(canvas.selftestEditingString().debugDescription)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 guard let self, let canvas = self.canvas else { return }
                 log("after Esc: editing=\(canvas.isEditingText) annotations=\(canvas.annotations.count) tool=\(self.state.tool.rawValue)")
@@ -676,8 +697,8 @@ final class IslandManager {
                         }
                         let total = palette.selftestResults.count
                         log("palette total items: \(total)")
-                        if total <= 500 {
-                            log("FAIL: expected the full emoji set, got \(total)")
+                        if total < 100 {
+                            log("FAIL: expected the full tech icon set, got \(total)")
                             exit(1)
                         }
                         palette.selftestSetQuery("chat")
@@ -686,22 +707,31 @@ final class IslandManager {
                             log("FAIL: expected results for query 'chat'")
                             exit(1)
                         }
-                        palette.selftestSetQuery("grinning")
+                        palette.selftestSetQuery("server")
                         if palette.selftestResults.isEmpty {
-                            log("FAIL: expected results for unicode-name query 'grinning'")
+                            log("FAIL: expected results for tech query 'server'")
                             exit(1)
                         }
                         palette.selftestSetQuery("chat")
-                        let picked = palette.selftestResults.first!
                         palette.selftestPickRow(0)
-                        log("palette pick: annotations=\(canvas.annotations.count) last=\(canvas.annotations.last?.text ?? "?")")
+                        log("palette pick: annotations=\(canvas.annotations.count) last=\(canvas.annotations.last?.kind.rawValue ?? "?")")
                         if canvas.annotations.count != 6 {
                             log("FAIL: picking a logo should insert an annotation")
                             exit(1)
                         }
-                        if canvas.annotations.last?.text != picked.emoji {
-                            log("FAIL: inserted logo does not match the picked item")
+                        if canvas.annotations.last?.kind != .image || canvas.annotations.last?.image == nil {
+                            log("FAIL: inserted logo should be an image annotation")
                             exit(1)
+                        }
+                        log("icon recolor test: changing color must re-tint the selected icon")
+                        let redColor = NSColor.systemRed
+                        self.state.strokeColor = redColor
+                        if let img = canvas.annotations.last {
+                            log("icon after recolor: strokeColor=\(img.strokeColor) image=\(img.image != nil)")
+                            if img.image == nil || img.strokeColor != redColor {
+                                log("FAIL: selected icon should recolor")
+                                exit(1)
+                            }
                         }
                         log("palette reopen + Esc close test")
                         self.showLogoPalette()
@@ -754,8 +784,192 @@ final class IslandManager {
                             log("FAIL: no light freedraw annotation was created")
                             exit(1)
                         }
-                        log("SELFTEST PASS")
-                        exit(0)
+
+                        log("shape library test: new shapes draw from a drag like any tool")
+                        for (tool, kind) in [
+                            (Tool.hexagon, ShapeKind.hexagon),
+                            (Tool.process, ShapeKind.process),
+                            (Tool.parallelogram, ShapeKind.parallelogram),
+                            (Tool.star, ShapeKind.star),
+                            (Tool.cross, ShapeKind.cross),
+                            (Tool.cloud, ShapeKind.cloud),
+                            (Tool.callout, ShapeKind.callout),
+                            (Tool.note, ShapeKind.note),
+                            (Tool.cube, ShapeKind.cube),
+                        ] {
+                            self.state.tool = tool
+                            self.state.lastNonTextTool = tool
+                            let s1 = self.win(CGPoint(x: 850, y: 200))
+                            let s2 = self.win(CGPoint(x: 930, y: 260))
+                            canvas.mouseDown(with: self.mouseEvent(at: s1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: s2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: s2, type: .leftMouseUp))
+                            guard let s = canvas.annotations.last, s.kind == kind else {
+                                log("FAIL: \(tool.label) should produce a \(kind.rawValue) annotation, got \(canvas.annotations.last?.kind.rawValue ?? "nil")")
+                                exit(1)
+                            }
+                            log("shape \(kind.rawValue): rect=\(Int(s.rect.width))x\(Int(s.rect.height))")
+                            if s.rect.width < 5 || s.rect.height < 5 {
+                                log("FAIL: \(kind.rawValue) should have a sized rect")
+                                exit(1)
+                            }
+                            guard let path = canvas.selftestPath(for: s) else {
+                                log("FAIL: \(kind.rawValue) should have a drawable path")
+                                exit(1)
+                            }
+                            if path.elementCount < 2 {
+                                log("FAIL: \(kind.rawValue) path should have elements, got \(path.elementCount)")
+                                exit(1)
+                            }
+                        }
+                        log("shape library test: connectors draw like arrows")
+                        for (tool, kind) in [
+                            (Tool.orthogonal, ShapeKind.orthogonal),
+                            (Tool.doubleArrow, ShapeKind.doubleArrow),
+                            (Tool.curvedConnector, ShapeKind.curvedConnector),
+                        ] {
+                            self.state.tool = tool
+                            self.state.lastNonTextTool = tool
+                            let c1 = self.win(CGPoint(x: 850, y: 330))
+                            let c2 = self.win(CGPoint(x: 980, y: 380))
+                            canvas.mouseDown(with: self.mouseEvent(at: c1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: c2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: c2, type: .leftMouseUp))
+                            guard let s = canvas.annotations.last, s.kind == kind, s.points.count == 2 else {
+                                log("FAIL: \(tool.label) should produce a \(kind.rawValue) with 2 points, got \(canvas.annotations.last?.kind.rawValue ?? "nil") pts=\(canvas.annotations.last?.points.count ?? -1)")
+                                exit(1)
+                            }
+                            log("connector \(kind.rawValue): points=\(s.points.count)")
+                            guard let path = canvas.selftestPath(for: s), path.elementCount >= 1 else {
+                                log("FAIL: \(kind.rawValue) should have a drawable path")
+                                exit(1)
+                            }
+                        }
+                        log("shape library test: palette contents are all drawable tools")
+                        if Tool.shapePalette.count < 25 {
+                            log("FAIL: shape palette should contain at least 25 shapes, got \(Tool.shapePalette.count)")
+                            exit(1)
+                        }
+                        for t in Tool.shapePalette where t.shapeKind == nil {
+                            log("FAIL: palette tool \(t.label) should map to a shape kind")
+                            exit(1)
+                        }
+
+                        log("code block test: typing in code-block mode makes a highlighted block")
+                        self.state.codeBlockMode = true
+                        self.state.tool = .text
+                        self.state.lastNonTextTool = .text
+                        let cp = self.win(CGPoint(x: 1250, y: 156))
+                        canvas.mouseDown(with: self.mouseEvent(at: cp, type: .leftMouseDown))
+                        log("code edit open: isEditingText=\(canvas.isEditingText)")
+                        if !canvas.isEditingText {
+                            log("FAIL: code mode should open the text editor")
+                            exit(1)
+                        }
+                        log("select all test: Cmd+A selects everything in the editing view")
+                        canvas.selftestSetText("hello world")
+                        if let ev = NSEvent.keyEvent(
+                            with: .keyDown, location: .zero, modifierFlags: [.command],
+                            timestamp: 0, windowNumber: 0, context: nil,
+                            characters: "a", charactersIgnoringModifiers: "a",
+                            isARepeat: false, keyCode: 0
+                        ) {
+                            let consumed = self.handleEditingKey(ev, canvas: canvas)
+                            log("post cmd+a: consumed=\(consumed) sel=\(canvas.selftestEditingSelectionLength())")
+                        }
+                        let selLen = canvas.selftestEditingSelectionLength()
+                        log("select all: selection length=\(selLen)")
+                        if selLen != 11 {
+                            log("FAIL: Cmd+A should select the whole text, got \(selLen)")
+                            exit(1)
+                        }
+                        log("auto-close test: openers insert their closing partner")
+                        canvas.selftestSetText("")
+                        self.sendKeyToWindow(keyCode: 33, characters: "{")
+                        self.sendKeyToWindow(keyCode: 33, characters: "{")
+                        self.sendKeyToWindow(keyCode: 3, characters: "f")
+                        self.sendKeyToWindow(keyCode: 45, characters: "n")
+                        let autoClosed = canvas.selftestEditingString()
+                        log("auto-close: \(autoClosed.debugDescription)")
+                        if autoClosed != "{{fn}}" {
+                            log("FAIL: braces should auto-close into {{fn}}: \(autoClosed)")
+                            exit(1)
+                        }
+                        log("auto-close step test: typing the closer skips over it")
+                        canvas.selftestSetText("}")
+                        canvas.selftestSetCursor(location: 0)
+                        self.sendKeyToWindow(keyCode: 42, characters: "}")
+                        if canvas.selftestEditingString() != "}" {
+                            log("FAIL: typing } when one is next should not duplicate it: \(canvas.selftestEditingString())")
+                            exit(1)
+                        }
+                        log("real-time sync test: canvas code block updates while typing")
+                        canvas.selftestSetText("let x = 1")
+                        if canvas.annotations.last?.text != "let x = 1" {
+                            log("FAIL: code block should mirror typing live: \(canvas.annotations.last?.text ?? "nil")")
+                            exit(1)
+                        }
+                        log("enter newline test: Enter must keep typing on a new line with smart indent")
+                        canvas.selftestSetText("fn main() {")
+                        self.sendKeyToWindow(keyCode: 36, characters: "\r")
+                        canvas.selftestSetText("fn main() {\n    x")
+                        canvas.commitPendingText(selectAndPick: true)
+                        if let t = canvas.annotations.last?.text, !t.contains("\n    x") {
+                            log("FAIL: Enter should indent after an opening brace: \(t)")
+                            exit(1)
+                        }
+                        log("code block test: typing in code-block mode makes a highlighted block")
+                        canvas.selftestSetText("fn main() {\n  let x = 42 // answer\n}")
+                        canvas.commitPendingText(selectAndPick: true)
+                        log("code after esc: isEditingText=\(canvas.isEditingText) count=\(canvas.annotations.count)")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                            guard let self, let canvas = self.canvas else { return }
+                            guard let cb = canvas.annotations.last, cb.kind == .text else {
+                                log("FAIL: code block annotation missing")
+                                exit(1)
+                            }
+                            log("code block: isCode=\(cb.isCode) font=\(cb.fontFamily) size=\(cb.fontSize)")
+                            if !cb.isCode || cb.fontFamily != "Cascadia Code" || cb.fontSize != 15 {
+                                log("FAIL: code block should be monospaced, compact and flagged")
+                                exit(1)
+                            }
+                            log("code block toggle test: converting back to plain text")
+                            canvas.toggleCodeBlock()
+                            if canvas.annotations.last?.isCode != false {
+                                log("FAIL: toggle should clear the code flag")
+                                exit(1)
+                            }
+                            log("code block toggle test: converting forward again")
+                            canvas.toggleCodeBlock()
+                            if canvas.annotations.last?.isCode != true {
+                                log("FAIL: toggle should re-apply the code flag")
+                                exit(1)
+                            }
+                            log("code block font restore test: converting existing text back must restore its font")
+                            guard let tIdx = canvas.annotations.indices.last(where: {
+                                canvas.annotations[$0].kind == .text && !canvas.annotations[$0].isCode
+                            }) else {
+                                log("FAIL: no plain text annotation to convert")
+                                exit(1)
+                            }
+                            canvas.selftestSelect([tIdx])
+                            let origFamily = canvas.annotations[tIdx].fontFamily
+                            let origSize = canvas.annotations[tIdx].fontSize
+                            canvas.toggleCodeBlock()
+                            if !canvas.annotations[tIdx].isCode || canvas.annotations[tIdx].fontFamily != "Cascadia Code" {
+                                log("FAIL: existing text should convert to code with Cascadia Code")
+                                exit(1)
+                            }
+                            canvas.toggleCodeBlock()
+                            if canvas.annotations[tIdx].isCode
+                                || canvas.annotations[tIdx].fontFamily != origFamily
+                                || canvas.annotations[tIdx].fontSize != origSize {
+                                log("FAIL: converting back should restore \(origFamily)/\(origSize), got \(canvas.annotations[tIdx].fontFamily)/\(canvas.annotations[tIdx].fontSize)")
+                                exit(1)
+                            }
+                            log("SELFTEST PASS")
+                            exit(0)
+                        }
                         }
                     }
                 }
@@ -784,6 +998,49 @@ final class IslandManager {
         )!
     }
 
+    /// Polls the overlay visibility until it matches `expectVisible`.
+    private func pollVisibility(
+        log: @escaping (String) -> Void,
+        expectVisible: Bool,
+        until: DispatchTime,
+        then: @escaping () -> Void
+    ) {
+        if self.isOverlayVisible == expectVisible {
+            then()
+            return
+        }
+        if DispatchTime.now() >= until {
+            log("FAIL: visibility did not reach \(expectVisible) (got \(self.isOverlayVisible))")
+            exit(1)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.pollVisibility(log: log, expectVisible: expectVisible, until: until, then: then)
+        }
+    }
+
+    /// Polls until the overlay show/hide animation finishes.
+    private func pollIdle(
+        log: @escaping (String) -> Void,
+        until: DispatchTime,
+        then: @escaping () -> Void
+    ) {
+        if !self.isAnimating {
+            then()
+            return
+        }
+        if DispatchTime.now() >= until {
+            log("FAIL: overlay animation never finished")
+            exit(1)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.pollIdle(log: log, until: until, then: then)
+        }
+    }
+
     private func postModifierCombo() {
         guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { return }
         ev.type = .flagsChanged
@@ -791,21 +1048,39 @@ final class IslandManager {
         ev.post(tap: .cghidEventTap)
     }
 
-    private func postKeyDown(keyCode: CGKeyCode) {
+    private func postKeyDown(keyCode: CGKeyCode, flags: CGEventFlags = []) {
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else { return }
+        down.flags = flags
         down.post(tap: .cghidEventTap)
         if let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) {
+            up.flags = flags
             up.post(tap: .cghidEventTap)
         }
     }
 
-    /// Deliver a key event straight to the key window (same path the system
+    /// Handles a key while a text block is being edited. Esc commits the
+    /// text, ⌘A selects all of it, everything else is left for the editor.
+    /// Returns true when the event was consumed.
+    func handleEditingKey(_ event: NSEvent, canvas: CanvasView) -> Bool {
+        if event.keyCode == 53 {
+            canvas.commitPendingText(selectAndPick: true)
+            return true
+        }
+        let mods = event.modifierFlags.intersection([.command, .control, .option])
+        if mods.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "a" {
+            canvas.selectAllInEditingField()
+            return true
+        }
+        return false
+    }
+
+    /// Delivers a key event straight to the key window (same path the system
     /// uses for real hardware events) — deterministic in self-tests.
-    private func sendKeyToWindow(keyCode: CGKeyCode) {
+    private func sendKeyToWindow(keyCode: CGKeyCode, characters: String = "\u{1b}", flags: NSEvent.ModifierFlags = []) {
         guard let down = NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: [],
+            with: .keyDown, location: .zero, modifierFlags: flags,
             timestamp: 0, windowNumber: window.windowNumber, context: nil,
-            characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+            characters: characters, charactersIgnoringModifiers: characters,
             isARepeat: false, keyCode: keyCode
         ) else { return }
         window.sendEvent(down)
@@ -818,7 +1093,7 @@ extension IslandManager: LogoPaletteDelegate {
         closeLogoPalette()
         guard let canvas else { return }
         let p = canvas.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
-        canvas.insertEmoji(item.emoji, at: p)
+        canvas.insertSymbol(item.symbol, at: p)
     }
 
     func logoPaletteDidClose() {

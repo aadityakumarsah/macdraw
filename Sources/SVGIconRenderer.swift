@@ -28,7 +28,7 @@ final class SVGIconRenderer {
 
         let image = NSImage(size: NSSize(width: target, height: target))
         image.lockFocus()
-        NSRect(x: 0, y: 0, width: target, height: target).fill(using: .copy)
+        NSRect(x: 0, y: 0, width: target, height: target).fill(using: .clear)
         tint.setStroke()
         path.lineWidth = strokeWidth(of: svg)
         path.lineCapStyle = .round
@@ -151,6 +151,10 @@ final class SVGIconRenderer {
         }
 
         while i < chars.count {
+            while i < chars.count && chars[i].isWhitespace {
+                i += 1
+            }
+            guard i < chars.count else { break }
             let ch = chars[i]
             if commandChars.contains(ch) {
                 cmd = ch
