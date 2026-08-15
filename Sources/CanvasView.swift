@@ -212,6 +212,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var marqueeStart: CGPoint?
     private var marqueeRect: CGRect = .zero
     private var eraseStroke: [CGPoint] = []
+    /// Shape whose edge connection dots are shown (connector tools only).
+    private var hoverShapeIndex: Int?
+    private var hoverSide: Int?
     private var editingView: NSTextView?
     private var editingIndex: Int?
     private var editingFontFamily: String?
@@ -452,7 +455,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .eraser, .bucketFill, .image:
             NSCursor.arrow.set()
         default:
-            NSCursor.crosshair.set()
+            if isConnectorTool(state.tool) {
+                if let (i, s) = connectionDot(at: adjustedP) {
+                    hoverShapeIndex = i
+                    hoverSide = s
+                    NSCursor.pointingHand.set()
+                } else {
+                    hoverShapeIndex = nil
+                    hoverSide = nil
+                    NSCursor.crosshair.set()
+                }
+            } else {
+                hoverShapeIndex = nil
+                hoverSide = nil
+                NSCursor.crosshair.set()
+            }
         }
     }
 
@@ -609,6 +626,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 ry: state.cornerRadiusY,
                 dynamicWidth: state.pressureMode == .dynamic
             )
+            // Connector tools grab the connection dot under the cursor, so
+            // the line starts glued to that box's edge.
+            if isConnectorTool(state.tool), let (i, s) = connectionDot(at: adjustedP) {
+                current?.connectionStart = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
+                if var c = current {
+                    c.points = [connectionPoint(for: c.connectionStart, fallback: adjustedP)]
+                    current = c
+                }
+            }
         }
     }
 
@@ -660,11 +686,22 @@ final class CanvasView: NSView, NSTextViewDelegate {
                  .cloud, .serverStack, .queue, .firewall, .cube,
                  .callout, .note:
                 c.rect = normalizedRect(from: dragStart, to: adjustedP)
-            case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal:
-                c.points = [
-                    snappedBoundaryPoint(dragStart),
-                    snappedBoundaryPoint(adjustedP),
-                ]
+            case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
+                var startP: CGPoint
+                if let cs = c.connectionStart, annotations.indices.contains(cs.annotationIndex) {
+                    startP = connectionPoint(for: cs, fallback: dragStart)
+                } else {
+                    startP = snappedBoundaryPoint(dragStart)
+                }
+                var endP: CGPoint
+                if let (i, s) = connectionDot(at: adjustedP) {
+                    c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
+                    endP = connectionPoint(for: c.connectionEnd, fallback: adjustedP)
+                } else {
+                    c.connectionEnd = nil
+                    endP = snappedBoundaryPoint(adjustedP)
+                }
+                c.points = [startP, endP]
             case .freedraw, .laser, .autoshape:
                 c.points.append(adjustedP)
                 c.pointTimes.append(Date())
@@ -827,8 +864,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
              .cloud, .serverStack, .queue, .firewall, .cube,
              .callout, .note:
             guard c.rect.width > 2 || c.rect.height > 2 else { return }
-        case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal:
+        case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             c.rect = normalizedRect(from: c.points.first ?? dragStart, to: c.points.last ?? dragStart)
+            // Re-check the release point: glued only if it landed on a dot.
+            if let end = c.points.last, let (i, s) = connectionDot(at: end) {
+                c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
+                c.points[c.points.count - 1] = connectionPoint(for: c.connectionEnd, fallback: end)
+            } else {
+                c.connectionEnd = nil
+            }
             guard distance(c.points.first ?? .zero, c.points.last ?? .zero) > 2 else { return }
         case .freedraw:
             // Trackpad signature support: smooth the points for better handwriting
@@ -1189,6 +1233,28 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Self-test hook: the drawable path for an annotation (as rendered).
     func selftestPath(for a: Annotation) -> NSBezierPath? {
         bezierPath(for: a)
+    }
+
+    /// First point of an annotation's rendered path (selftest hook).
+    func selftestPathStart(_ a: Annotation) -> CGPoint? {
+        selftestPathPoints(a).first
+    }
+
+    /// All vertices of an annotation's rendered path (selftest hook).
+    func selftestPathPoints(_ a: Annotation) -> [CGPoint] {
+        let path = bezierPath(for: a)
+        var pts: [CGPoint] = []
+        for i in 0..<path.elementCount {
+            let raw = UnsafeMutablePointer<NSPoint>.allocate(capacity: 3)
+            defer { raw.deallocate() }
+            switch path.element(at: i, associatedPoints: raw) {
+            case .moveTo, .lineTo:
+                pts.append(raw[0])
+            default:
+                break
+            }
+        }
+        return pts
     }
 
     /// Selects all the text in the open editing view (Cmd+A).
@@ -1667,6 +1733,34 @@ final class CanvasView: NSView, NSTextViewDelegate {
             drawSelectionOverlay(for: annotations[sel])
         }
 
+        // Connection dots on box edges for connector tools — grab one to
+        // glue a line to that box. The grabbed dot and the hovered target
+        // dot are highlighted.
+        if isConnectorTool(state.tool) {
+            var dotShapes: Set<Int> = []
+            if let i = hoverShapeIndex { dotShapes.insert(i) }
+            if let c = current, let cs = c.connectionStart { dotShapes.insert(cs.annotationIndex) }
+            for i in dotShapes where annotations.indices.contains(i) {
+                let a = annotations[i]
+                guard isClosed(a.kind), a.kind != .laser else { continue }
+                for (side, p) in connectionDots(for: a) {
+                    let isSource = current?.connectionStart?.annotationIndex == i && current?.connectionStart?.side == side
+                    let isTarget = hoverShapeIndex == i && hoverSide == side && current != nil
+                    if isSource || isTarget {
+                        NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).setFill()
+                        NSBezierPath(ovalIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10)).fill()
+                        NSColor.white.setStroke()
+                        let ring = NSBezierPath(ovalIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10))
+                        ring.lineWidth = 1.5
+                        ring.stroke()
+                    } else {
+                        NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.55).setFill()
+                        NSBezierPath(ovalIn: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8)).fill()
+                    }
+                }
+            }
+        }
+
         ctx.restoreGraphicsState()
     }
 
@@ -1717,12 +1811,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     strokeDotted(path: path, color: a.strokeColor, width: a.strokeWidth)
                 }
             }
-            if a.kind == .arrow || a.kind == .doubleArrow || a.kind == .curvedConnector || a.kind == .orthogonal {
+            if a.kind == .arrow || a.kind == .doubleArrow || a.kind == .curvedConnector || a.kind == .orthogonal || a.kind == .connector {
                 if let seg = lastSegment(of: path) {
                     drawArrowhead(at: seg.end, from: seg.start, color: a.strokeColor, width: a.strokeWidth)
                 }
                 if a.kind == .doubleArrow, let seg = firstSegment(of: path) {
                     drawArrowhead(at: seg.start, from: seg.end, color: a.strokeColor, width: a.strokeWidth)
+                }
+            }
+            // Connection dots — show where the elbow connector is pinned to
+            // its boxes (one on each box edge).
+            if a.kind == .connector, a.points.count > 1 {
+                let r = max(2.5, a.strokeWidth / 2 + 1)
+                a.strokeColor.setFill()
+                for p in [a.points[0], a.points[a.points.count - 1]] {
+                    NSBezierPath(ovalIn: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)).fill()
                 }
             }
             // Text attached to a polygon — drawn inside the rotation transform,
@@ -1982,8 +2085,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
             var pts = a.points
             if handle == .startPoint {
                 pts[0] = snappedBoundaryPoint(p, selfIndex: selfIndex)
+                a.connectionStart = nil
             } else {
                 pts[pts.count - 1] = snappedBoundaryPoint(p, selfIndex: selfIndex)
+                a.connectionEnd = nil
             }
             a.points = pts
             a.rect = boundingRect(of: pts)
@@ -2034,7 +2139,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
                 a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: a.fontSize * 1.4)
             }
-        case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal:
+        case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             let fixedX: CGFloat
             switch handle {
             case .topLeft, .midLeft, .bottomLeft: fixedX = orig.maxX
@@ -2495,15 +2600,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .arrow, .line:
             let pts = a.points
             guard pts.count > 1 else { return NSBezierPath() }
-            let s = pts[0]
-            let e = pts[pts.count - 1]
+            let s = connectionPoint(for: a.connectionStart, fallback: pts[0])
+            let e = connectionPoint(for: a.connectionEnd, fallback: pts[pts.count - 1])
+            let sOwner = connectionNormal(for: a.connectionStart).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: s)
+            let eOwner = connectionNormal(for: a.connectionEnd).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: e)
             let margin = 8 + a.strokeWidth / 2
             let obstacles = connectorObstacles(for: a, margin: margin)
             if straightIsBlocked(s, e, obstacles: obstacles),
                let route = connectorRoute(
                    from: s, to: e,
-                   startOwner: connectorOwner(at: s),
-                   endOwner: connectorOwner(at: e),
+                   startOwner: sOwner,
+                   endOwner: eOwner,
                    obstacles: obstacles
                ) {
                 let path = NSBezierPath()
@@ -2514,13 +2621,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 return path
             }
             if rough {
-                return roughLine(from: pts[0], to: pts[pts.count - 1], slop: slop, edge: edge, seed: seed)
+                return roughLine(from: s, to: e, slop: slop, edge: edge, seed: seed)
             }
             let path = NSBezierPath()
-            path.move(to: pts[0])
-            for p in pts.dropFirst() {
-                path.line(to: p)
-            }
+            path.move(to: s)
+            path.line(to: e)
             return path
         case .freedraw, .laser:
             let pts = a.points
@@ -2548,18 +2653,20 @@ final class CanvasView: NSView, NSTextViewDelegate {
             }
             path.close()
             return path
-        case .doubleArrow, .curvedConnector, .orthogonal:
+        case .doubleArrow, .curvedConnector, .orthogonal, .connector:
             let pts = a.points
             guard pts.count > 1 else { return NSBezierPath() }
-            let s = pts[0]
-            let e = pts[pts.count - 1]
+            let s = connectionPoint(for: a.connectionStart, fallback: pts[0])
+            let e = connectionPoint(for: a.connectionEnd, fallback: pts[pts.count - 1])
+            let sOwner = connectionNormal(for: a.connectionStart).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: s)
+            let eOwner = connectionNormal(for: a.connectionEnd).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: e)
             let margin = 8 + a.strokeWidth / 2
             let obstacles = connectorObstacles(for: a, margin: margin)
             var blocked = false
             switch a.kind {
             case .doubleArrow:
                 blocked = straightIsBlocked(s, e, obstacles: obstacles)
-            case .orthogonal:
+            case .orthogonal, .connector:
                 blocked = straightIsBlocked(s, e, obstacles: obstacles)
                     || straightIsBlocked(s, CGPoint(x: e.x, y: s.y), obstacles: obstacles)
                     || straightIsBlocked(CGPoint(x: e.x, y: s.y), e, obstacles: obstacles)
@@ -2584,8 +2691,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if blocked,
                let route = connectorRoute(
                    from: s, to: e,
-                   startOwner: connectorOwner(at: s),
-                   endOwner: connectorOwner(at: e),
+                   startOwner: sOwner,
+                   endOwner: eOwner,
                    obstacles: obstacles
                ) {
                 let path = NSBezierPath()
@@ -2596,12 +2703,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 return path
             }
             switch a.kind {
-            case .doubleArrow, .orthogonal:
+            case .doubleArrow, .orthogonal, .connector:
                 let path = NSBezierPath()
-                path.move(to: pts[0])
-                var prev = pts[0]
+                path.move(to: s)
+                var prev = s
                 for p in pts.dropFirst() {
-                    if a.kind == .orthogonal {
+                    if a.kind == .orthogonal || a.kind == .connector {
                         path.line(to: CGPoint(x: p.x, y: prev.y))
                         path.line(to: p)
                     } else {
@@ -3154,6 +3261,73 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     // MARK: - connector routing
 
+    private func isConnectorTool(_ tool: Tool) -> Bool {
+        switch tool {
+        case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The four edge-midpoint connection dots of a shape (in canvas space).
+    private func connectionDots(for a: Annotation) -> [(side: Int, point: CGPoint)] {
+        let r = a.rect
+        let center = CGPoint(x: r.midX, y: r.midY)
+        let local: [(Int, CGPoint)] = [
+            (0, CGPoint(x: r.minX + r.width * 0.5, y: r.maxY)), // top
+            (1, CGPoint(x: r.maxX, y: r.minY + r.height * 0.5)), // right
+            (2, CGPoint(x: r.minX + r.width * 0.5, y: r.minY)), // bottom
+            (3, CGPoint(x: r.minX, y: r.minY + r.height * 0.5)), // left
+        ]
+        return local.map { ($0.0, rotatedPoint($0.1, around: center, by: a.rotation)) }
+    }
+
+    /// The connection dot under `p`, if any (connector tools snap to these).
+    private func connectionDot(at p: CGPoint) -> (index: Int, side: Int)? {
+        let threshold: CGFloat = 9
+        for (i, a) in annotations.enumerated() {
+            guard isClosed(a.kind), a.kind != .laser else { continue }
+            for (side, dot) in connectionDots(for: a) where distance(p, dot) < threshold {
+                return (i, side)
+            }
+        }
+        return nil
+    }
+
+    /// Resolves a glued connector end against the shape's *current* rect, so
+    /// the line follows the box when it moves, resizes or rotates.
+    private func connectionPoint(for c: ShapeConnection?, fallback: CGPoint) -> CGPoint {
+        guard let c, annotations.indices.contains(c.annotationIndex) else { return fallback }
+        let a = annotations[c.annotationIndex]
+        let r = a.rect
+        let fx = r.minX + r.width * c.fraction
+        let fy = r.minY + r.height * c.fraction
+        let local: CGPoint
+        switch c.side {
+        case 0: local = CGPoint(x: fx, y: r.maxY)
+        case 1: local = CGPoint(x: r.maxX, y: fy)
+        case 2: local = CGPoint(x: fx, y: r.minY)
+        default: local = CGPoint(x: r.minX, y: fy)
+        }
+        return rotatedPoint(local, around: CGPoint(x: r.midX, y: r.midY), by: a.rotation)
+    }
+
+    /// The outward edge normal at a glued connector end — the connector must
+    /// leave / enter the shape perpendicular to that edge.
+    private func connectionNormal(for c: ShapeConnection?) -> CGPoint? {
+        guard let c, annotations.indices.contains(c.annotationIndex) else { return nil }
+        let a = annotations[c.annotationIndex]
+        let base: CGPoint
+        switch c.side {
+        case 0: base = CGPoint(x: 0, y: 1)
+        case 1: base = CGPoint(x: 1, y: 0)
+        case 2: base = CGPoint(x: 0, y: -1)
+        default: base = CGPoint(x: -1, y: 0)
+        }
+        return rotatedPoint(base, around: .zero, by: a.rotation)
+    }
+
     /// The closed shape a connector end is attached to (within snap distance),
     /// with the outward-facing normal at the attachment point. The connector
     /// must leave / enter its shape perpendicular to the shape's edge.
@@ -3209,7 +3383,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// itself is never its own obstacle.
     private func connectorObstacles(for a: Annotation, margin: CGFloat) -> [CGRect] {
         var out: [CGRect] = []
-        for other in annotations {
+        let startIdx = a.connectionStart?.annotationIndex
+        let endIdx = a.connectionEnd?.annotationIndex
+        for (i, other) in annotations.enumerated() {
+            // The connector's glued owner shapes are not obstacles — their
+            // inflated rects would swallow the connector's own endpoints.
+            if i == startIdx || i == endIdx { continue }
             if other.kind == a.kind,
                other.rect == a.rect,
                other.points == a.points,
@@ -3269,14 +3448,60 @@ final class CanvasView: NSView, NSTextViewDelegate {
             let my = (a.y + b.y) / 2
             // Horizontal-first and vertical-first bends, plus parallel
             // offsets so routes can dodge obstacles sitting beside the
-            // direct line.
-            for y in [a.y, b.y, my, my - 60, my + 60, my - 120, my + 120] {
-                candidates.append([a, CGPoint(x: a.x, y: y), CGPoint(x: b.x, y: y), b])
+            // direct line. Clearance lines are derived from the obstacles'
+            // own bounds too, so a tall mid-box is always dodged instead of
+            // pierced, and the wider ladder covers very large shapes.
+            var yLines: [CGFloat] = [a.y, b.y, my, my - 60, my + 60, my - 120, my + 120, my - 180, my + 180]
+            var xLines: [CGFloat] = [a.x, b.x, mx, mx - 60, mx + 60, mx - 120, mx + 120, mx - 180, mx + 180]
+            // Clear columns/lines derived from the obstacles themselves, so a
+            // tall mid-box is always dodged instead of pierced, even when it
+            // reaches right up to the connected shapes.
+            var columns = Set<CGFloat>([a.x, b.x, end.x])
+            var dodgeYs = Set<CGFloat>([my - 120, my + 120, my - 60, my + 60])
+            for ob in obstacles {
+                yLines.append(ob.maxY + 14)
+                yLines.append(ob.minY - 14)
+                xLines.append(ob.maxX + 14)
+                xLines.append(ob.minX - 14)
+                if ob.maxX >= a.x && ob.minX <= b.x {
+                    columns.insert(ob.maxX + 14)
+                    columns.insert(ob.minX - 14)
+                    dodgeYs.insert(ob.maxY + 14)
+                    dodgeYs.insert(ob.minY - 14)
+                }
             }
-            for x in [a.x, b.x, mx, mx - 60, mx + 60, mx - 120, mx + 120] {
-                candidates.append([a, CGPoint(x: x, y: b.y), CGPoint(x: x, y: a.y), b])
+            for y in yLines {
+                candidates.append([a, CGPoint(x: a.x, y: y), CGPoint(x: b.x, y: y), b, end])
             }
-            candidates.sort { pathLength($0) < pathLength($1) }
+            for x in xLines {
+                candidates.append([a, CGPoint(x: x, y: b.y), CGPoint(x: x, y: a.y), b, end])
+            }
+            // Full 4-bend dodges: climb at a clear column, cross at a clear
+            // line, descend at a clear column, then approach the end shape.
+            let cols = columns.sorted()
+            for y in dodgeYs.sorted() {
+                for c in cols {
+                    for x in cols {
+                        candidates.append([
+                            a,
+                            CGPoint(x: c, y: a.y),
+                            CGPoint(x: c, y: y),
+                            CGPoint(x: x, y: y),
+                            CGPoint(x: x, y: end.y),
+                            end
+                        ])
+                    }
+                }
+            }
+            // Shortest clean route wins, but dodge routes that cross above the
+            // endpoints' mid-line are preferred over equally-cheap bottom
+            // routes (within a small length band), so connectors go over
+            // obstacles by default.
+            candidates.sort {
+                let l1 = pathLength($0), l2 = pathLength($1)
+                if abs(l1 - l2) > 40 { return l1 < l2 }
+                return $0.count > 2 ? $0[2].y > $1[2].y : l1 < l2
+            }
             for cand in candidates {
                 var full: [CGPoint] = [start]
                 for q in cand where distance(full.last!, q) > 0.5 {

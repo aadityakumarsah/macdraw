@@ -825,6 +825,7 @@ final class IslandManager {
                         log("shape library test: connectors draw like arrows")
                         for (tool, kind) in [
                             (Tool.orthogonal, ShapeKind.orthogonal),
+                            (Tool.connector, ShapeKind.connector),
                             (Tool.doubleArrow, ShapeKind.doubleArrow),
                             (Tool.curvedConnector, ShapeKind.curvedConnector),
                         ] {
@@ -845,6 +846,94 @@ final class IslandManager {
                                 exit(1)
                             }
                         }
+                        log("smart connector test: glued ends follow the box")
+                        self.state.tool = .rectangle
+                        self.state.lastNonTextTool = .rectangle
+                        let a1 = self.win(CGPoint(x: 600, y: 100))
+                        let a2 = self.win(CGPoint(x: 680, y: 160))
+                        canvas.mouseDown(with: self.mouseEvent(at: a1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: a2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: a2, type: .leftMouseUp))
+                        let boxA = canvas.annotations.count - 1
+                        let b1 = self.win(CGPoint(x: 600, y: 300))
+                        let b2 = self.win(CGPoint(x: 680, y: 360))
+                        canvas.mouseDown(with: self.mouseEvent(at: b1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: b2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: b2, type: .leftMouseUp))
+                        let boxB = canvas.annotations.count - 1
+                        self.state.tool = .connector
+                        self.state.lastNonTextTool = .connector
+                        // Grab box A's top-edge dot (640,160) and release on box B's bottom dot (640,300).
+                        let c1 = self.win(CGPoint(x: 640, y: 160))
+                        let c2 = self.win(CGPoint(x: 640, y: 300))
+                        canvas.mouseDown(with: self.mouseEvent(at: c1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: c2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: c2, type: .leftMouseUp))
+                        guard let link = canvas.annotations.last, link.kind == .connector else {
+                            log("FAIL: dot drag should create a connector, got \(canvas.annotations.last?.kind.rawValue ?? "nil")")
+                            exit(1)
+                        }
+                        if link.connectionStart?.annotationIndex != boxA || link.connectionEnd?.annotationIndex != boxB {
+                            log("FAIL: connector should be glued to boxA and boxB, got \(String(describing: link.connectionStart)) \(String(describing: link.connectionEnd))")
+                            exit(1)
+                        }
+                        // Move box A right by 60 — the glued end must follow.
+                        self.state.tool = .selection
+                        let mv1 = self.win(CGPoint(x: 650, y: 120))
+                        let mv2 = self.win(CGPoint(x: 710, y: 120))
+                        canvas.mouseDown(with: self.mouseEvent(at: mv1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: mv2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: mv2, type: .leftMouseUp))
+                        let start = canvas.selftestPathStart(link)
+                        if let start, abs(start.x - 700) < 0.5, abs(start.y - 160) < 0.5 {
+                            log("glue follow: connector start followed the box to (700,160)")
+                        } else {
+                            log("FAIL: glued connector should follow the moved box, path start = \(String(describing: start))")
+                            exit(1)
+                        }
+                        log("mid-box dodge test: connector routes over a tall box in the way")
+                        // boxA (right dot -> (560,430)), boxB (left dot <- (900,430)),
+                        // tall mid box spanning the whole corridor.
+                        self.state.tool = .rectangle
+                        self.state.lastNonTextTool = .rectangle
+                        let da1 = self.win(CGPoint(x: 500, y: 400))
+                        let da2 = self.win(CGPoint(x: 560, y: 460))
+                        canvas.mouseDown(with: self.mouseEvent(at: da1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: da2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: da2, type: .leftMouseUp))
+                        let boxA2 = canvas.annotations.count - 1
+                        let db1 = self.win(CGPoint(x: 900, y: 400))
+                        let db2 = self.win(CGPoint(x: 960, y: 460))
+                        canvas.mouseDown(with: self.mouseEvent(at: db1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: db2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: db2, type: .leftMouseUp))
+                        let boxB2 = canvas.annotations.count - 1
+                        let dm1 = self.win(CGPoint(x: 640, y: 250))
+                        let dm2 = self.win(CGPoint(x: 860, y: 610))
+                        canvas.mouseDown(with: self.mouseEvent(at: dm1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: dm2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: dm2, type: .leftMouseUp))
+                        let mid = canvas.annotations.count - 1
+                        self.state.tool = .connector
+                        self.state.lastNonTextTool = .connector
+                        let cc1 = self.win(CGPoint(x: 560, y: 430))
+                        let cc2 = self.win(CGPoint(x: 900, y: 430))
+                        canvas.mouseDown(with: self.mouseEvent(at: cc1, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: cc2, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: cc2, type: .leftMouseUp))
+                        guard let link2 = canvas.annotations.last, link2.kind == .connector else {
+                            log("FAIL: dot drag should create a connector, got \(canvas.annotations.last?.kind.rawValue ?? "nil")")
+                            exit(1)
+                        }
+                        let midRect = canvas.annotations[mid].rect
+                        let pathPts = canvas.selftestPathPoints(link2)
+                        let inside = pathPts.contains { midRect.contains($0) }
+                        let maxY = pathPts.map(\.y).max() ?? 0
+                        if inside || maxY < midRect.maxY {
+                            log("FAIL: connector should clear the mid box, inside=\(inside) maxY=\(maxY) midTop=\(midRect.maxY) pts=\(pathPts)")
+                            exit(1)
+                        }
+                        log("mid-box dodge: connector cleared the box over the top (maxY=\(maxY))")
                         log("shape library test: palette contents are all drawable tools")
                         if Tool.shapePalette.count < 25 {
                             log("FAIL: shape palette should contain at least 25 shapes, got \(Tool.shapePalette.count)")

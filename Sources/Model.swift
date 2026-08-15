@@ -43,6 +43,7 @@ enum ShapeKind: String {
     case doubleArrow
     case curvedConnector
     case orthogonal
+    case connector
 }
 
 /// How the outline of a shape is stroked.
@@ -111,6 +112,7 @@ enum Tool: String, CaseIterable {
     case doubleArrow
     case curvedConnector
     case orthogonal
+    case connector
 
     /// Tools that draw rect-based shapes, shown in the shape palette.
     static let shapePalette: [Tool] = [
@@ -119,7 +121,7 @@ enum Tool: String, CaseIterable {
         .star, .star6, .cross, .process, .predefinedProcess, .delay,
         .manualInput, .display, .cloud, .serverStack, .queue,
         .firewall, .cube, .callout, .note, .arrow, .line,
-        .doubleArrow, .curvedConnector, .orthogonal,
+        .doubleArrow, .curvedConnector, .orthogonal, .connector,
     ]
 
     var iconName: String {
@@ -166,6 +168,7 @@ enum Tool: String, CaseIterable {
         case .doubleArrow: return "double-arrow"
         case .curvedConnector: return "curved-connector"
         case .orthogonal: return "orthogonal"
+        case .connector: return "connector"
         }
     }
 
@@ -213,6 +216,7 @@ enum Tool: String, CaseIterable {
         case .doubleArrow: return "Double arrow"
         case .curvedConnector: return "Curved connector"
         case .orthogonal: return "Orthogonal line"
+        case .connector: return "Connector"
         }
     }
 
@@ -252,6 +256,7 @@ enum Tool: String, CaseIterable {
         case .doubleArrow: return .doubleArrow
         case .curvedConnector: return .curvedConnector
         case .orthogonal: return .orthogonal
+        case .connector: return .connector
         default: return nil
         }
     }
@@ -298,10 +303,26 @@ struct Annotation {
     /// True when this text renders as a syntax-highlighted code block with a
     /// translucent background.
     var isCode: Bool = false
+    /// When set, this connector is glued to a shape's edge: its start point
+    /// is recomputed from that shape's current rect whenever it moves, so
+    /// the line follows the box. nil = plain absolute point.
+    var connectionStart: ShapeConnection? = nil
+    var connectionEnd: ShapeConnection? = nil
     /// Font this text used before it became a code block — restored exactly
     /// when toggling back to normal text (nil = never converted).
     var normalFontFamily: String? = nil
     var normalFontSize: CGFloat? = nil
+}
+
+/// Where a connector is pinned to a shape's edge. The anchor stays glued to
+/// the box: moving, resizing or rotating the shape moves the connector end
+/// with it (side/fraction are in the shape's local, pre-rotation space).
+struct ShapeConnection: Codable, Equatable {
+    var annotationIndex: Int
+    /// 0 = top, 1 = right, 2 = bottom, 3 = left edge.
+    var side: Int
+    /// Position along the side, 0...1 (0 = start of the side, 1 = end).
+    var fraction: CGFloat
 }
 
 /// Solid backdrop behind the drawing — lets the user write on a clean

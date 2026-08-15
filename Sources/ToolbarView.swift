@@ -651,7 +651,7 @@ struct ShapesPaletteView: View {
         ShapeGroup(title: "Flowchart", tools: [.process, .predefinedProcess, .delay, .manualInput, .display]),
         ShapeGroup(title: "Architecture", tools: [.cloud, .serverStack, .queue, .firewall, .cube]),
         ShapeGroup(title: "Communication", tools: [.callout, .note]),
-        ShapeGroup(title: "Connectors", tools: [.doubleArrow, .curvedConnector, .orthogonal]),
+        ShapeGroup(title: "Connectors", tools: [.doubleArrow, .curvedConnector, .orthogonal, .connector]),
     ]
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 5)
