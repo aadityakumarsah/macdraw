@@ -4,7 +4,8 @@ Draw, annotate and laser-point directly on your screen — over any app, in seco
 
 ![macOS](https://img.shields.io/badge/macOS-13+-black) ![Swift](https://img.shields.io/badge/Swift-5.9-orange) ![License](https://img.shields.io/badge/license-MIT-blue) ![Size](https://img.shields.io/badge/size-1MB-lightgrey)
 
-## Screenshots
+## Demo
+![Demo Video : ](https://res.cloudinary.com/dye2aeml8/video/upload/v1786801047/macdraw/demo-video.mov)
 
 ![Demo 1](app-ss/demo1.png)
 ![Demo 2](app-ss/demo2.png)
