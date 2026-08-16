@@ -47,6 +47,7 @@ final class IslandManager {
     private weak var canvas: CanvasView?
     private var toolbarHost: NSView?
     private var undoMonitor: Any?
+    private var gestureMonitor: Any?
     private var isShowing = false
     private var isAnimating = false
     private var logoPalette: LogoPaletteView?
@@ -222,6 +223,7 @@ final class IslandManager {
                 onClose: { [weak self] in self?.hide() },
                 onUndo: { [weak canvas] in canvas?.undo() },
                 onClear: { [weak canvas] in canvas?.clearAll() },
+                onResetView: { [weak canvas] in canvas?.resetView() },
                 onActivate: { [weak self] in self?.activate() },
                 onDeactivate: { [weak self] in self?.deactivate() },
                 onToggleCodeBlock: { [weak canvas] in canvas?.toggleCodeBlock() },
@@ -309,12 +311,32 @@ final class IslandManager {
             }
             return event
         }
+
+        // Two-finger scroll + pinch can be eaten by SwiftUI scroll views in
+        // the toolbar, or never reach the canvas depending on window routing.
+        // Catch every gesture for our overlay window and hand it to the
+        // canvas directly, so panning/zooming always responds.
+        gestureMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify]) { [weak self] event in
+            guard let self, let canvas = self.canvas else { return event }
+            guard event.window === self.window else { return event }
+            guard self.state.drawingMode else { return event }
+            // Cursor over the toolbar? Let its own scroll views keep working.
+            if let toolbar = self.toolbarHost {
+                let p = toolbar.convert(event.locationInWindow, from: nil)
+                if toolbar.bounds.contains(p) { return event }
+            }
+            return canvas.handleGesture(event) ? nil : event
+        }
     }
 
     private func teardownContent() {
         if let m = undoMonitor {
             NSEvent.removeMonitor(m)
             undoMonitor = nil
+        }
+        if let m = gestureMonitor {
+            NSEvent.removeMonitor(m)
+            gestureMonitor = nil
         }
         canvas = nil
         toolbarHost = nil

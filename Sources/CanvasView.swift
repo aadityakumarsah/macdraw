@@ -197,6 +197,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var lastSavedData: Data?
 
     private var canvasOffset: CGPoint = .zero
+    /// Zoom factor of the infinite canvas (1 = 100%). Pinch to zoom, or
+    /// ⌘ + scroll wheel. Zooming keeps the world point under the cursor fixed.
+    private(set) var zoom: CGFloat = 1
+    /// True while the space bar is held — dragging pans the canvas from any
+    /// tool (like Figma), instead of using the current tool.
+    private var spaceHeld = false
+    /// True while a space-drag pan is in progress.
+    private var spacePanning = false
     private var current: Annotation?
     private var dragStart: CGPoint = .zero
     private var dragOriginOffset: CGPoint = .zero
@@ -218,6 +226,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var editingView: NSTextView?
     private var editingIndex: Int?
     private var editingFontFamily: String?
+    /// The text size in world (unzoomed) points while an edit field is open —
+    /// the field's font is `worldSize * zoom`, so panning/zooming mid-edit
+    /// keeps everything glued together.
+    private var editingWorldFontSize: CGFloat = 0
     /// The font this text used before code mode replaced it (used when
     /// committing a brand-new code block so toggling it back restores it).
     private var editingNormalFontFamily: String?
@@ -308,6 +320,94 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     var isEditingText: Bool { editingView != nil }
 
+    // MARK: - world <-> screen coordinates
+
+    /// Canvas (world) point under a screen point: world = (screen - offset) / zoom.
+    private func screenToWorld(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: (p.x - canvasOffset.x) / zoom, y: (p.y - canvasOffset.y) / zoom)
+    }
+
+    private func screenToWorld(_ r: CGRect) -> CGRect {
+        CGRect(
+            x: (r.minX - canvasOffset.x) / zoom,
+            y: (r.minY - canvasOffset.y) / zoom,
+            width: r.width / zoom,
+            height: r.height / zoom
+        )
+    }
+
+    /// Screen point for a canvas (world) point: screen = world * zoom + offset.
+    private func worldToScreen(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x * zoom + canvasOffset.x, y: p.y * zoom + canvasOffset.y)
+    }
+
+    private func worldToScreen(_ r: CGRect) -> CGRect {
+        CGRect(
+            x: r.minX * zoom + canvasOffset.x,
+            y: r.minY * zoom + canvasOffset.y,
+            width: r.width * zoom,
+            height: r.height * zoom
+        )
+    }
+
+    /// Zooms the canvas by `factor` around `screenPoint` (keeps the world
+    /// point under the cursor fixed). Also used for keyboard zoom.
+    private func zoomCanvas(by factor: CGFloat, around screenPoint: CGPoint) {
+        let newZoom = min(8, max(0.15, zoom * factor))
+        let actual = newZoom / zoom
+        guard abs(actual - 1) > 0.001 else { return }
+        canvasOffset.x = screenPoint.x - (screenPoint.x - canvasOffset.x) * actual
+        canvasOffset.y = screenPoint.y - (screenPoint.y - canvasOffset.y) * actual
+        zoom = newZoom
+        syncEditingView()
+        needsDisplay = true
+    }
+
+    /// Resets zoom to 100% and centers the canvas back at the screen origin.
+    func resetView() {
+        canvasOffset = .zero
+        zoom = 1
+        syncEditingView()
+        needsDisplay = true
+    }
+
+    /// Applies the current zoom to an open text edit view (recomputes its
+    /// frame from the world rect so the field stays glued to the text).
+    private func syncEditingView() {
+        guard let tv = editingView else { return }
+        let worldRect: CGRect
+        if let idx = editingIndex, annotations.indices.contains(idx) {
+            let a = annotations[idx]
+            if a.kind == .text {
+                worldRect = CGRect(
+                    x: a.rect.minX,
+                    y: a.rect.minY,
+                    width: max(160, a.rect.width),
+                    height: max(34, a.rect.height)
+                )
+            } else {
+                let pad: CGFloat = 10
+                worldRect = CGRect(
+                    x: a.rect.minX + pad,
+                    y: a.rect.minY + pad,
+                    width: max(60, a.rect.width - pad * 2),
+                    height: max(28, a.rect.height - pad * 2)
+                )
+            }
+        } else {
+            worldRect = screenToWorld(tv.frame)
+        }
+        let screenRect = worldToScreen(worldRect)
+        var f = tv.frame
+        f.origin = screenRect.origin
+        f.size.width = screenRect.width
+        f.size.height = max(screenRect.height, tv.frame.height * (screenRect.width / max(1, tv.frame.width)))
+        tv.frame = f
+        if editingWorldFontSize > 0 {
+            tv.font = Fonts.nsFont(for: editingFontFamily ?? state.fontFamily, size: editingWorldFontSize * zoom)
+        }
+    }
+
     init(state: CanvasState) {
         self.state = state
         super.init(frame: .zero)
@@ -317,8 +417,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
             .dropFirst()
             .sink { [weak self] size, family in
                 guard let self, let tv = self.editingView, !self.isCodeEditingContext else { return }
-                tv.font = Fonts.nsFont(for: family, size: size)
+                tv.font = Fonts.nsFont(for: family, size: size * self.zoom)
                 self.editingFontFamily = family
+                self.editingWorldFontSize = size
             }
             .store(in: &cancellables)
         // Live color updates while a text field is open
@@ -427,9 +528,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
     override func mouseMoved(with event: NSEvent) {
         // In pass-through mode the cursor belongs to the apps below.
         guard state.drawingMode else { return }
+        if spaceHeld {
+            NSCursor.openHand.set()
+            return
+        }
         let p = convert(event.locationInWindow, from: nil)
         // Adjust for canvas offset in hit testing
-        let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+        let adjustedP = screenToWorld(p)
         switch state.tool {
         case .selection:
             if let sel = selected.first, sel < annotations.count {
@@ -477,6 +582,53 @@ final class CanvasView: NSView, NSTextViewDelegate {
         NSCursor.arrow.set()
     }
 
+    // MARK: - infinite canvas gestures
+
+    /// Trackpad pinch — zoom around the cursor.
+    override func magnify(with event: NSEvent) {
+        guard state.drawingMode else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        zoomCanvas(by: 1 + event.magnification, around: p)
+    }
+
+    /// Gesture hook for the overlay's local monitor: routes scroll / pinch
+    /// events to the canvas so two-finger panning and zooming work no matter
+    /// where the cursor is. Returns true when the event was consumed.
+    func handleGesture(_ event: NSEvent) -> Bool {
+        // Scrolling over the open text field belongs to the editor itself.
+        if let tv = editingView {
+            let p = convert(event.locationInWindow, from: nil)
+            if tv.frame.contains(p) { return false }
+        }
+        switch event.type {
+        case .scrollWheel:
+            scrollWheel(with: event)
+        case .magnify:
+            magnify(with: event)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Two-finger trackpad scroll (or mouse wheel) pans the canvas; holding
+    /// ⌘ turns the same gesture into zooming (handy for mouse users).
+    override func scrollWheel(with event: NSEvent) {
+        guard state.drawingMode else { return }
+        if event.modifierFlags.contains(.command) {
+            let p = convert(event.locationInWindow, from: nil)
+            let factor = event.hasPreciseScrollingDeltas
+                ? 1 + event.scrollingDeltaY * 0.01
+                : 1 + event.scrollingDeltaY * 0.08
+            zoomCanvas(by: factor, around: p)
+            return
+        }
+        canvasOffset.x += event.scrollingDeltaX
+        canvasOffset.y += event.scrollingDeltaY
+        syncEditingView()
+        needsDisplay = true
+    }
+
     // MARK: - mouse
 
     override func mouseDown(with event: NSEvent) {
@@ -484,10 +636,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
             editingView?.resignFirstResponder()
         }
         let p = convert(event.locationInWindow, from: nil)
+        // Holding space turns any tool into a temporary pan (Figma-style).
+        if spaceHeld, !isEditingText {
+            NSCursor.closedHand.set()
+            dragStart = p
+            dragOriginOffset = canvasOffset
+            spacePanning = true
+            return
+        }
         switch state.tool {
         case .selection:
             // Adjust for canvas offset in selection tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             dragStart = adjustedP
             if event.clickCount >= 2, let i = hitIndex(adjustedP),
                annotations[i].kind == .text || isClosed(annotations[i].kind) {
@@ -562,18 +722,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
             dragOriginOffset = canvasOffset
         case .lasso:
             // Adjust for canvas offset in lasso tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             dragStart = adjustedP
             lassoPoly = [adjustedP]
         case .eraser:
             pushUndo()
             // Adjust for canvas offset in eraser tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             eraseStroke = [adjustedP]
             erase(at: adjustedP)
         case .bucketFill:
             // Adjust for canvas offset in bucket fill tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             if let i = hitIndex(adjustedP) {
                 pushUndo()
                 if state.fillEnabled {
@@ -589,7 +749,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKey()
             // Adjust for canvas offset when hitting text
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             if let i = hitIndex(adjustedP), annotations[i].kind == .text {
                 // Clicking an existing text edits it instead of creating a new one.
                 beginTextEditing(at: adjustedP, editingIndex: i)
@@ -605,7 +765,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             pickImage(at: p)
         default:
             // Adjust coordinates by canvas offset to ensure drawing works correctly after panning
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             dragStart = adjustedP
             let kind = state.tool.shapeKind ?? .rect
             current = Annotation(
@@ -640,10 +800,16 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if spacePanning {
+            canvasOffset = dragOriginOffset + (p - dragStart)
+            syncEditingView()
+            needsDisplay = true
+            return
+        }
         switch state.tool {
         case .selection:
             // Adjust for canvas offset in selection tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             if let ms = marqueeStart {
                 marqueeRect = normalizedRect(from: ms, to: adjustedP)
             } else if let i = rotateIndex {
@@ -663,13 +829,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
             }
         case .hand:
             canvasOffset = dragOriginOffset + (p - dragStart)
+            syncEditingView()
         case .lasso:
             // Adjust for canvas offset in lasso tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             lassoPoly.append(adjustedP)
         case .eraser:
             // Adjust for canvas offset in eraser tool
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             eraseStroke.append(adjustedP)
             erase(at: adjustedP)
         case .text:
@@ -677,7 +844,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         default:
             guard var c = current else { return }
             // Adjust point by canvas offset for drawing tools
-            let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+            let adjustedP = screenToWorld(p)
             switch c.kind {
             case .rect, .diamond, .ellipse, .frame,
                  .triangle, .rightTriangle, .parallelogram, .trapezoid,
@@ -715,8 +882,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     override func mouseUp(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        if spacePanning {
+            spacePanning = false
+            NSCursor.openHand.set()
+            return
+        }
         // Adjust point by canvas offset for consistency
-        let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+        let adjustedP = screenToWorld(p)
         switch state.tool {
         case .selection:
             if marqueeStart != nil {
@@ -771,7 +943,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Esc — end text editing, or switch to selection tool
+        if event.keyCode == 49 { // space — hold to pan from any tool
+            if !isEditingText {
+                spaceHeld = true
+                NSCursor.openHand.set()
+                return
+            }
+        } else if event.keyCode == 53 { // Esc — end text editing, or switch to selection tool
             if isEditingText {
                 commitPendingText(selectAndPick: true)
             } else {
@@ -813,9 +991,30 @@ final class CanvasView: NSView, NSTextViewDelegate {
                   event.charactersIgnoringModifiers?.lowercased() == "f" {
             // Send to back
             sendToBack()
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "0" {
+            resetView()
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "=" {
+            zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY))
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "-" {
+            zoomCanvas(by: 0.8, around: CGPoint(x: bounds.midX, y: bounds.midY))
         } else {
             super.keyDown(with: event)
         }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 49 { // space
+            spaceHeld = false
+            if spacePanning {
+                spacePanning = false
+                NSCursor.arrow.set()
+            }
+            return
+        }
+        super.keyUp(with: event)
     }
 
     /// Selects every annotation so the user can move/resize or delete them all
@@ -921,6 +1120,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             size = 15
         }
         editingFontFamily = family
+        editingWorldFontSize = size
         self.editingIndex = editingIndex
         let editingPolygon = existing.map { $0.kind != .text } ?? false
         let codeWidth: CGFloat = (editingIndex == nil && code) ? 460 : 260
@@ -945,6 +1145,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 height: max(28, a.rect.height - pad * 2)
             )
         } ?? CGRect(x: p.x, y: p.y, width: codeWidth, height: 34)
+        // The edit field is a plain subview (screen space) — scale its frame
+        // and font by the canvas zoom so it sits exactly on the world rect.
+        let screenRect = worldToScreen(rect)
 
         if code {
             // Code edits update the annotation live while typing, so the undo
@@ -991,12 +1194,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             self.editingIndex = annotations.count - 1
         }
 
-        let tv = NSTextView(frame: rect)
+        let tv = NSTextView(frame: screenRect)
         tv.isRichText = false
         tv.isEditable = true
         tv.isSelectable = true
         tv.drawsBackground = false
-        tv.font = Fonts.nsFont(for: family, size: size)
+        tv.font = Fonts.nsFont(for: family, size: size * zoom)
         tv.textColor = existing?.strokeColor ?? state.strokeColor
         tv.allowsUndo = true
         // Plain, predictable editing: no autocorrect, quotes or dashes.
@@ -1028,9 +1231,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if let existing, !existing.text.isEmpty {
             tv.string = existing.text
             // Fit the view's height to the existing text right away.
-            let attrs: [NSAttributedString.Key: Any] = [.font: tv.font ?? Fonts.nsFont(for: family, size: size)]
+            let attrs: [NSAttributedString.Key: Any] = [.font: tv.font ?? Fonts.nsFont(for: family, size: size * zoom)]
             let bounds = (existing.text as NSString).boundingRect(
-                with: CGSize(width: rect.width, height: .greatestFiniteMagnitude),
+                with: CGSize(width: screenRect.width, height: .greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 attributes: attrs
             )
@@ -1087,12 +1290,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
         layoutManager.ensureLayout(for: container)
         let used = layoutManager.usedRect(for: container)
         var f = tv.frame
+        // The field's font is scaled by zoom, so its measured height is in
+        // screen points — the annotation rect is stored in world points.
         let target = max(34, ceil(used.height) + 10)
         if abs(target - f.height) > 0.5 {
             f.size.height = target
             tv.frame = f
             if isCodeEditingContext, let idx = editingIndex, annotations.indices.contains(idx) {
-                annotations[idx].rect.size.height = target
+                annotations[idx].rect.size.height = target / zoom
                 needsDisplay = true
             }
         }
@@ -1275,7 +1480,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         window?.makeFirstResponder(self)
         let str = tv.string.trimmingCharacters(in: .whitespacesAndNewlines)
         let family = editingFontFamily ?? state.fontFamily
-        let size = tv.font?.pointSize ?? state.fontSize
+        let size = editingWorldFontSize > 0 ? editingWorldFontSize : (tv.font?.pointSize ?? state.fontSize) / zoom
         // Fresh polygons have no text yet — let the toolbar font size apply.
         let targetSize: CGFloat
         if let idx = editingIndex, annotations.indices.contains(idx),
@@ -1287,6 +1492,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let idx = editingIndex
         editingIndex = nil
         editingFontFamily = nil
+        editingWorldFontSize = 0
         let undoPushed = editingUndoPushed
         editingUndoPushed = false
         let normalFamily = editingNormalFontFamily
@@ -1322,11 +1528,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
         )
         var r = tv.frame
         r.size = CGSize(width: width, height: max(bounds.height, size * 1.4))
+        // The field lives in screen space; the annotation is stored in world
+        // points, so convert back before committing.
+        let worldRect = screenToWorld(r)
         if !undoPushed { pushUndo() }
         if let idx, annotations.indices.contains(idx) {
             var updated = annotations[idx]
             if updated.kind == .text {
-                updated.rect = r
+                updated.rect = worldRect
                 updated.text = str
                 updated.fontFamily = family
                 updated.fontSize = size
@@ -1351,7 +1560,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         annotations.append(Annotation(
             kind: .text,
-            rect: r,
+            rect: worldRect,
             strokeColor: state.strokeColor,
             fillColor: nil,
             fillOpacity: state.fillOpacity,
@@ -1429,7 +1638,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// palette), tinted with the current stroke color.
     func insertSymbol(_ symbol: String, at p: CGPoint) {
         // Adjust for canvas offset
-        let adjustedP = CGPoint(x: p.x - canvasOffset.x, y: p.y - canvasOffset.y)
+        let adjustedP = screenToWorld(p)
         guard let image = tintedSymbolImage(named: symbol, pointSize: 44, color: state.strokeColor) else { return }
         let size = image.size
         pushUndo()
@@ -1497,7 +1706,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 }
                 // Convert window point to canvas coordinates at placement time
                 let canvasPoint = self.convert(windowPoint, from: nil)
-                let adjustedPoint = CGPoint(x: canvasPoint.x - self.canvasOffset.x, y: canvasPoint.y - self.canvasOffset.y)
+                let adjustedPoint = self.screenToWorld(canvasPoint)
                 self.pushUndo()
                 self.annotations.append(Annotation(
                     kind: .image,
@@ -1534,7 +1743,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 }
                 // Convert window point to canvas coordinates at placement time
                 let canvasPoint = self.convert(windowPoint, from: nil)
-                let adjustedPoint = CGPoint(x: canvasPoint.x - self.canvasOffset.x, y: canvasPoint.y - self.canvasOffset.y)
+                let adjustedPoint = self.screenToWorld(canvasPoint)
                 self.pushUndo()
                 self.annotations.append(Annotation(
                     kind: .image,
@@ -1693,6 +1902,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         ctx.saveGraphicsState()
         let t = NSAffineTransform()
         t.translateX(by: canvasOffset.x, yBy: canvasOffset.y)
+        t.scale(by: zoom)
         t.concat()
 
         // Sort annotations by z-index for proper layering

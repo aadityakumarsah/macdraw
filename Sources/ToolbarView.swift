@@ -18,6 +18,7 @@ struct ToolbarView: View {
     let onClose: () -> Void
     let onUndo: () -> Void
     let onClear: () -> Void
+    let onResetView: () -> Void
     let onActivate: () -> Void
     let onDeactivate: () -> Void
     let onToggleCodeBlock: () -> Void
@@ -158,6 +159,14 @@ struct ToolbarView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Clear all")
+
+                    Button(action: onResetView) {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .frame(width: 32, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset view — zoom 100%, recenter (⌘0)")
                 }
             }
 
@@ -598,6 +607,9 @@ struct ShortcutsView: View {
             ForEach([
                 ("Draw on / off", "Toolbar button"),
                 ("Pause drawing", "Draw button again"),
+                ("Pan canvas", "Space + drag / two-finger scroll"),
+                ("Zoom canvas", "Pinch / ⌘ + scroll"),
+                ("Reset view", "⌘0"),
                 ("Undo", "⌘Z"),
                 ("Select all", "⌘A"),
                 ("Delete selection", "⌫"),
