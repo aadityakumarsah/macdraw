@@ -60,6 +60,11 @@ echo "== installing to build/ =="
 mkdir -p build
 rm -rf build/macdraw.app
 rsync -a "$APP" build/
+# Desktop/iCloud can attach Finder metadata while the app is copied out of
+# the temporary build directory. Remove it and sign the exact app users run.
+xattr -cr build/macdraw.app 2>/dev/null || true
+codesign --force --sign - build/macdraw.app
+codesign --verify --deep --strict build/macdraw.app && echo "installed app signature OK"
 
 echo "== release zip =="
 # The app auto-updates by downloading this zip from the GitHub release

@@ -10,6 +10,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
     case openAI = "OpenAI / Codex"
     case anthropic = "Anthropic / Claude"
     case openRouter = "OpenRouter"
+    case gemini = "Google Gemini"
     case custom = "OpenAI-compatible"
     case local = "Local (Ollama)"
     var id: String { rawValue }
@@ -18,6 +19,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .openAI: return "https://api.openai.com/v1"
         case .anthropic: return "https://api.anthropic.com/v1"
         case .openRouter: return "https://openrouter.ai/api/v1"
+        case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
         case .custom: return ""
         case .local: return "http://127.0.0.1:11434/v1"
         }
@@ -27,6 +29,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .openAI: return "gpt-4.1-mini"
         case .anthropic: return "claude-sonnet-4-20250514"
         case .openRouter: return "openai/gpt-4.1-mini"
+        case .gemini: return "gemini-2.5-flash"
         case .custom: return ""
         case .local: return "llama3.2"
         }
@@ -56,20 +59,34 @@ struct DiagramSpec: Codable {
 }
 
 final class AISettings: ObservableObject {
-    @Published var provider: AIProvider { didSet { saveNonSecret() } }
-    @Published var endpoint: String { didSet { saveNonSecret() } }
-    @Published var model: String { didSet { saveNonSecret() } }
-    @Published var apiKey: String { didSet { KeychainStore.set(apiKey, account: "ai.apiKey") } }
+    @Published var provider: AIProvider { didSet { saveNonSecret(); loadAPIKeyForCurrentProvider() } }
+    @Published var endpoint: String { didSet { saveNonSecret(); invalidateTest() } }
+    @Published var model: String { didSet { saveNonSecret(); invalidateTest() } }
+    @Published var apiKey: String { didSet { KeychainStore.set(apiKey, account: Self.keychainAccount(for: provider)); invalidateTest() } }
     @Published var testStatus = "Not tested"
+
+    static func keychainAccount(for provider: AIProvider) -> String { "ai.apiKey." + provider.rawValue }
+
     init() {
         let d = UserDefaults.standard
         let savedProvider = AIProvider(rawValue: d.string(forKey: "ai.provider") ?? "") ?? .local
         provider = savedProvider
         endpoint = d.string(forKey: "ai.endpoint") ?? savedProvider.defaultEndpoint
         model = d.string(forKey: "ai.model") ?? savedProvider.defaultModel
-        apiKey = KeychainStore.get(account: "ai.apiKey") ?? ""
+        let providerKey = KeychainStore.get(account: Self.keychainAccount(for: savedProvider))
+        let legacyKey = KeychainStore.get(account: "ai.apiKey")
+        apiKey = providerKey ?? legacyKey ?? ""
+        // Preserve existing installations: the old single key was most often
+        // an OpenRouter key, so associate it with the provider selected by the
+        // user instead of making them enter it again after upgrading.
+        if providerKey == nil, let legacyKey { KeychainStore.set(legacyKey, account: Self.keychainAccount(for: savedProvider)) }
     }
-    func useProviderDefaults() { endpoint = provider.defaultEndpoint; model = provider.defaultModel }
+    func useProviderDefaults() { endpoint = provider.defaultEndpoint; model = provider.defaultModel; loadAPIKeyForCurrentProvider() }
+    private func loadAPIKeyForCurrentProvider() {
+        let key = KeychainStore.get(account: Self.keychainAccount(for: provider)) ?? ""
+        if apiKey != key { apiKey = key }
+    }
+    private func invalidateTest() { if testStatus != "Not tested" { testStatus = "Not tested" } }
     private func saveNonSecret() {
         let d = UserDefaults.standard
         d.set(provider.rawValue, forKey: "ai.provider")
@@ -107,22 +124,73 @@ enum LocalModelRuntime {
         guard !model.isEmpty else {
             throw NSError(domain: "MacdrawAI", code: 20, userInfo: [NSLocalizedDescriptionKey: "Enter a local model name first."])
         }
-        if try await run("/usr/bin/which", ["ollama"]).status != 0 {
-            let install = try await run("/usr/bin/env", ["brew", "install", "ollama"])
+
+        var executable = findExecutable(named: "ollama")
+        if executable == nil {
+            guard let brew = findExecutable(named: "brew") else {
+                throw NSError(domain: "MacdrawAI", code: 21, userInfo: [NSLocalizedDescriptionKey: "Ollama is not installed, and Homebrew was not found. Install Ollama from ollama.com, then try again."])
+            }
+            let install = try await run(brew, ["install", "ollama"])
             guard install.status == 0 else { throw failure("Ollama installation", install) }
+            executable = findExecutable(named: "ollama")
         }
-        if server?.isRunning != true {
+        guard let executable else {
+            throw NSError(domain: "MacdrawAI", code: 22, userInfo: [NSLocalizedDescriptionKey: "Ollama was installed, but its command could not be found. Restart macdraw and try again."])
+        }
+
+        // Ollama may already be running as a menu-bar app or a launch agent.
+        // Only start a child process when the local API is not ready.
+        if !(await isServerReady()) && server?.isRunning != true {
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["ollama", "serve"]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = ["serve"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
             try process.run()
             server = process
-            try await Task.sleep(for: .milliseconds(500))
         }
-        let pull = try await run("/usr/bin/env", ["ollama", "pull", model])
+        guard await waitForServer() else {
+            throw NSError(domain: "MacdrawAI", code: 23, userInfo: [NSLocalizedDescriptionKey: "Ollama did not become ready. Open the Ollama app or run `ollama serve`, then try again."])
+        }
+
+        let pull = try await run(executable, ["pull", model])
         guard pull.status == 0 else { throw failure("Model download", pull) }
+    }
+
+    private static func findExecutable(named name: String) -> String? {
+        let fm = FileManager.default
+        let pathCandidates = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map { String($0) }
+            .map { "\($0)/\(name)" }
+        let fixedCandidates: [String]
+        if name == "ollama" {
+            fixedCandidates = [
+                "/opt/homebrew/bin/ollama",
+                "/usr/local/bin/ollama",
+                "/Applications/Ollama.app/Contents/Resources/ollama",
+                "\(NSHomeDirectory())/.local/bin/ollama"
+            ]
+        } else {
+            fixedCandidates = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/usr/bin/brew"]
+        }
+        return (pathCandidates + fixedCandidates).first { fm.isExecutableFile(atPath: $0) }
+    }
+
+    private static func isServerReady() async -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:11434/api/tags") else { return false }
+        var request = URLRequest(url: url); request.timeoutInterval = 1.5
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            return (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
+        } catch { return false }
+    }
+
+    private static func waitForServer() async -> Bool {
+        for _ in 0..<30 {
+            if await isServerReady() { return true }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return false
     }
 
     private static func failure(_ action: String, _ result: (status: Int32, output: String)) -> NSError {
@@ -154,11 +222,13 @@ enum LocalModelRuntime {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NSError(domain: "MacdrawAI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Describe the diagram first."]) }
         if settings.provider == .local && settings.endpoint.isEmpty { throw NSError(domain: "MacdrawAI", code: 2, userInfo: [NSLocalizedDescriptionKey: "Set the local Ollama endpoint."]) }
         if settings.provider != .local && settings.apiKey.isEmpty { throw NSError(domain: "MacdrawAI", code: 3, userInfo: [NSLocalizedDescriptionKey: "Add an API key in Settings."]) }
+        if settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw NSError(domain: "MacdrawAI", code: 4, userInfo: [NSLocalizedDescriptionKey: "Set a model name in Settings."]) }
         let content = try await request(prompt: prompt, settings: settings)
         return try decode(content)
     }
     static func test(settings: AISettings) async -> String {
         do {
+            if settings.provider != .local && settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Add an API key in Settings." }
             if settings.provider == .local {
                 let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 guard let url = URL(string: endpoint + "/models") else { return "The endpoint URL is invalid." }
@@ -177,6 +247,7 @@ enum LocalModelRuntime {
                 }
                 return "Connected (Ollama)"
             }
+            if settings.provider == .gemini { return await healthCheck(settings: settings) }
             if settings.provider != .anthropic {
                 return await healthCheck(settings: settings)
             }
@@ -187,12 +258,25 @@ enum LocalModelRuntime {
 
     private static func healthCheck(settings: AISettings) async -> String {
         let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: endpoint + "/models") else { return "The endpoint URL is invalid." }
+        let path: String
+        if settings.provider == .gemini {
+            let model = settings.model.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "models/", with: "")
+            guard !model.isEmpty else { return "Set a Gemini model name in Settings." }
+            guard let escapedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return "The model name is invalid." }
+            path = "/models/\(escapedModel)"
+        } else {
+            path = "/models"
+        }
+        guard let url = URL(string: endpoint + path) else { return "The endpoint URL is invalid." }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if !settings.apiKey.isEmpty { request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization") }
+        if settings.provider == .gemini {
+            request.setValue(settings.apiKey, forHTTPHeaderField: "x-goog-api-key")
+        } else if !settings.apiKey.isEmpty {
+            request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { return "No response from provider." }
@@ -208,14 +292,26 @@ enum LocalModelRuntime {
         let urlString: String
         var body: [String: Any]
         var headers = ["Content-Type": "application/json"]
-        if settings.provider == .anthropic {
+        if settings.provider == .gemini {
+            let model = settings.model.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "models/", with: "")
+            guard let escapedModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { throw NSError(domain: "MacdrawAI", code: 4, userInfo: [NSLocalizedDescriptionKey: "The model name is invalid."]) }
+            urlString = endpoint + "/models/\(escapedModel):generateContent"
+            headers["x-goog-api-key"] = settings.apiKey
+            body = [
+                "systemInstruction": ["parts": [["text": systemPrompt]]],
+                "contents": [["role": "user", "parts": [["text": prompt]]]],
+                "generationConfig": ["temperature": 0.2, "maxOutputTokens": maxTokens, "responseMimeType": "application/json"]
+            ]
+        } else if settings.provider == .anthropic {
             urlString = endpoint + "/messages"
             headers["x-api-key"] = settings.apiKey; headers["anthropic-version"] = "2023-06-01"
             body = ["model": settings.model, "max_tokens": maxTokens, "system": systemPrompt, "messages": [["role": "user", "content": prompt]]]
         } else {
             urlString = endpoint + "/chat/completions"
             if !settings.apiKey.isEmpty { headers["Authorization"] = "Bearer \(settings.apiKey)" }
-            body = ["model": settings.model, "temperature": 0.2, "response_format": ["type": "json_object"], "max_tokens": maxTokens, "messages": [["role": "system", "content": systemPrompt], ["role": "user", "content": prompt]]]
+            // Do not force response_format here: many valid OpenRouter models
+            // are OpenAI-compatible but do not expose JSON-mode parameters.
+            body = ["model": settings.model, "temperature": 0.2, "max_tokens": maxTokens, "messages": [["role": "system", "content": systemPrompt], ["role": "user", "content": prompt]]]
         }
         guard let url = URL(string: urlString) else { throw NSError(domain: "MacdrawAI", code: 4, userInfo: [NSLocalizedDescriptionKey: "The endpoint URL is invalid."]) }
         var req = URLRequest(url: url); req.httpMethod = "POST"; req.timeoutInterval = 35
@@ -228,6 +324,13 @@ enum LocalModelRuntime {
             throw NSError(domain: "MacdrawAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Provider returned \(http.statusCode): \(text.prefix(240))"])
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if settings.provider == .gemini,
+           let candidates = json?["candidates"] as? [[String: Any]],
+           let parts = candidates.first?["content"] as? [String: Any],
+           let values = parts["parts"] as? [[String: Any]] {
+            let text = values.compactMap { $0["text"] as? String }.joined()
+            if !text.isEmpty { return text }
+        }
         if settings.provider == .anthropic, let blocks = json?["content"] as? [[String: Any]], let text = blocks.first?["text"] as? String { return text }
         if let choices = json?["choices"] as? [[String: Any]], let message = choices.first?["message"] as? [String: Any], let text = message["content"] as? String { return text }
         throw NSError(domain: "MacdrawAI", code: 6, userInfo: [NSLocalizedDescriptionKey: "Provider did not return chat text."])
@@ -313,7 +416,10 @@ private struct AISettingsView: View {
         Picker("Provider", selection: $settings.provider) { ForEach(AIProvider.allCases) { Text($0.rawValue).tag($0) } }.onChange(of: settings.provider) { _, _ in settings.useProviderDefaults() }
         TextField("Endpoint", text: $settings.endpoint).textFieldStyle(.roundedBorder)
         TextField("Model", text: $settings.model).textFieldStyle(.roundedBorder)
-        if settings.provider != .local { SecureField("API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder) }
+        if settings.provider != .local {
+            SecureField(settings.provider == .gemini ? "Gemini API key (stored in Keychain)" : "API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder)
+            if settings.provider == .gemini { Text("Create a key in Google AI Studio, then paste it here.").font(.system(size: 10)).foregroundStyle(.secondary) }
+        }
         if settings.provider == .local {
             HStack(spacing: 8) {
                 if installing { ProgressView().controlSize(.small) }
@@ -337,7 +443,12 @@ private struct AISettingsView: View {
             if installing || !setupStatus.isEmpty { Text(setupStatus).font(.system(size: 10)).foregroundStyle(.secondary) }
             Text("Uses local Ollama; setup installs it through Homebrew and pulls the selected model. Prompts never leave localhost.").font(.system(size: 10)).foregroundStyle(.secondary)
         }
-        HStack { Button(testing ? "Testing…" : "Test connection") { testing = true; Task { let status = await DiagramAI.test(settings: settings); await MainActor.run { settings.testStatus = status; testing = false } } }.disabled(testing); Text(settings.testStatus).font(.system(size: 11)).foregroundStyle(settings.testStatus == "Connected" ? .green : .secondary) }
+        HStack {
+            Button(testing ? "Testing…" : "Test connection") { testing = true; Task { let status = await DiagramAI.test(settings: settings); await MainActor.run { settings.testStatus = status; testing = false } } }.disabled(testing)
+            Image(systemName: settings.testStatus.hasPrefix("Connected") ? "checkmark.circle.fill" : "circle.dotted")
+                .foregroundStyle(settings.testStatus.hasPrefix("Connected") ? .green : .secondary)
+            Text(settings.testStatus).font(.system(size: 11)).foregroundStyle(settings.testStatus.hasPrefix("Connected") ? .green : .secondary)
+        }
         if settings.provider == .local { Text("Local mode uses Ollama. Install it once in Terminal: `brew install ollama`; then run `ollama serve` and `ollama pull \(settings.model.isEmpty ? "llama3.2" : settings.model)`.").font(.system(size: 10)).foregroundStyle(.secondary) }
     }.padding(14).background(Color.primary.opacity(0.05)) }
 }

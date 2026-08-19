@@ -27,6 +27,14 @@ macdraw is a full-screen transparent overlay that captures your clicks so you ca
 - **Autosave** — your drawing persists across quits and relaunches
 - **Keyboard-first** — every tool has a one-key shortcut
 
+## AI text-to-diagram
+
+Open the sparkle button and choose a provider. API keys are stored in the macOS
+Keychain separately for each provider. Supported providers are OpenAI/Codex,
+Anthropic, OpenRouter, Google Gemini, and OpenAI-compatible endpoints.
+
+Google Gemini uses the native Gemini API; create a key in [Google AI Studio](https://aistudio.google.com/app/apikey), choose **Google Gemini**, and paste it into the Gemini key field. For local diagrams, choose **Local (Ollama)** and use the setup button—macdraw finds an existing Ollama installation, starts its local server when needed, and downloads the selected model.
+
 ## Install
 
 ### Via the website
