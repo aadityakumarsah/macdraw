@@ -1444,6 +1444,12 @@ final class IslandManager {
             return false
         }
         switch key {
+        case "z":
+            if event.modifierFlags.contains(.shift) {
+                canvas.redoInEditingField()
+            } else {
+                canvas.undoInEditingField()
+            }
         case "x":
             canvas.cutInEditingField()
         case "c":

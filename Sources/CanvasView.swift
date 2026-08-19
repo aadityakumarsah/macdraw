@@ -1807,9 +1807,33 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// Native editing commands are sent here by the overlay's key monitor,
     /// because this accessory app intentionally has no main-menu Edit items.
-    func cutInEditingField() { editingView?.cut(nil) }
-    func copyInEditingField() { editingView?.copy(nil) }
-    func pasteInEditingField() { editingView?.paste(nil) }
+    /// Using the pasteboard directly makes a cut → paste round trip reliable
+    /// even when AppKit cannot resolve a menu item's target in an accessory
+    /// application.
+    func copyInEditingField() {
+        guard let tv = editingView else { return }
+        let range = tv.selectedRange()
+        guard range.length > 0, range.location != NSNotFound else { return }
+        let text = (tv.string as NSString).substring(with: range)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    func cutInEditingField() {
+        guard let tv = editingView, tv.selectedRange().length > 0 else { return }
+        copyInEditingField()
+        tv.insertText("", replacementRange: tv.selectedRange())
+    }
+
+    func pasteInEditingField() {
+        guard let tv = editingView,
+              let text = NSPasteboard.general.string(forType: .string) else { return }
+        tv.insertText(text, replacementRange: tv.selectedRange())
+    }
+
+    func undoInEditingField() { editingView?.undoManager?.undo() }
+    func redoInEditingField() { editingView?.undoManager?.redo() }
 
     /// Toggles bold on the selection (or insertion attributes), matching the
     /// standard macOS Cmd+B behavior.
