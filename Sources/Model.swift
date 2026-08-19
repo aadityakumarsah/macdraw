@@ -404,6 +404,11 @@ final class CanvasState: ObservableObject {
     /// apps. When true, the canvas captures mouse events for drawing.
     @Published var drawingMode: Bool = false
 
+    /// Controls the Excalidraw-inspired navigation panel. Keeping this in the
+    /// shared canvas state lets the toolbar and the native overlay animate the
+    /// same sidebar without competing sources of truth.
+    @Published var sidebarVisible: Bool = false
+
     /// The tool that was active before text mode — restored when the user
     /// presses Esc to exit text editing.
     var lastNonTextTool: Tool = .selection

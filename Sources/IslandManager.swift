@@ -28,12 +28,15 @@ final class OverlayWindow: NSPanel {
 /// hit-testable; clicks anywhere else fall through to the apps below.
 private final class ContainerView: NSView {
     weak var toolbarHost: NSView?
+    weak var sidebarHost: NSView?
     var isDrawingMode: (() -> Bool)?
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         if isDrawingMode?() == false {
-            guard let toolbar = toolbarHost else { return nil }
-            guard toolbar.frame.contains(point) else { return nil }
+            if let sidebar = sidebarHost, sidebar.frame.contains(point) {
+                return sidebar.hitTest(convert(point, to: sidebar))
+            }
+            guard let toolbar = toolbarHost, toolbar.frame.contains(point) else { return nil }
             return toolbar.hitTest(convert(point, to: toolbar))
         }
         return super.hitTest(point)
@@ -48,11 +51,31 @@ final class IslandManager {
     let updater = AppUpdater()
     private weak var canvas: CanvasView?
     private var toolbarHost: NSView?
+    private var sidebarHost: NSView?
     private var undoMonitor: Any?
     private var gestureMonitor: Any?
     private var isShowing = false
     private var isAnimating = false
     private var logoPalette: LogoPaletteView?
+
+    private func switchPage(_ id: UUID) {
+        guard let canvas else { return }
+        canvas.saveViewStateToPages()
+        pages.switchPage(id: id)
+        canvas.applyCurrentPage()
+    }
+
+    private func toggleSidebar() {
+        guard let sidebar = sidebarHost else { return }
+        state.sidebarVisible.toggle()
+        var frame = sidebar.frame
+        frame.origin.x = state.sidebarVisible ? 16 : -frame.width - 16
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            sidebar.animator().frame = frame
+        }
+    }
 
     var isLogoPaletteVisible: Bool { logoPalette?.superview != nil }
 
@@ -219,6 +242,22 @@ final class IslandManager {
         container.addSubview(canvas)
         self.canvas = canvas
 
+        let sidebar = NSHostingView(
+            rootView: SidebarView(
+                state: state,
+                pages: pages,
+                onClose: { [weak self] in self?.toggleSidebar() },
+                onSwitchPage: { [weak self] id in self?.switchPage(id) },
+                onClear: { [weak canvas] in canvas?.clearAll() },
+                onResetView: { [weak canvas] in canvas?.resetView() }
+            )
+        )
+        sidebar.frame = CGRect(x: -308, y: 106, width: 292, height: 560)
+        sidebar.appearance = NSAppearance(named: .darkAqua)
+        container.addSubview(sidebar)
+        sidebarHost = sidebar
+        container.sidebarHost = sidebar
+
         let toolbar = NSHostingView(
             rootView: ToolbarView(
                 state: state,
@@ -237,11 +276,9 @@ final class IslandManager {
                     canvas.insertSymbol(symbol, at: p)
                 },
                 onSwitchPage: { [weak self] id in
-                    guard let self, let canvas = self.canvas else { return }
-                    canvas.saveViewStateToPages()
-                    self.pages.switchPage(id: id)
-                    canvas.applyCurrentPage()
-                }
+                    self?.switchPage(id)
+                },
+                onToggleSidebar: { [weak self] in self?.toggleSidebar() }
             )
         )
         toolbar.frame = CGRect(
@@ -350,6 +387,10 @@ final class IslandManager {
                 let p = toolbar.convert(event.locationInWindow, from: nil)
                 if toolbar.bounds.contains(p) { return event }
             }
+            if let sidebar = self.sidebarHost {
+                let p = sidebar.convert(event.locationInWindow, from: nil)
+                if sidebar.bounds.contains(p) { return event }
+            }
             return canvas.handleGesture(event) ? nil : event
         }
     }
@@ -365,6 +406,8 @@ final class IslandManager {
         }
         canvas = nil
         toolbarHost = nil
+        sidebarHost = nil
+        state.sidebarVisible = false
         window.contentView = nil
     }
 

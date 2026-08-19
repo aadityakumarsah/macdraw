@@ -26,6 +26,7 @@ struct ToolbarView: View {
     let onToggleCodeBlock: () -> Void
     let onInsertSymbol: (String) -> Void
     let onSwitchPage: (UUID) -> Void
+    let onToggleSidebar: () -> Void
 
     enum ColorTarget {
         case stroke
@@ -111,6 +112,18 @@ struct ToolbarView: View {
 
     private var topRow: some View {
         HStack(spacing: 6) {
+            Button(action: onToggleSidebar) {
+                Image(systemName: state.sidebarVisible ? "sidebar.left" : "sidebar.left")
+                    .frame(width: 30, height: 30)
+                    .background(
+                        state.sidebarVisible ? Color.white.opacity(0.14) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(state.sidebarVisible ? "Hide sidebar" : "Show sidebar")
+
             pagesButton
 
             Divider().frame(height: 22)
