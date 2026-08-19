@@ -127,12 +127,17 @@ enum LocalModelRuntime {
 
         var executable = findExecutable(named: "ollama")
         if executable == nil {
-            guard let brew = findExecutable(named: "brew") else {
-                throw NSError(domain: "MacdrawAI", code: 21, userInfo: [NSLocalizedDescriptionKey: "Ollama is not installed, and Homebrew was not found. Install Ollama from ollama.com, then try again."])
+            if let brew = findExecutable(named: "brew") {
+                let install = try await run(brew, ["install", "ollama"])
+                guard install.status == 0 else { throw failure("Ollama installation", install) }
+                executable = findExecutable(named: "ollama")
+            } else {
+                // Do not require users to know about Homebrew. Install the
+                // official app into the user's Applications directory, which
+                // avoids sudo/password prompts and works for Finder-launched
+                // macdraw processes with a minimal PATH.
+                executable = try await installOfficialOllama()
             }
-            let install = try await run(brew, ["install", "ollama"])
-            guard install.status == 0 else { throw failure("Ollama installation", install) }
-            executable = findExecutable(named: "ollama")
         }
         guard let executable else {
             throw NSError(domain: "MacdrawAI", code: 22, userInfo: [NSLocalizedDescriptionKey: "Ollama was installed, but its command could not be found. Restart macdraw and try again."])
@@ -168,12 +173,43 @@ enum LocalModelRuntime {
                 "/opt/homebrew/bin/ollama",
                 "/usr/local/bin/ollama",
                 "/Applications/Ollama.app/Contents/Resources/ollama",
+                "\(NSHomeDirectory())/Applications/Ollama.app/Contents/Resources/ollama",
                 "\(NSHomeDirectory())/.local/bin/ollama"
             ]
         } else {
             fixedCandidates = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/usr/bin/brew"]
         }
         return (pathCandidates + fixedCandidates).first { fm.isExecutableFile(atPath: $0) }
+    }
+
+    private static func installOfficialOllama() async throws -> String {
+        guard #available(macOS 14.0, *) else {
+            throw NSError(domain: "MacdrawAI", code: 21, userInfo: [NSLocalizedDescriptionKey: "Automatic Ollama installation requires macOS 14 or newer. Open ollama.com/download/mac, install Ollama, then click setup again."])
+        }
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("macdraw-ollama-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+
+        let archive = work.appendingPathComponent("Ollama-darwin.zip")
+        let download = try await run("/usr/bin/curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive.path, "https://ollama.com/download/Ollama-darwin.zip"])
+        guard download.status == 0 else { throw failure("Ollama download", download) }
+
+        let extracted = work.appendingPathComponent("extracted")
+        try fm.createDirectory(at: extracted, withIntermediateDirectories: true)
+        let unpack = try await run("/usr/bin/ditto", ["-x", "-k", archive.path, extracted.path])
+        guard unpack.status == 0 else { throw failure("Ollama unpack", unpack) }
+        let downloadedApp = extracted.appendingPathComponent("Ollama.app")
+        guard fm.isExecutableFile(atPath: downloadedApp.appendingPathComponent("Contents/Resources/ollama").path) else {
+            throw NSError(domain: "MacdrawAI", code: 22, userInfo: [NSLocalizedDescriptionKey: "The Ollama download did not contain a usable macOS app. Open ollama.com/download/mac and install it once, then try again."])
+        }
+
+        let userApplications = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Applications", isDirectory: true)
+        try fm.createDirectory(at: userApplications, withIntermediateDirectories: true)
+        let destination = userApplications.appendingPathComponent("Ollama.app")
+        if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+        try fm.copyItem(at: downloadedApp, to: destination)
+        return destination.appendingPathComponent("Contents/Resources/ollama").path
     }
 
     private static func isServerReady() async -> Bool {
@@ -412,12 +448,16 @@ private struct AISettingsView: View {
     @State private var testing = false
     @State private var installing = false
     @State private var setupStatus = ""
+    @State private var setupNeedsHelp = false
     var body: some View { VStack(alignment: .leading, spacing: 8) {
         Picker("Provider", selection: $settings.provider) { ForEach(AIProvider.allCases) { Text($0.rawValue).tag($0) } }.onChange(of: settings.provider) { _, _ in settings.useProviderDefaults() }
         TextField("Endpoint", text: $settings.endpoint).textFieldStyle(.roundedBorder)
         TextField("Model", text: $settings.model).textFieldStyle(.roundedBorder)
         if settings.provider != .local {
-            SecureField(settings.provider == .gemini ? "Gemini API key (stored in Keychain)" : "API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder)
+            HStack(spacing: 6) {
+                SecureField(settings.provider == .gemini ? "Gemini API key (stored in Keychain)" : "API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder)
+                Button { pasteAPIKey() } label: { Image(systemName: "doc.on.clipboard") }.help("Paste API key from clipboard")
+            }
             if settings.provider == .gemini { Text("Create a key in Google AI Studio, then paste it here.").font(.system(size: 10)).foregroundStyle(.secondary) }
         }
         if settings.provider == .local {
@@ -425,6 +465,7 @@ private struct AISettingsView: View {
                 if installing { ProgressView().controlSize(.small) }
                 Button(installing ? "Setting up…" : "Set up Ollama & pull model") {
                     installing = true
+                    setupNeedsHelp = false
                     setupStatus = "Checking for Ollama…"
                     settings.testStatus = "Installing Ollama and downloading \(settings.model)…"
                     Task {
@@ -433,15 +474,18 @@ private struct AISettingsView: View {
                             try await LocalModelRuntime.setUp(model: settings.model)
                             await MainActor.run { setupStatus = "Testing local connection…" }
                             let status = await DiagramAI.test(settings: settings)
-                            await MainActor.run { settings.testStatus = status; setupStatus = "Done"; installing = false }
+                            await MainActor.run { settings.testStatus = status; setupStatus = "Ollama is ready."; installing = false }
                         } catch {
-                            await MainActor.run { settings.testStatus = error.localizedDescription; setupStatus = "Setup failed"; installing = false }
+                            await MainActor.run { settings.testStatus = "Needs setup"; setupStatus = error.localizedDescription; setupNeedsHelp = true; installing = false }
                         }
                     }
                 }.disabled(installing)
             }
-            if installing || !setupStatus.isEmpty { Text(setupStatus).font(.system(size: 10)).foregroundStyle(.secondary) }
-            Text("Uses local Ollama; setup installs it through Homebrew and pulls the selected model. Prompts never leave localhost.").font(.system(size: 10)).foregroundStyle(.secondary)
+            if installing || !setupStatus.isEmpty { Text(setupStatus).font(.system(size: 10)).foregroundStyle(setupNeedsHelp ? .orange : .secondary) }
+            if setupNeedsHelp {
+                Button("Open Ollama download page") { openOllamaDownloadPage() }.buttonStyle(.borderless).font(.system(size: 10))
+            }
+            Text("Setup finds or installs Ollama, starts it, and downloads the selected model. Prompts never leave localhost.").font(.system(size: 10)).foregroundStyle(.secondary)
         }
         HStack {
             Button(testing ? "Testing…" : "Test connection") { testing = true; Task { let status = await DiagramAI.test(settings: settings); await MainActor.run { settings.testStatus = status; testing = false } } }.disabled(testing)
@@ -449,8 +493,17 @@ private struct AISettingsView: View {
                 .foregroundStyle(settings.testStatus.hasPrefix("Connected") ? .green : .secondary)
             Text(settings.testStatus).font(.system(size: 11)).foregroundStyle(settings.testStatus.hasPrefix("Connected") ? .green : .secondary)
         }
-        if settings.provider == .local { Text("Local mode uses Ollama. Install it once in Terminal: `brew install ollama`; then run `ollama serve` and `ollama pull \(settings.model.isEmpty ? "llama3.2" : settings.model)`.").font(.system(size: 10)).foregroundStyle(.secondary) }
+        if settings.provider == .local { Text("If automatic setup cannot finish, install Ollama from ollama.com/download/mac and click the setup button again.").font(.system(size: 10)).foregroundStyle(.secondary) }
     }.padding(14).background(Color.primary.opacity(0.05)) }
+
+    private func pasteAPIKey() {
+        guard let value = NSPasteboard.general.string(forType: .string) else { return }
+        settings.apiKey = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func openOllamaDownloadPage() {
+        if let url = URL(string: "https://ollama.com/download/mac") { NSWorkspace.shared.open(url) }
+    }
 }
 
 private struct DiagramPreview: View {

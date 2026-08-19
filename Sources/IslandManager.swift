@@ -363,7 +363,12 @@ final class IslandManager {
             // While a search field is focused (the "/" palette or the shapes
             // palette search), keys belong to it — never trigger tools from
             // typing a shortcut letter into a search box.
-            if let responder = NSApp.keyWindow?.firstResponder, responder is NSTextView {
+            // SwiftUI TextField/SecureField bridge to NSTextField, while
+            // TextEditor/search fields bridge to NSTextView. Let both classes
+            // receive standard editing commands such as Cmd+V instead of
+            // routing them to the canvas paste handler.
+            if let responder = NSApp.keyWindow?.firstResponder,
+               responder is NSTextView || responder is NSTextField {
                 return event
             }
 
