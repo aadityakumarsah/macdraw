@@ -2263,6 +2263,74 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
+    /// Adds an AI-generated diagram as ordinary Macdraw annotations. Nothing is
+    /// rasterized: every node, connector and edge label remains selectable and
+    /// editable after insertion.
+    func insertAIDiagram(_ diagram: DiagramSpec, at screenPoint: CGPoint) {
+        commitPendingText()
+        guard !diagram.nodes.isEmpty else { return }
+        pushUndo()
+        let target = screenToWorld(screenPoint)
+        let sourceBounds = diagram.nodes.reduce(CGRect.null) { partial, node in
+            partial.union(CGRect(x: node.x, y: node.y, width: node.width, height: node.height))
+        }
+        let offset = CGPoint(x: target.x - sourceBounds.midX, y: target.y - sourceBounds.midY)
+        let firstIndex = annotations.count
+        var indices: [String: Int] = [:]
+        for node in diagram.nodes {
+            let kind: ShapeKind
+            switch node.kind.lowercased() {
+            case "start", "end", "terminator": kind = .ellipse
+            case "decision": kind = .diamond
+            case "input", "manualinput": kind = .manualInput
+            case "database", "data": kind = .serverStack
+            case "predefined": kind = .predefinedProcess
+            default: kind = .process
+            }
+            let rect = CGRect(x: node.x + offset.x, y: node.y + offset.y,
+                              width: max(72, node.width), height: max(42, node.height))
+            var item = Annotation(kind: kind, rect: rect, strokeColor: state.strokeColor,
+                                  fillColor: state.fillEnabled ? state.fillColor : NSColor.systemIndigo,
+                                  fillOpacity: state.fillEnabled ? state.fillOpacity : 0.13,
+                                  strokeWidth: state.strokeWidth, opacity: state.elementOpacity,
+                                  text: node.label, fontFamily: state.fontFamily,
+                                  fontSize: min(22, max(13, state.fontSize * 0.65)), rounded: true,
+                                  strokeStyle: state.strokeStyle, textInside: true)
+            item.textAnchor = .center
+            annotations.append(item)
+            indices[node.id] = annotations.count - 1
+        }
+        for edge in diagram.edges {
+            guard let fromIndex = indices[edge.from], let toIndex = indices[edge.to] else { continue }
+            let a = annotations[fromIndex].rect, b = annotations[toIndex].rect
+            let start = CGPoint(x: a.midX, y: a.midY)
+            let end = CGPoint(x: b.midX, y: b.midY)
+            let kind: ShapeKind = edge.style.lowercased() == "orthogonal" ? .orthogonal : (edge.style.lowercased() == "straight" ? .arrow : .curvedConnector)
+            var connector = Annotation(kind: kind, rect: normalizedRect(from: start, to: end), strokeColor: state.strokeColor,
+                                       strokeWidth: state.strokeWidth, opacity: state.elementOpacity,
+                                       points: [start, end], strokeStyle: state.strokeStyle,
+                                       arrowStart: .none, arrowEnd: .arrow)
+            connector.connectionStart = ShapeConnection(annotationIndex: fromIndex, side: facingSide(from: start, toward: end), fraction: 0.5)
+            connector.connectionEnd = ShapeConnection(annotationIndex: toIndex, side: facingSide(from: end, toward: start), fraction: 0.5)
+            annotations.append(connector)
+            if let label = edge.label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
+                let text = Annotation(kind: .text, rect: CGRect(x: mid.x - 55, y: mid.y - 12, width: 110, height: 24), strokeColor: state.strokeColor, text: label, fontFamily: state.fontFamily, fontSize: 13)
+                annotations.append(text)
+            }
+        }
+        selected = Set(firstIndex..<annotations.count)
+        state.tool = .selection
+        needsDisplay = true
+    }
+
+    private func facingSide(from source: CGPoint, toward target: CGPoint) -> Int {
+        let dx = target.x - source.x
+        let dy = target.y - source.y
+        if abs(dx) >= abs(dy) { return dx >= 0 ? 1 : 3 }
+        return dy >= 0 ? 0 : 2
+    }
+
     // MARK: - persistence (pages)
 
     /// Writes the current drawing into the current page (laser strokes are

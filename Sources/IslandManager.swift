@@ -29,12 +29,16 @@ final class OverlayWindow: NSPanel {
 private final class ContainerView: NSView {
     weak var toolbarHost: NSView?
     weak var sidebarHost: NSView?
+    weak var aiHost: NSView?
     var isDrawingMode: (() -> Bool)?
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         if isDrawingMode?() == false {
             if let sidebar = sidebarHost, sidebar.frame.contains(point) {
                 return sidebar.hitTest(convert(point, to: sidebar))
+            }
+            if let ai = aiHost, ai.frame.contains(point) {
+                return ai.hitTest(convert(point, to: ai))
             }
             guard let toolbar = toolbarHost, toolbar.frame.contains(point) else { return nil }
             return toolbar.hitTest(convert(point, to: toolbar))
@@ -52,6 +56,8 @@ final class IslandManager {
     private weak var canvas: CanvasView?
     private var toolbarHost: NSView?
     private var sidebarHost: NSView?
+    private var aiHost: NSView?
+    private let aiSettings = AISettings()
     private var undoMonitor: Any?
     private var gestureMonitor: Any?
     private var isShowing = false
@@ -74,6 +80,18 @@ final class IslandManager {
             context.duration = 0.2
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             sidebar.animator().frame = frame
+        }
+    }
+
+    private func toggleAIDrawer() {
+        guard let drawer = aiHost else { return }
+        let showing = drawer.frame.origin.x >= 0
+        var frame = drawer.frame
+        frame.origin.x = showing ? -frame.width - 16 : 16
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            drawer.animator().frame = frame
         }
     }
 
@@ -258,6 +276,23 @@ final class IslandManager {
         sidebarHost = sidebar
         container.sidebarHost = sidebar
 
+        let aiDrawer = NSHostingView(
+            rootView: AIDiagramDrawer(settings: aiSettings, onInsert: { [weak self, weak canvas] diagram in
+                guard let self, let canvas else { return }
+                // The click is inside the drawer, so mouse location would put
+                // the diagram beneath the drawer. Use the visible canvas
+                // center as a stable insertion target instead.
+                let p = CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
+                canvas.insertAIDiagram(diagram, at: p)
+                self.toggleAIDrawer()
+            }, onClose: { [weak self] in self?.toggleAIDrawer() })
+        )
+        aiDrawer.frame = CGRect(x: -406, y: 120, width: 390, height: 520)
+        aiDrawer.appearance = NSAppearance(named: .darkAqua)
+        container.addSubview(aiDrawer)
+        aiHost = aiDrawer
+        container.aiHost = aiDrawer
+
         let toolbar = NSHostingView(
             rootView: ToolbarView(
                 state: state,
@@ -278,7 +313,8 @@ final class IslandManager {
                 onSwitchPage: { [weak self] id in
                     self?.switchPage(id)
                 },
-                onToggleSidebar: { [weak self] in self?.toggleSidebar() }
+                onToggleSidebar: { [weak self] in self?.toggleSidebar() },
+                onToggleAI: { [weak self] in self?.toggleAIDrawer() }
             )
         )
         toolbar.frame = CGRect(
@@ -407,6 +443,7 @@ final class IslandManager {
         canvas = nil
         toolbarHost = nil
         sidebarHost = nil
+        aiHost = nil
         state.sidebarVisible = false
         window.contentView = nil
     }

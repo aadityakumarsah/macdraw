@@ -27,6 +27,7 @@ struct ToolbarView: View {
     let onInsertSymbol: (String) -> Void
     let onSwitchPage: (UUID) -> Void
     let onToggleSidebar: () -> Void
+    let onToggleAI: () -> Void
 
     enum ColorTarget {
         case stroke
@@ -125,6 +126,15 @@ struct ToolbarView: View {
             .help(state.sidebarVisible ? "Hide sidebar" : "Show sidebar")
 
             pagesButton
+
+            Button(action: onToggleAI) {
+                Image(systemName: "sparkles")
+                    .frame(width: 30, height: 30)
+                    .background(Color.purple.opacity(0.32), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Text to diagram — generate editable flowcharts with AI")
 
             Divider().frame(height: 22)
 

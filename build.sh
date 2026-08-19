@@ -14,7 +14,7 @@ VERSION=$(grep '^let appVersion' Sources/UpdateChecker.swift | sed -E 's/.*"([^"
 echo "== version: $VERSION =="
 
 echo "== compiling =="
-swiftc -O Sources/*.swift -o "$APP/Contents/MacOS/macdraw" \
+swiftc -O -module-cache-path "$WORK/module-cache" Sources/*.swift -o "$APP/Contents/MacOS/macdraw" \
   -framework AppKit -framework Carbon -framework SwiftUI
 
 echo "== copying resources =="
