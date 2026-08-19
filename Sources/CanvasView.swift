@@ -65,6 +65,7 @@ struct PersistedAnnotation: Codable {
     var ry: CGFloat?
     var textInside: Bool?
     var textAnchor: String?
+    var textAutoResize: Bool?
     var dynamicWidth: Bool?
     var symbol: String?
     var isCode: Bool?
@@ -134,6 +135,7 @@ private extension Annotation {
             ry: ry,
             textInside: textInside,
             textAnchor: textAnchor.rawValue,
+            textAutoResize: textAutoResize,
             dynamicWidth: dynamicWidth,
             symbol: symbol,
             isCode: isCode,
@@ -193,6 +195,7 @@ private extension Annotation {
             ry: ry,
             textInside: p.textInside ?? false,
             textAnchor: TextAnchor(rawValue: p.textAnchor ?? "") ?? .center,
+            textAutoResize: p.textAutoResize ?? true,
             dynamicWidth: p.dynamicWidth ?? false,
             symbol: p.symbol,
             isCode: p.isCode ?? false,
@@ -266,6 +269,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// committing a brand-new code block so toggling it back restores it).
     private var editingNormalFontFamily: String?
     private var editingNormalFontSize: CGFloat?
+    /// Standalone text grows to its measured content until the user drags a
+    /// horizontal handle, at which point its width becomes a wrap constraint.
+    private var editingTextAutoResize = true
     /// True when the current edit pushed its undo snapshot up front (code
     /// edits mutate the annotation live while typing, so the snapshot must
     /// be taken before the first keystroke, not at commit).
@@ -416,7 +422,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 worldRect = CGRect(
                     x: a.rect.minX,
                     y: a.rect.minY,
-                    width: max(160, a.rect.width),
+                    width: max(60, a.rect.width),
                     height: max(34, a.rect.height)
                 )
             } else {
@@ -1190,6 +1196,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         editingFontFamily = family
         editingWorldFontSize = size
         self.editingIndex = editingIndex
+        editingTextAutoResize = existing?.textAutoResize ?? true
         if let idx = editingIndex, annotations.indices.contains(idx),
            isDataStructure(annotations[idx].kind) {
             // Editing a data-structure shape: the click picks which node's
@@ -1202,7 +1209,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             editingNodeIndex = nil
         }
         let editingPolygon = existing.map { $0.kind != .text } ?? false
-        let codeWidth: CGFloat = (editingIndex == nil && code) ? 460 : 260
+        let codeWidth: CGFloat = (editingIndex == nil && code) ? 460 : 60
         let rect = existing.map { a in
             if a.kind == .text {
                 // Overlay the view exactly on the existing text so re-editing
@@ -1210,7 +1217,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 return CGRect(
                     x: a.rect.minX,
                     y: a.rect.minY,
-                    width: max(160, a.rect.width),
+                    width: max(60, a.rect.width),
                     height: max(34, a.rect.height)
                 )
             }
@@ -1304,6 +1311,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         tv.isAutomaticTextReplacementEnabled = false
         tv.isAutomaticSpellingCorrectionEnabled = false
         tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.lineBreakMode = .byWordWrapping
         tv.alignment = editingPolygon ? .center : .left
         tv.wantsLayer = true
         if code {
@@ -1358,6 +1366,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         } else if !editingPolygon {
             applyMarkdownLive(tv)
         }
+        resizeEditingFieldToFitContent(tv)
     }
 
     /// True while the open editing view belongs to a code block (either a new
@@ -1465,8 +1474,56 @@ final class CanvasView: NSView, NSTextViewDelegate {
         )
     }
 
-    /// Keeps the edit view tall enough to show everything being typed — it
-    /// grows downward (the canvas is flipped) so nothing scrolls out of view.
+    /// Makes the edit field and its canvas rectangle agree on exactly the
+    /// same measured content.  Free text grows horizontally (and vertically
+    /// for explicit newlines); horizontally resized text retains that width
+    /// and wraps.  This prevents the editor from clipping characters that the
+    /// renderer thinks are outside the stored rectangle.
+    private func resizeEditingFieldToFitContent(_ tv: NSTextView) {
+        let isStandaloneText = editingIndex.map {
+            annotations.indices.contains($0) && annotations[$0].kind == .text
+        } ?? true
+        guard isStandaloneText else { return }
+
+        var frame = tv.frame
+        let inset = tv.textContainerInset.width * 2
+        if editingTextAutoResize {
+            let storage: NSAttributedString
+            if let textStorage = tv.textStorage {
+                storage = textStorage
+            } else if let font = tv.font {
+                storage = NSAttributedString(string: tv.string, attributes: [.font: font])
+            } else {
+                storage = NSAttributedString(string: tv.string)
+            }
+            let natural = storage.boundingRect(
+                with: CGSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            )
+            frame.size.width = max(60, ceil(natural.width) + ceil(inset) + 2)
+        }
+
+        tv.frame = frame
+        guard let layoutManager = tv.layoutManager, let container = tv.textContainer else { return }
+        layoutManager.ensureLayout(for: container)
+        let used = layoutManager.usedRect(for: container)
+        frame = tv.frame
+        frame.size.height = max(34, ceil(used.height) + tv.textContainerInset.height * 2 + 2)
+        tv.frame = frame
+
+        // Existing text (and eagerly-created code) must be updated while the
+        // overlay is open so zooming/panning cannot restore stale dimensions.
+        if let idx = editingIndex, annotations.indices.contains(idx) {
+            annotations[idx].rect = screenToWorld(frame)
+            annotations[idx].textAutoResize = editingTextAutoResize
+            if isCodeEditingContext {
+                annotations[idx].text = tv.string
+            }
+            needsDisplay = true
+        }
+    }
+
+    /// Keeps the edit view sized to show every character being typed.
     func textDidChange(_ notification: Notification) {
         guard let tv = notification.object as? NSTextView, tv === editingView else { return }
         if isCodeEditingContext {
@@ -1481,21 +1538,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 applyMarkdownLive(tv)
             }
         }
-        guard let layoutManager = tv.layoutManager, let container = tv.textContainer else { return }
-        layoutManager.ensureLayout(for: container)
-        let used = layoutManager.usedRect(for: container)
-        var f = tv.frame
-        // The field's font is scaled by zoom, so its measured height is in
-        // screen points — the annotation rect is stored in world points.
-        let target = max(34, ceil(used.height) + 10)
-        if abs(target - f.height) > 0.5 {
-            f.size.height = target
-            tv.frame = f
-            if isCodeEditingContext, let idx = editingIndex, annotations.indices.contains(idx) {
-                annotations[idx].rect.size.height = target / zoom
-                needsDisplay = true
-            }
-        }
+        resizeEditingFieldToFitContent(tv)
     }
 
     /// Pushes the editing view's text onto its canvas annotation (code edits
@@ -1607,6 +1650,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         } else {
             applyMarkdownLive(tv)
         }
+        resizeEditingFieldToFitContent(tv)
     }
 
     /// Self-test hook: font size at a character index of the open editing
@@ -1781,6 +1825,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             var updated = annotations[idx]
             if updated.kind == .text {
                 updated.rect = worldRect
+                updated.textAutoResize = editingTextAutoResize
                 updated.text = str
                 updated.fontFamily = family
                 updated.fontSize = size
@@ -2925,21 +2970,26 @@ final class CanvasView: NSView, NSTextViewDelegate {
             let cornerHandles: [ResizeHandle] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
             
             if horizontalHandles.contains(handle) {
-                // Only change width, keep font size
-                a.rect = CGRect(x: newRect.minX, y: orig.minY, width: newRect.width, height: orig.height)
+                // A horizontal drag deliberately changes this into wrapped
+                // text. Re-measure the height immediately so wrapped lines
+                // never vanish below a stale one-line selection box.
+                a.textAutoResize = false
+                let h = measuredTextHeight(for: a, width: newRect.width)
+                a.rect = CGRect(x: newRect.minX, y: orig.minY, width: newRect.width, height: h)
             } else if verticalHandles.contains(handle) {
                 // Only change font size, keep width
                 let sy = newRect.height / max(1, orig.height)
                 a.fontSize = max(6, min(300, a.fontSize * sy))
                 a.richTextData = scaledRichTextData(a.richTextData, by: sy)
-                a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: a.fontSize * 1.4)
+                a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: measuredTextHeight(for: a, width: orig.width))
             } else if cornerHandles.contains(handle) {
                 // Corner handles: change both
                 let sx = newRect.width / max(1, orig.width)
                 let sy = newRect.height / max(1, orig.height)
                 a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
                 a.richTextData = scaledRichTextData(a.richTextData, by: max(sx, sy))
-                a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: a.fontSize * 1.4)
+                a.textAutoResize = false
+                a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: measuredTextHeight(for: a, width: newRect.width))
             }
         case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             let fixedX: CGFloat
@@ -2968,6 +3018,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
             a.rect = newRect
         }
         return a
+    }
+
+    private func measuredTextHeight(for a: Annotation, width: CGFloat) -> CGFloat {
+        let attributed = a.richText() ?? NSAttributedString(
+            string: a.text,
+            attributes: [.font: Fonts.nsFont(for: a.fontFamily, size: a.fontSize)]
+        )
+        let bounds = attributed.boundingRect(
+            with: CGSize(width: max(6, width), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return max(ceil(bounds.height), ceil(a.fontSize * 1.4))
     }
 
     private func drawSelectionHandles(for a: Annotation) {

@@ -322,6 +322,11 @@ struct Annotation {
     /// a polygon to type into it). The text moves/resizes/rotates with it.
     var textInside: Bool = false
     var textAnchor: TextAnchor = .center
+    /// Standalone text grows to its measured content while this is true.
+    /// Dragging a horizontal text handle turns it off and makes that width a
+    /// deliberate wrapping constraint (the same distinction used by modern
+    /// canvas editors).
+    var textAutoResize: Bool = true
     /// True when this stroke renders with variable width — velocity-driven
     /// calligraphic swell and taper — instead of uniform thickness.
     var dynamicWidth: Bool = false
