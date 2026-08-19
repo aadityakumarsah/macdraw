@@ -47,6 +47,7 @@ struct PersistedAnnotation: Codable {
     var fill: [CGFloat]?
     var fillOpacity: CGFloat
     var strokeWidth: CGFloat
+    var opacity: CGFloat?
     var points: [[CGFloat]]
     var text: String
     var fontFamily: String
@@ -59,6 +60,8 @@ struct PersistedAnnotation: Codable {
     var locked: Bool
     var zIndex: Int
     var strokeStyle: String?
+    var arrowStart: String?
+    var arrowEnd: String?
     var sloppiness: CGFloat?
     var edgeRoughness: CGFloat?
     var rx: CGFloat?
@@ -117,6 +120,7 @@ private extension Annotation {
             fill: fillColor.map { colorComponents($0) },
             fillOpacity: fillOpacity,
             strokeWidth: strokeWidth,
+            opacity: opacity,
             points: points.map { [$0.x, $0.y] },
             text: text,
             fontFamily: fontFamily,
@@ -129,6 +133,8 @@ private extension Annotation {
             locked: locked,
             zIndex: zIndex,
             strokeStyle: strokeStyle.rawValue,
+            arrowStart: arrowStart.rawValue,
+            arrowEnd: arrowEnd.rawValue,
             sloppiness: sloppiness,
             edgeRoughness: edgeRoughness,
             rx: rx,
@@ -175,6 +181,7 @@ private extension Annotation {
             fillColor: fillColor,
             fillOpacity: p.fillOpacity,
             strokeWidth: p.strokeWidth,
+            opacity: p.opacity ?? 1,
             points: p.points.compactMap { pt in
                 pt.count >= 2 ? CGPoint(x: pt[0], y: pt[1]) : nil
             },
@@ -189,6 +196,8 @@ private extension Annotation {
             locked: p.locked,
             zIndex: p.zIndex,
             strokeStyle: StrokeStyle(rawValue: p.strokeStyle ?? "") ?? .solid,
+            arrowStart: ArrowheadStyle(rawValue: p.arrowStart ?? "") ?? .none,
+            arrowEnd: ArrowheadStyle(rawValue: p.arrowEnd ?? "") ?? ((ShapeKind(rawValue: p.kind) == .line) ? .none : .arrow),
             sloppiness: p.sloppiness ?? 0,
             edgeRoughness: p.edgeRoughness ?? 0,
             rx: rx,
@@ -471,6 +480,36 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 tv.textColor = color
             }
             .store(in: &cancellables)
+        // Inspector controls apply to the selection immediately, while also
+        // remaining the defaults for the next element the user draws.
+        state.$strokeWidth.dropFirst().sink { [weak self] width in
+            self?.applyToSelection(where: { $0.kind != .text && $0.kind != .image && $0.kind != .laser }) { $0.strokeWidth = width }
+        }.store(in: &cancellables)
+        state.$strokeStyle.dropFirst().sink { [weak self] style in
+            self?.applyToSelection(where: { $0.kind != .text && $0.kind != .image && $0.kind != .laser }) { $0.strokeStyle = style }
+        }.store(in: &cancellables)
+        state.$elementOpacity.dropFirst().sink { [weak self] opacity in
+            self?.applyToSelection { $0.opacity = opacity }
+        }.store(in: &cancellables)
+        Publishers.CombineLatest(state.$arrowStart, state.$arrowEnd).dropFirst().sink { [weak self] start, end in
+            self?.applyToSelection { a in
+                guard self?.isLineKind(a.kind) == true else { return }
+                a.arrowStart = start
+                a.arrowEnd = end
+            }
+        }.store(in: &cancellables)
+        Publishers.CombineLatest(state.$fontSize, state.$fontFamily).dropFirst().sink { [weak self] size, family in
+            self?.applyToSelection(where: { $0.kind == .text }) {
+                $0.fontSize = size
+                $0.fontFamily = family
+            }
+        }.store(in: &cancellables)
+        Publishers.CombineLatest3(state.$fillColor, state.$fillOpacity, state.$fillEnabled).dropFirst().sink { [weak self] color, opacity, enabled in
+            self?.applyToSelection(where: { self?.isClosed($0.kind) == true }) {
+                $0.fillColor = enabled ? color : nil
+                $0.fillOpacity = opacity
+            }
+        }.store(in: &cancellables)
         // Picking a stroke color while shapes/text are selected recolors them
         // immediately (and stays undoable). Icon annotations are re-rendered
         // with the new tint.
@@ -539,6 +578,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    private func applyToSelection(
+        where accepts: (Annotation) -> Bool = { _ in true },
+        _ update: (inout Annotation) -> Void
+    ) {
+        let targets = selected.filter {
+            annotations.indices.contains($0) && !annotations[$0].locked && accepts(annotations[$0])
+        }
+        guard !targets.isEmpty else { return }
+        pushUndo()
+        for i in targets {
+            update(&annotations[i])
+        }
+        needsDisplay = true
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -823,11 +877,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 fillColor: state.fillEnabled ? state.fillColor : nil,
                 fillOpacity: state.fillOpacity,
                 strokeWidth: state.strokeWidth,
+                opacity: state.elementOpacity,
                 points: [adjustedP],
                 pointTimes: [Date()],
                 rounded: state.tool == .embeddable,
                 dashed: state.tool == .frame,
-                strokeStyle: state.tool == .frame ? .dashed : .solid,
+                strokeStyle: state.tool == .frame ? .dashed : state.strokeStyle,
+                arrowStart: state.tool == .doubleArrow ? .arrow : state.arrowStart,
+                arrowEnd: state.tool == .line ? .none : state.arrowEnd,
                 sloppiness: 0,
                 edgeRoughness: 0,
                 rx: state.cornerRadius,
@@ -1748,6 +1805,52 @@ final class CanvasView: NSView, NSTextViewDelegate {
         editingView?.selectAll(nil)
     }
 
+    /// Native editing commands are sent here by the overlay's key monitor,
+    /// because this accessory app intentionally has no main-menu Edit items.
+    func cutInEditingField() { editingView?.cut(nil) }
+    func copyInEditingField() { editingView?.copy(nil) }
+    func pasteInEditingField() { editingView?.paste(nil) }
+
+    /// Toggles bold on the selection (or insertion attributes), matching the
+    /// standard macOS Cmd+B behavior.
+    func toggleBoldInEditingField() {
+        guard let tv = editingView else { return }
+        let range = tv.selectedRange()
+        let storage = tv.textStorage
+        let makeBold: Bool
+        if range.length == 0 {
+            let current = (tv.typingAttributes[.font] as? NSFont) ?? tv.font ?? NSFont.systemFont(ofSize: 13)
+            makeBold = !current.fontDescriptor.symbolicTraits.contains(.bold)
+        } else {
+            var allBold = true
+            storage?.enumerateAttribute(.font, in: range) { value, _, _ in
+                guard let font = value as? NSFont, font.fontDescriptor.symbolicTraits.contains(.bold) else {
+                    allBold = false
+                    return
+                }
+            }
+            makeBold = !allBold
+        }
+        let trait: NSFontTraitMask = makeBold ? .boldFontMask : .unboldFontMask
+        if range.length == 0 {
+            var attributes = tv.typingAttributes
+            let current = (attributes[.font] as? NSFont) ?? tv.font ?? NSFont.systemFont(ofSize: 13)
+            attributes[.font] = NSFontManager.shared.convert(current, toHaveTrait: trait)
+            tv.typingAttributes = attributes
+        } else {
+            var fonts: [(NSFont, NSRange)] = []
+            storage?.enumerateAttribute(.font, in: range) { value, subrange, _ in
+                fonts.append(((value as? NSFont) ?? tv.font ?? NSFont.systemFont(ofSize: 13), subrange))
+            }
+            storage?.beginEditing()
+            for (font, subrange) in fonts {
+                storage?.addAttribute(.font, value: NSFontManager.shared.convert(font, toHaveTrait: trait), range: subrange)
+            }
+            storage?.endEditing()
+        }
+        tv.didChangeText()
+    }
+
     /// Commits the open text field. Returns the index of the committed text
     /// annotation (newly created or re-edited), or nil when nothing was
     /// committed (empty new text, or an emptied re-edit deletes the annotation).
@@ -1831,11 +1934,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 updated.fontSize = size
                 updated.fillOpacity = state.fillOpacity
                 if !wasCode {
-                    // Non-code edits re-derive the markdown document; code
-                    // edits keep whatever rich text was already there.
-                    updated.richTextData = hasMarkdownFormatting(str)
-                        ? rtfData(markdownStyledWorld(str, family: family, size: size, color: updated.strokeColor))
-                        : nil
+                    // Preserve explicit formatting such as Cmd+B as well as
+                    // live markdown attributes, converting from the zoomed
+                    // editing view back into canvas/world scale.
+                    updated.richTextData = rtfData(scaledRichText(tv.attributedString(), by: 1 / zoom))
                 }
             } else if isDataStructure(updated.kind), let nodeIdx {
                 // A value inside a data-structure node — only that node's
@@ -1896,10 +1998,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if state.codeBlockMode {
             annotations[annotations.count - 1].fontFamily = "Cascadia Code"
             annotations[annotations.count - 1].fontSize = 15
-        } else if hasMarkdownFormatting(str) {
-            annotations[annotations.count - 1].richTextData = rtfData(
-                markdownStyledWorld(str, family: family, size: size, color: state.strokeColor)
-            )
+        } else {
+            annotations[annotations.count - 1].richTextData = rtfData(scaledRichText(tv.attributedString(), by: 1 / zoom))
         }
         needsDisplay = true
         return annotations.count - 1
@@ -2570,6 +2670,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if editingView != nil, editingIndex == index {
             if a.kind == .text { return }
         }
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSGraphicsContext.current?.cgContext.setAlpha(max(0, min(1, a.opacity)))
         let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
         let transform = NSAffineTransform()
         transform.translateX(by: center.x, yBy: center.y)
@@ -2619,12 +2722,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     strokeDotted(path: path, color: a.strokeColor, width: a.strokeWidth)
                 }
             }
-            if a.kind == .arrow || a.kind == .doubleArrow || a.kind == .curvedConnector || a.kind == .orthogonal || a.kind == .connector {
+            if isLineKind(a.kind) {
                 if let seg = lastSegment(of: path) {
-                    drawArrowhead(at: seg.end, from: seg.start, color: a.strokeColor, width: a.strokeWidth)
+                    drawArrowhead(a.arrowEnd, at: seg.end, from: seg.start, color: a.strokeColor, width: a.strokeWidth)
                 }
-                if a.kind == .doubleArrow, let seg = firstSegment(of: path) {
-                    drawArrowhead(at: seg.start, from: seg.end, color: a.strokeColor, width: a.strokeWidth)
+                if let seg = firstSegment(of: path) {
+                    drawArrowhead(a.arrowStart, at: seg.start, from: seg.end, color: a.strokeColor, width: a.strokeWidth)
                 }
             }
             // Connection dots — show where the elbow connector is pinned to
@@ -3400,7 +3503,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return 6
     }
 
-    private func drawArrowhead(at end: CGPoint, from prev: CGPoint, color: NSColor, width: CGFloat) {
+    private func drawArrowhead(_ style: ArrowheadStyle, at end: CGPoint, from prev: CGPoint, color: NSColor, width: CGFloat) {
+        guard style != .none else { return }
         let dx = end.x - prev.x
         let dy = end.y - prev.y
         let len = max(1, sqrt(dx * dx + dy * dy))
@@ -3409,15 +3513,36 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let size = max(10, width * 3)
         let p1 = CGPoint(x: end.x - ux * size + uy * size * 0.5, y: end.y - uy * size - ux * size * 0.5)
         let p2 = CGPoint(x: end.x - ux * size - uy * size * 0.5, y: end.y - uy * size + ux * size * 0.5)
-        let path = NSBezierPath()
-        path.move(to: p1)
-        path.line(to: end)
-        path.line(to: p2)
-        color.setStroke()
-        path.lineWidth = width
-        path.lineCapStyle = .round
-        path.lineJoinStyle = .round
-        path.stroke()
+        switch style {
+        case .none:
+            break
+        case .arrow:
+            let path = NSBezierPath()
+            path.move(to: p1)
+            path.line(to: end)
+            path.line(to: p2)
+            color.setStroke()
+            path.lineWidth = width
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            path.stroke()
+        case .triangle:
+            let path = NSBezierPath()
+            path.move(to: p1)
+            path.line(to: end)
+            path.line(to: p2)
+            path.close()
+            color.setFill()
+            path.fill()
+        case .bar:
+            let path = NSBezierPath()
+            path.move(to: p1)
+            path.line(to: p2)
+            color.setStroke()
+            path.lineWidth = width
+            path.lineCapStyle = .round
+            path.stroke()
+        }
     }
 
     /// Values inside the nodes of a data-structure shape, each fitted and
@@ -3555,23 +3680,26 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 for p in all.dropFirst() { path.line(to: p) }
                 return path
             }
-            let sOwner = connectionNormal(for: a.connectionStart).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: s)
-            let eOwner = connectionNormal(for: a.connectionEnd).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: e)
-            let margin = 8 + a.strokeWidth / 2
-            let obstacles = connectorObstacles(for: a, margin: margin)
-            if straightIsBlocked(s, e, obstacles: obstacles),
-               let route = connectorRoute(
-                   from: s, to: e,
-                   startOwner: sOwner,
-                   endOwner: eOwner,
-                   obstacles: obstacles
-               ) {
-                let path = NSBezierPath()
-                path.move(to: route[0])
-                for p in route.dropFirst() {
-                    path.line(to: p)
+            // Arrows avoid closed shapes automatically, using the same
+            // obstacle router as connectors. A user-created bend always wins
+            // (the early return above), so automatic routing never rewrites
+            // deliberate geometry. Plain lines remain straight.
+            if a.kind == .arrow {
+                let startOwner = connectionNormal(for: a.connectionStart).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: s)
+                let endOwner = connectionNormal(for: a.connectionEnd).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: e)
+                let obstacles = connectorObstacles(for: a, margin: 8 + a.strokeWidth / 2)
+                if straightIsBlocked(s, e, obstacles: obstacles),
+                   let route = connectorRoute(
+                    from: s, to: e,
+                    startOwner: startOwner,
+                    endOwner: endOwner,
+                    obstacles: obstacles
+                   ) {
+                    let path = NSBezierPath()
+                    path.move(to: route[0])
+                    for point in route.dropFirst() { path.line(to: point) }
+                    return path
                 }
-                return path
             }
             if rough {
                 return roughLine(from: s, to: e, slop: slop, edge: edge, seed: seed)

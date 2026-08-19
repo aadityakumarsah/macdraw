@@ -1425,8 +1425,10 @@ final class IslandManager {
         }
     }
 
-    /// Handles a key while a text block is being edited. Esc commits the
-    /// text, ⌘A selects all of it, everything else is left for the editor.
+    /// Handles a key while a text block is being edited. The overlay does not
+    /// install a traditional Edit menu, so standard text commands are routed
+    /// directly to the active NSTextView instead of being mistaken for canvas
+    /// commands.
     /// Returns true when the event was consumed.
     func handleEditingKey(_ event: NSEvent, canvas: CanvasView) -> Bool {
         if event.keyCode == 53 {
@@ -1438,7 +1440,22 @@ final class IslandManager {
             canvas.selectAllInEditingField()
             return true
         }
-        return false
+        guard mods.contains(.command), let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return false
+        }
+        switch key {
+        case "x":
+            canvas.cutInEditingField()
+        case "c":
+            canvas.copyInEditingField()
+        case "v":
+            canvas.pasteInEditingField()
+        case "b":
+            canvas.toggleBoldInEditingField()
+        default:
+            return false
+        }
+        return true
     }
 
     /// Delivers a key event straight to the key window (same path the system

@@ -59,6 +59,44 @@ enum StrokeStyle: String, CaseIterable, Codable {
     case dotted
 }
 
+enum ArrowheadStyle: String, CaseIterable, Codable {
+    case none
+    case arrow
+    case triangle
+    case bar
+}
+
+extension ArrowheadStyle {
+    var label: String {
+        switch self {
+        case .none: return "None"
+        case .arrow: return "Arrow"
+        case .triangle: return "Triangle"
+        case .bar: return "Bar"
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .none: return "minus"
+        case .arrow: return "arrow.right"
+        case .triangle: return "triangle.fill"
+        case .bar: return "line.vertical"
+        }
+    }
+}
+
+extension StrokeStyle {
+    var label: String { rawValue.capitalized }
+
+    var iconName: String {
+        switch self {
+        case .solid, .dashed: return "line.diagonal"
+        case .dotted: return "circle.grid.3x3.fill"
+        }
+    }
+}
+
 /// How the pen responds to movement:
 /// - `.light`: uniform, constant-width lines regardless of speed or input.
 /// - `.dynamic`: velocity-driven calligraphic strokes that swell when the
@@ -297,6 +335,9 @@ struct Annotation {
     var fillColor: NSColor?
     var fillOpacity: CGFloat = 1.0
     var strokeWidth: CGFloat = 2
+    /// Overall element opacity; unlike fill opacity this also affects strokes,
+    /// text, images and arrowheads.
+    var opacity: CGFloat = 1
     var points: [CGPoint] = []
     var pointTimes: [Date] = []
     var text: String = ""
@@ -311,6 +352,8 @@ struct Annotation {
     var zIndex: Int = 0
     /// Stroke rendering style (solid / dashed / dotted).
     var strokeStyle: StrokeStyle = .solid
+    var arrowStart: ArrowheadStyle = .none
+    var arrowEnd: ArrowheadStyle = .arrow
     /// 0 = perfect vector lines, 1 = heavily hand-drawn wobble (Rough.js style).
     var sloppiness: CGFloat = 0
     /// 0 = clean corners, 1 = sketchy over-drawn corners that stick out.
@@ -386,6 +429,10 @@ final class CanvasState: ObservableObject {
     @Published var fillEnabled: Bool = false
     @Published var fillOpacity: CGFloat = 0.5
     @Published var strokeWidth: CGFloat = 3
+    @Published var strokeStyle: StrokeStyle = .solid
+    @Published var elementOpacity: CGFloat = 1
+    @Published var arrowStart: ArrowheadStyle = .none
+    @Published var arrowEnd: ArrowheadStyle = .arrow
     @Published var fontFamily: String = "Virgil"
     @Published var fontSize: CGFloat = 28
     @Published var canvasBackground: CanvasBackground = .clear

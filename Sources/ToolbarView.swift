@@ -461,6 +461,10 @@ struct ToolbarView: View {
             Slider(value: $state.strokeWidth, in: 1...16, step: 1)
                 .frame(width: 70)
                 .help("Stroke width")
+            strokeStyleMenu
+            arrowheadMenu(title: "Start", selection: $state.arrowStart)
+            arrowheadMenu(title: "End", selection: $state.arrowEnd)
+            opacityControl
             Divider().frame(height: 24)
             fullPalette
             Divider().frame(height: 24)
@@ -476,6 +480,56 @@ struct ToolbarView: View {
                 .frame(width: 22)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var strokeStyleMenu: some View {
+        Menu {
+            ForEach(StrokeStyle.allCases, id: \.self) { style in
+                Button {
+                    state.strokeStyle = style
+                } label: {
+                    Label(style.label, systemImage: style.iconName)
+                }
+            }
+        } label: {
+            Image(systemName: state.strokeStyle.iconName)
+                .frame(width: 24, height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .help("Stroke style: \(state.strokeStyle.label)")
+    }
+
+    private func arrowheadMenu(title: String, selection: Binding<ArrowheadStyle>) -> some View {
+        Menu {
+            ForEach(ArrowheadStyle.allCases, id: \.self) { style in
+                Button {
+                    selection.wrappedValue = style
+                } label: {
+                    Text(style.label)
+                }
+            }
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: selection.wrappedValue.iconName)
+                Text(title)
+                    .font(.system(size: 9, weight: .medium))
+            }
+            .frame(height: 22)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .help("\(title) arrowhead: \(selection.wrappedValue.label)")
+    }
+
+    private var opacityControl: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "circle.lefthalf.filled")
+                .font(.system(size: 11))
+            Slider(value: $state.elementOpacity, in: 0.1...1, step: 0.1)
+                .frame(width: 46)
+        }
+        .help("Element opacity")
     }
 
     private var targetPicker: some View {
