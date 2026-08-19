@@ -9,6 +9,10 @@ trap 'rm -rf "$WORK"' EXIT
 APP="$WORK/macdraw.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+# Single source of truth for the version: Sources/UpdateChecker.swift.
+VERSION=$(grep '^let appVersion' Sources/UpdateChecker.swift | sed -E 's/.*"([^"]+)".*/\1/')
+echo "== version: $VERSION =="
+
 echo "== compiling =="
 swiftc -O Sources/*.swift -o "$APP/Contents/MacOS/macdraw" \
   -framework AppKit -framework Carbon -framework SwiftUI
@@ -19,7 +23,7 @@ rsync -a Resources/ "$APP/Contents/Resources/"
 find "$APP/Contents/Resources/Icons" -name '*.svg' \
   -exec sed -i '' 's/stroke="currentColor"/stroke="#000000"/g' {} +
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -35,9 +39,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIconFile</key>
 	<string>icon.icns</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$VERSION</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>$VERSION</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
@@ -57,6 +61,14 @@ mkdir -p build
 rm -rf build/macdraw.app
 rsync -a "$APP" build/
 
+echo "== release zip =="
+# The app auto-updates by downloading this zip from the GitHub release
+# (tag v$VERSION). It must keep the macdraw- prefix and .zip suffix.
+ZIP="build/macdraw-v$VERSION.zip"
+rm -f "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent build/macdraw.app "$ZIP"
+
 echo ""
-echo "Built: $(pwd)/build/macdraw.app"
-echo "Run:   open $(pwd)/build/macdraw.app"
+echo "Built:   $(pwd)/build/macdraw.app"
+echo "Release: $(pwd)/$ZIP  (attach to a GitHub release tagged v$VERSION)"
+echo "Run:     open $(pwd)/build/macdraw.app"

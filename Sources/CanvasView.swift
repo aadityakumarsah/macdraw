@@ -27,16 +27,20 @@ private extension NSBezierPath {
 }
 
 /// Which selection handle the user is dragging.
-private enum ResizeHandle {
+private enum ResizeHandle: Equatable {
     case topLeft, topMid, topRight
     case midRight, bottomRight, bottomMid
     case bottomLeft, midLeft
     case startPoint, endPoint
+    /// A bend point on a line/arrow/connector. For a 2-point line the handle
+    /// sits at the midpoint and dragging inserts a new bend; for lines with
+    /// existing bends each interior point gets its own handle to drag.
+    case bend(Int)
 }
 
 /// Codable snapshot of an annotation, used to persist drawings to disk so they
 /// survive app relaunches.
-private struct PersistedAnnotation: Codable {
+struct PersistedAnnotation: Codable {
     var kind: String
     var x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat
     var stroke: [CGFloat]
@@ -66,6 +70,8 @@ private struct PersistedAnnotation: Codable {
     var isCode: Bool?
     var normalFontFamily: String?
     var normalFontSize: CGFloat?
+    var richTextData: Data?
+    var nodeTexts: [String]?
 }
 
 private func colorComponents(_ c: NSColor) -> [CGFloat] {
@@ -91,6 +97,17 @@ private func imageFromPNG(_ s: String) -> NSImage? {
 }
 
 private extension Annotation {
+    /// Independent copy for the clipboard: fresh creation time (so hand-drawn
+    /// wobble re-seeds), no glued connections (indices would dangle), and the
+    /// image is shared by reference — it's immutable after creation.
+    func copied() -> Annotation {
+        var c = self
+        c.createdAt = Date()
+        c.connectionStart = nil
+        c.connectionEnd = nil
+        return c
+    }
+
     func persisted() -> PersistedAnnotation {
         PersistedAnnotation(
             kind: kind.rawValue,
@@ -121,7 +138,9 @@ private extension Annotation {
             symbol: symbol,
             isCode: isCode,
             normalFontFamily: normalFontFamily,
-            normalFontSize: normalFontSize
+            normalFontSize: normalFontSize,
+            richTextData: richTextData,
+            nodeTexts: nodeTexts.isEmpty ? nil : nodeTexts
         )
     }
 
@@ -178,7 +197,8 @@ private extension Annotation {
             symbol: p.symbol,
             isCode: p.isCode ?? false,
             normalFontFamily: p.normalFontFamily,
-            normalFontSize: p.normalFontSize
+            normalFontSize: p.normalFontSize,
+            nodeTexts: p.nodeTexts ?? []
         )
     }
 }
@@ -189,6 +209,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     override var isFlipped: Bool { true }
 
     private let state: CanvasState
+    private let pages: PagesManager
     private(set) var annotations: [Annotation] = [] {
         didSet { scheduleSave() }
     }
@@ -209,6 +230,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var dragStart: CGPoint = .zero
     private var dragOriginOffset: CGPoint = .zero
     private(set) var selected: Set<Int> = []
+    /// Deep copies of the last ⌘C — pasted with ⌘V (Canva-style), offset from
+    /// the cursor. Also mirrored to the system pasteboard as a PNG.
+    private var clipboard: [Annotation] = []
+    /// Minimap: shows the whole drawing with a viewport box so you always
+    /// know where you are on the infinite canvas. Click/drag to pan there.
+    private var minimapVisible: Bool = true
+    private var minimapPanning = false
+    private let minimapSize = CGSize(width: 176, height: 128)
     private var movingOriginals: [Int: Annotation] = [:]
     private var resizeIndex: Int?
     private var resizeHandle: ResizeHandle?
@@ -225,6 +254,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var hoverSide: Int?
     private var editingView: NSTextView?
     private var editingIndex: Int?
+    /// Node of a data-structure shape being edited, when the edit field is
+    /// open over one of its nodes.
+    private var editingNodeIndex: Int?
     private var editingFontFamily: String?
     /// The text size in world (unzoomed) points while an edit field is open —
     /// the field's font is `worldSize * zoom`, so panning/zooming mid-edit
@@ -315,6 +347,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             } else {
                 NSCursor.resizeUpDown.set()
             }
+        case .bend:
+            NSCursor.pointingHand.set()
         }
     }
 
@@ -408,8 +442,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
     }
 
-    init(state: CanvasState) {
+    init(state: CanvasState, pages: PagesManager) {
         self.state = state
+        self.pages = pages
         super.init(frame: .zero)
         wantsLayer = true
         // Live font updates while a text field is open (size slider / font menu).
@@ -479,6 +514,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             .dropFirst()
             .sink { [weak self] _ in
                 self?.needsDisplay = true
+                self?.autoContrastStrokeColor()
             }
             .store(in: &cancellables)
         laserTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
@@ -644,6 +680,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             spacePanning = true
             return
         }
+        // Clicking the minimap pans the canvas there — from any tool.
+        if minimapVisible, minimapRect().contains(p), !isEditingText {
+            minimapPanning = true
+            panToMinimap(p)
+            return
+        }
         switch state.tool {
         case .selection:
             // Adjust for canvas offset in selection tool
@@ -806,6 +848,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
             needsDisplay = true
             return
         }
+        if minimapPanning {
+            panToMinimap(p)
+            return
+        }
         switch state.tool {
         case .selection:
             // Adjust for canvas offset in selection tool
@@ -851,7 +897,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
                  .pentagon, .hexagon, .octagon, .star, .star6, .cross,
                  .process, .predefinedProcess, .delay, .manualInput, .display,
                  .cloud, .serverStack, .queue, .firewall, .cube,
-                 .callout, .note:
+                 .callout, .note,
+                 .linkedList, .stack, .heap, .graph, .set:
                 c.rect = normalizedRect(from: dragStart, to: adjustedP)
             case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
                 var startP: CGPoint
@@ -885,6 +932,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if spacePanning {
             spacePanning = false
             NSCursor.openHand.set()
+            return
+        }
+        if minimapPanning {
+            minimapPanning = false
             return
         }
         // Adjust point by canvas offset for consistency
@@ -974,6 +1025,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
                   event.charactersIgnoringModifiers?.lowercased() == "a" {
             selectAll()
         } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "c" {
+            copySelection()
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "x" {
+            cutSelection()
+        } else if event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "v" {
+            paste()
+        } else if event.modifierFlags.contains(.command),
                   event.charactersIgnoringModifiers?.lowercased() == "l" {
             // Lock/unlock selected annotations
             for i in selected {
@@ -1061,10 +1121,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
              .pentagon, .hexagon, .octagon, .star, .star6, .cross,
              .process, .predefinedProcess, .delay, .manualInput, .display,
              .cloud, .serverStack, .queue, .firewall, .cube,
-             .callout, .note:
+             .callout, .note,
+             .linkedList, .stack, .heap, .graph, .set:
             guard c.rect.width > 2 || c.rect.height > 2 else { return }
         case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
-            c.rect = normalizedRect(from: c.points.first ?? dragStart, to: c.points.last ?? dragStart)
+            // Bounding box of every point (a bend can stick out past the
+            // start/end line, and the rect drives selection + rotation).
+            c.rect = boundingRect(of: c.points)
             // Re-check the release point: glued only if it landed on a dot.
             if let end = c.points.last, let (i, s) = connectionDot(at: end) {
                 c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
@@ -1087,6 +1150,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
             guard c.points.count > 2 else { return }
             c.points = smooth(c.points)
             c.rect = boundingRect(of: c.points)
+            // A magic shape is always closed — fill it like a closed sketch.
+            if state.fillEnabled {
+                c.fillColor = state.fillColor
+                c.fillOpacity = state.fillOpacity
+            }
         case .laser:
             c.strokeColor = NSColor(red: 1, green: 0.24, blue: 0.18, alpha: 1)
             c.strokeWidth = 3
@@ -1122,6 +1190,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
         editingFontFamily = family
         editingWorldFontSize = size
         self.editingIndex = editingIndex
+        if let idx = editingIndex, annotations.indices.contains(idx),
+           isDataStructure(annotations[idx].kind) {
+            // Editing a data-structure shape: the click picks which node's
+            // value gets the field (fall back to the first node).
+            editingNodeIndex = dataStructureNodes(for: annotations[idx])
+                .enumerated()
+                .first { $0.element.contains(p) }?
+                .offset ?? 0
+        } else {
+            editingNodeIndex = nil
+        }
         let editingPolygon = existing.map { $0.kind != .text } ?? false
         let codeWidth: CGFloat = (editingIndex == nil && code) ? 460 : 260
         let rect = existing.map { a in
@@ -1133,6 +1212,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     y: a.rect.minY,
                     width: max(160, a.rect.width),
                     height: max(34, a.rect.height)
+                )
+            }
+            if isDataStructure(a.kind), let nodeIdx = editingNodeIndex,
+               nodeIdx < dataStructureNodes(for: a).count {
+                // The field overlays exactly the node being edited.
+                let node = dataStructureNodes(for: a)[nodeIdx]
+                return CGRect(
+                    x: node.minX,
+                    y: node.minY,
+                    width: max(60, node.width),
+                    height: max(28, node.height)
                 )
             }
             // Typing inside a polygon: the view sits centered in the shape
@@ -1200,7 +1290,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
         tv.isSelectable = true
         tv.drawsBackground = false
         tv.font = Fonts.nsFont(for: family, size: size * zoom)
-        tv.textColor = existing?.strokeColor ?? state.strokeColor
+        // Code fields live on a solid block — pin the base text color to the
+        // block mode so plain text is never invisible while typing.
+        tv.textColor = code
+            ? (state.canvasBackground == .black
+                ? NSColor(calibratedWhite: 0.93, alpha: 1)
+                : NSColor(calibratedWhite: 0.12, alpha: 1))
+            : (existing?.strokeColor ?? state.strokeColor)
         tv.allowsUndo = true
         // Plain, predictable editing: no autocorrect, quotes or dashes.
         tv.isAutomaticQuoteSubstitutionEnabled = false
@@ -1211,35 +1307,45 @@ final class CanvasView: NSView, NSTextViewDelegate {
         tv.alignment = editingPolygon ? .center : .left
         tv.wantsLayer = true
         if code {
-            // The code "editor" look: translucent rounded block that stays
-            // readable on any backdrop, matching the committed code block.
+            // The code "editor" look: solid rounded block that stays readable
+            // on any backdrop, matching the committed code block exactly.
             let dark = state.canvasBackground == .black
+            let colors = codeBlockColors(dark: dark)
             tv.textContainerInset = NSSize(width: 8, height: 6)
             tv.layer?.cornerRadius = 8
-            tv.layer?.backgroundColor = (dark
-                ? NSColor.white.withAlphaComponent(0.15)
-                : NSColor.black.withAlphaComponent(0.10)).cgColor
+            tv.layer?.backgroundColor = colors.background.cgColor
             tv.layer?.borderWidth = 1
-            tv.layer?.borderColor = (dark
-                ? NSColor.white.withAlphaComponent(0.35)
-                : NSColor.black.withAlphaComponent(0.22)).cgColor
+            tv.layer?.borderColor = colors.border.cgColor
         } else {
             tv.layer?.cornerRadius = 4
             tv.layer?.borderWidth = 1
             tv.layer?.borderColor = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).cgColor
         }
-        if let existing, !existing.text.isEmpty {
-            tv.string = existing.text
-            // Fit the view's height to the existing text right away.
-            let attrs: [NSAttributedString.Key: Any] = [.font: tv.font ?? Fonts.nsFont(for: family, size: size * zoom)]
-            let bounds = (existing.text as NSString).boundingRect(
-                with: CGSize(width: screenRect.width, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: attrs
-            )
-            var f = tv.frame
-            f.size.height = max(f.height, ceil(bounds.height) + 8)
-            tv.frame = f
+        if let existing {
+            let fieldFont = tv.font ?? Fonts.nsFont(for: family, size: size * zoom)
+            // The field always edits the source text — the plain markdown the
+            // user typed (markers visible). For a data-structure node it edits
+            // that node's value. The committed annotation renders the finished
+            // document separately.
+            let sourceText: String
+            if isDataStructure(existing.kind), let nodeIdx = editingNodeIndex {
+                sourceText = paddedNodeTexts(existing)[nodeIdx]
+            } else {
+                sourceText = existing.text
+            }
+            if !sourceText.isEmpty {
+                tv.string = sourceText
+                // Fit the view's height to the existing text right away.
+                let attrs: [NSAttributedString.Key: Any] = [.font: fieldFont]
+                let bounds = (sourceText as NSString).boundingRect(
+                    with: CGSize(width: screenRect.width, height: .greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    attributes: attrs
+                )
+                var f = tv.frame
+                f.size.height = max(f.height, ceil(bounds.height) + 8)
+                tv.frame = f
+            }
         }
         tv.delegate = self
         addSubview(tv)
@@ -1249,6 +1355,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         window?.makeFirstResponder(tv)
         if code, !tv.string.isEmpty {
             highlightCode(in: tv)
+        } else if !editingPolygon {
+            applyMarkdownLive(tv)
         }
     }
 
@@ -1276,6 +1384,87 @@ final class CanvasView: NSView, NSTextViewDelegate {
         tv.setSelectedRange(sel)
     }
 
+    /// Applies markdown styling to the open edit field live, while typing
+    /// (like code highlighting): headings, bullets, quotes, dividers, fenced
+    /// code and inline emphasis. Only plain text annotations get this —
+    /// polygon labels stay simple. When no markdown remains, resets the
+    /// storage back to the base font so nothing lingers after the last
+    /// marker is deleted.
+    private func applyMarkdownLive(_ tv: NSTextView) {
+        guard !isHighlightingCode else { return }
+        isHighlightingCode = true
+        defer { isHighlightingCode = false }
+        guard !tv.string.isEmpty else { return }
+        let sel = tv.selectedRange()
+        let baseFont = tv.font ?? Fonts.nsFont(for: state.fontFamily, size: state.fontSize * zoom)
+        let baseColor = tv.textColor ?? state.strokeColor
+        if !hasMarkdownFormatting(tv.string) {
+            tv.textStorage?.setAttributes(
+                [.font: baseFont, .foregroundColor: baseColor],
+                range: NSRange(location: 0, length: tv.string.count)
+            )
+        } else {
+            let styled = markdownStyled(
+                tv.string,
+                baseFont: baseFont,
+                baseColor: baseColor,
+                dark: state.canvasBackground == .black,
+                codeHighlighter: { [weak self] text, font, dark in
+                    self?.syntaxHighlighted(text, font: font, dark: dark)
+                        ?? NSAttributedString(string: text, attributes: [.font: font])
+                }
+            )
+            tv.textStorage?.setAttributedString(styled)
+        }
+        tv.setSelectedRange(sel)
+    }
+
+    /// Scales every font in an attributed string by `factor` — used to
+    /// transfer rich text between world and screen space (the edit field
+    /// lives zoomed).
+    private func scaledRichText(_ rt: NSAttributedString, by factor: CGFloat) -> NSAttributedString {
+        guard factor != 1 else { return rt }
+        let out = NSMutableAttributedString(attributedString: rt)
+        out.enumerateAttribute(.font, in: NSRange(location: 0, length: out.length)) { value, range, _ in
+            guard let f = value as? NSFont else { return }
+            let scaled = NSFont(descriptor: f.fontDescriptor, size: f.pointSize * factor) ?? f
+            out.addAttribute(.font, value: scaled, range: range)
+        }
+        return out
+    }
+
+    private func scaledRichTextData(_ data: Data?, by factor: CGFloat) -> Data? {
+        guard let data, factor != 1, let rt = NSAttributedString(rtf: data, documentAttributes: nil) else {
+            return data
+        }
+        let scaled = scaledRichText(rt, by: factor)
+        return try? scaled.data(
+            from: NSRange(location: 0, length: scaled.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        )
+    }
+
+    private func rtfData(_ styled: NSAttributedString) -> Data? {
+        try? styled.data(
+            from: NSRange(location: 0, length: styled.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        )
+    }
+
+    private func markdownStyledWorld(_ str: String, family: String, size: CGFloat, color: NSColor) -> NSAttributedString {
+        markdownStyled(
+            str,
+            baseFont: Fonts.nsFont(for: family, size: size),
+            baseColor: color,
+            dark: state.canvasBackground == .black,
+            display: true,
+            codeHighlighter: { [weak self] text, font, dark in
+                self?.syntaxHighlighted(text, font: font, dark: dark)
+                    ?? NSAttributedString(string: text, attributes: [.font: font])
+            }
+        )
+    }
+
     /// Keeps the edit view tall enough to show everything being typed — it
     /// grows downward (the canvas is flipped) so nothing scrolls out of view.
     func textDidChange(_ notification: Notification) {
@@ -1285,6 +1474,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             // Mirror the text onto the canvas annotation in real time so the
             // code block updates while typing, not only on Esc.
             syncCodeAnnotation(tv)
+        } else {
+            // Live markdown styling for plain text annotations.
+            let isPolygon = editingIndex.flatMap { annotations.indices.contains($0) ? annotations[$0].kind != .text : nil } ?? false
+            if !isPolygon {
+                applyMarkdownLive(tv)
+            }
         }
         guard let layoutManager = tv.layoutManager, let container = tv.textContainer else { return }
         layoutManager.ensureLayout(for: container)
@@ -1409,7 +1604,49 @@ final class CanvasView: NSView, NSTextViewDelegate {
         // sync explicitly to match what real typing produces.
         if isCodeEditingContext {
             syncCodeAnnotation(tv)
+        } else {
+            applyMarkdownLive(tv)
         }
+    }
+
+    /// Self-test hook: font size at a character index of the open editing
+    /// view (nil when no field is open or the index is out of range).
+    func selftestEditingFontSize(at location: Int) -> CGFloat? {
+        guard let tv = editingView, !tv.string.isEmpty else { return nil }
+        let clamped = min(max(0, location), tv.string.count - 1)
+        guard let font = tv.textStorage?.attribute(.font, at: clamped, effectiveRange: nil) as? NSFont else { return nil }
+        return font.pointSize
+    }
+
+    /// Self-test hook: whether the character at a given index of the open
+    /// editing view is bold (headings and emphasis are bold).
+    func selftestEditingIsBold(at location: Int) -> Bool {
+        guard let tv = editingView, !tv.string.isEmpty else { return false }
+        let clamped = min(max(0, location), tv.string.count - 1)
+        guard let font = tv.textStorage?.attribute(.font, at: clamped, effectiveRange: nil) as? NSFont else { return false }
+        return font.fontDescriptor.symbolicTraits.contains(.bold)
+    }
+
+    /// Self-test hook: commits the open editing field (same as Esc).
+    func selftestCommitEditing() {
+        _ = commitTextEditing()
+    }
+
+    /// Self-test hook: node frames of a data-structure shape at `index`.
+    func selftestNodeRects(_ index: Int) -> [CGRect] {
+        guard annotations.indices.contains(index) else { return [] }
+        return dataStructureNodes(for: annotations[index])
+    }
+
+    /// Self-test hook: node values of a data-structure shape at `index`.
+    func selftestNodeTexts(_ index: Int) -> [String] {
+        guard annotations.indices.contains(index) else { return [] }
+        return paddedNodeTexts(annotations[index])
+    }
+
+    /// Self-test hook: world → screen conversion for synthetic clicks.
+    func selftestWorldToScreen(_ p: CGPoint) -> CGPoint {
+        worldToScreen(p)
     }
 
     /// Self-test hook: moves the cursor in the open editing view.
@@ -1490,9 +1727,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             targetSize = size
         }
         let idx = editingIndex
+        let wasCode = isCodeEditingContext
         editingIndex = nil
         editingFontFamily = nil
         editingWorldFontSize = 0
+        let nodeIdx = editingNodeIndex
+        editingNodeIndex = nil
         let undoPushed = editingUndoPushed
         editingUndoPushed = false
         let normalFamily = editingNormalFontFamily
@@ -1509,6 +1749,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 if annotations[idx].kind == .text {
                     annotations.remove(at: idx)
                     selected = []
+                } else if isDataStructure(annotations[idx].kind), let nodeIdx, nodeIdx < annotations[idx].nodeTexts.count {
+                    // Clearing a node's value just empties that node.
+                    var texts = paddedNodeTexts(annotations[idx])
+                    texts[nodeIdx] = ""
+                    annotations[idx].nodeTexts = texts
                 } else {
                     annotations[idx].text = ""
                     annotations[idx].textInside = false
@@ -1540,6 +1785,19 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 updated.fontFamily = family
                 updated.fontSize = size
                 updated.fillOpacity = state.fillOpacity
+                if !wasCode {
+                    // Non-code edits re-derive the markdown document; code
+                    // edits keep whatever rich text was already there.
+                    updated.richTextData = hasMarkdownFormatting(str)
+                        ? rtfData(markdownStyledWorld(str, family: family, size: size, color: updated.strokeColor))
+                        : nil
+                }
+            } else if isDataStructure(updated.kind), let nodeIdx {
+                // A value inside a data-structure node — only that node's
+                // text changes; the shape and other nodes are untouched.
+                var texts = paddedNodeTexts(updated)
+                texts[nodeIdx] = str
+                updated.nodeTexts = texts
             } else {
                 // Text inside a polygon — the shape's geometry is untouched,
                 // only the attached text and its fitted size change.
@@ -1590,10 +1848,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
             normalFontFamily: state.codeBlockMode ? normalFamily : nil,
             normalFontSize: state.codeBlockMode ? normalSize : nil
         ))
-        // Code blocks start monospaced at a readable size.
         if state.codeBlockMode {
             annotations[annotations.count - 1].fontFamily = "Cascadia Code"
             annotations[annotations.count - 1].fontSize = 15
+        } else if hasMarkdownFormatting(str) {
+            annotations[annotations.count - 1].richTextData = rtfData(
+                markdownStyledWorld(str, family: family, size: size, color: state.strokeColor)
+            )
         }
         needsDisplay = true
         return annotations.count - 1
@@ -1833,25 +2094,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
-    // MARK: - persistence
+    // MARK: - persistence (pages)
 
-    /// JSON file the drawing is saved to, so it survives app relaunches.
-    private var persistURL: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        let dir = base.appendingPathComponent("MacDraw", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("annotations.json")
-    }
-
-    /// Writes the current drawing to disk (laser strokes are transient, so they
-    /// are never persisted). Skips the write when nothing changed.
+    /// Writes the current drawing into the current page (laser strokes are
+    /// transient, so they are never persisted). Skips the write when nothing
+    /// changed.
     private func saveAnnotations() {
         let items = annotations.filter { $0.kind != .laser }.map { $0.persisted() }
         guard let data = try? JSONEncoder().encode(items) else { return }
         if data == lastSavedData { return }
         lastSavedData = data
-        try? data.write(to: persistURL, options: .atomic)
+        pages.updateCurrentAnnotations(items)
+        pages.setViewState(pan: canvasOffset, zoom: zoom)
     }
 
     /// Coalesces bursts of edits (e.g. drag frames) into a single disk write.
@@ -1862,12 +2116,29 @@ final class CanvasView: NSView, NSTextViewDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
     }
 
-    /// Restores the drawing saved by a previous session (called on init).
+    /// Restores the drawing saved in the current page (called on init).
     private func loadAnnotations() {
-        guard let data = try? Data(contentsOf: persistURL) else { return }
-        let items = (try? JSONDecoder().decode([PersistedAnnotation].self, from: data)) ?? []
-        annotations = items.map { .restored(from: $0) }
+        applyCurrentPage()
+    }
+
+    /// Swaps the canvas over to the current page: its annotations and its own
+    /// pan/zoom. Called at startup and on every page switch.
+    func applyCurrentPage() {
+        annotations = pages.currentAnnotations().map { .restored(from: $0) }
+        selected = []
+        undoStack = []
+        lastSavedData = nil
+        let (pan, z) = pages.viewState()
+        canvasOffset = pan
+        zoom = min(8, max(0.15, z))
+        commitPendingText()
         needsDisplay = true
+    }
+
+    /// Stores the current pan/zoom into the page being left (called right
+    /// before a page switch, so each page keeps its own view).
+    func saveViewStateToPages() {
+        pages.setViewState(pan: canvasOffset, zoom: zoom)
     }
 
     func deleteSelected() {
@@ -1878,6 +2149,162 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         selected = []
         needsDisplay = true
+    }
+
+    // MARK: - copy / paste (Canva-style ⌘C / ⌘V)
+
+    /// Copies the selected annotations into the internal clipboard and mirrors
+    /// them to the system pasteboard as a PNG (so they can be pasted into any
+    /// other app). Laser strokes are never copied.
+    func copySelection() {
+        let items = selected
+            .filter { annotations.indices.contains($0) }
+            .map { annotations[$0] }
+            .filter { $0.kind != .laser }
+        guard !items.isEmpty else { return }
+        clipboard = items.map { $0.copied() }
+        if let img = renderSelectionToImage() {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.writeObjects([img])
+        }
+        needsDisplay = true
+    }
+
+    /// Copies then deletes the selection (⌘X).
+    func cutSelection() {
+        copySelection()
+        deleteSelected()
+    }
+
+    /// Pastes the internal clipboard (⌘V). When nothing was copied inside
+    /// macdraw, falls back to pasting an image from the system clipboard —
+    /// so pictures copied in Canva / the browser / Finder land right on the
+    /// canvas. Returns true when something was pasted.
+    @discardableResult
+    func paste() -> Bool {
+        if pasteInternalClipboard() { return true }
+        return pasteSystemImage()
+    }
+
+    private func pasteInternalClipboard() -> Bool {
+        guard !clipboard.isEmpty else { return false }
+        pushUndo()
+        // Paste at the cursor when it's over the canvas, otherwise drop the
+        // copies right next to the originals.
+        let cursor = convert(window?.convertPoint(fromScreen: NSEvent.mouseLocation) ?? .zero, from: nil)
+        let viewport = screenToWorld(bounds)
+        var pastePoint = CGPoint(x: viewport.midX, y: viewport.midY)
+        if bounds.contains(cursor) {
+            pastePoint = screenToWorld(cursor)
+        }
+        let anchor = clipboard[0].rect
+        let dx = pastePoint.x - anchor.midX
+        let dy = pastePoint.y - anchor.midY
+        let topZ = (annotations.map(\.zIndex).max() ?? 0) + 1
+        var added: [Int] = []
+        for var c in clipboard {
+            c.rect = c.rect.offsetBy(dx: dx, dy: dy)
+            c.points = c.points.map { $0 + CGPoint(x: dx, y: dy) }
+            c.createdAt = Date()
+            c.zIndex = topZ
+            c.connectionStart = nil
+            c.connectionEnd = nil
+            annotations.append(c)
+            added.append(annotations.count - 1)
+        }
+        selected = Set(added)
+        needsDisplay = true
+        scheduleSave()
+        return true
+    }
+
+    /// Pastes an NSImage found on the system pasteboard as a new image
+    /// annotation at the cursor.
+    private func pasteSystemImage() -> Bool {
+        guard let img = NSImage(pasteboard: NSPasteboard.general) else { return false }
+        pushUndo()
+        var p = convert(window?.convertPoint(fromScreen: NSEvent.mouseLocation) ?? .zero, from: nil)
+        if !bounds.contains(p) {
+            p = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
+        let adjusted = screenToWorld(p)
+        var size = img.size
+        let maxW: CGFloat = 360
+        if size.width > maxW {
+            let k = maxW / size.width
+            size = CGSize(width: maxW, height: size.height * k)
+        }
+        annotations.append(Annotation(
+            kind: .image,
+            rect: CGRect(
+                x: adjusted.x - size.width / 2,
+                y: adjusted.y - size.height / 2,
+                width: size.width,
+                height: size.height
+            ),
+            strokeColor: state.strokeColor,
+            fillColor: nil,
+            fillOpacity: state.fillOpacity,
+            strokeWidth: 2,
+            points: [],
+            pointTimes: [],
+            text: "",
+            fontFamily: "Virgil",
+            fontSize: 24,
+            image: img,
+            rounded: false,
+            dashed: false,
+            rotation: 0,
+            createdAt: Date(),
+            locked: false,
+            zIndex: (annotations.map(\.zIndex).max() ?? 0) + 1
+        ))
+        selected = [annotations.count - 1]
+        needsDisplay = true
+        scheduleSave()
+        return true
+    }
+
+    /// Renders the current selection to a bitmap (for the system clipboard).
+    private func renderSelectionToImage() -> NSImage? {
+        let items = selected
+            .filter { annotations.indices.contains($0) }
+            .map { annotations[$0] }
+            .filter { $0.kind != .laser }
+        guard let first = items.first else { return nil }
+        var r = first.rect
+        for a in items { r = r.union(a.rect) }
+        r = r.insetBy(dx: -14, dy: -14)
+        let scale: CGFloat = 2
+        let w = Int(r.width * scale), h = Int(r.height * scale)
+        guard w > 1, h > 1,
+              let rep = NSBitmapImageRep(
+                  bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
+                  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                  isPlanar: false, colorSpaceName: .deviceRGB,
+                  bytesPerRow: 0, bitsPerPixel: 0
+              ) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        guard let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+            NSGraphicsContext.restoreGraphicsState()
+            return nil
+        }
+        NSGraphicsContext.current = ctx
+        // The canvas is flipped (y down); bitmap contexts are not — flip so
+        // the render matches what the user sees on screen.
+        let t = NSAffineTransform()
+        t.translateX(by: 0, yBy: CGFloat(h))
+        t.scaleX(by: scale, yBy: -scale)
+        t.translateX(by: -r.minX, yBy: -r.minY)
+        t.concat()
+        for a in items {
+            draw(annotation: a, index: -1)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        let img = NSImage(size: NSSize(width: w, height: h))
+        img.addRepresentation(rep)
+        return img
     }
 
     // MARK: - drawing
@@ -1972,6 +2399,124 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
 
         ctx.restoreGraphicsState()
+
+        if state.drawingMode {
+            drawMinimap()
+        }
+    }
+
+    // MARK: - minimap
+
+    /// Panel in the bottom-left corner showing the whole drawing with a
+    /// viewport box — you always see where you are on the infinite canvas.
+    /// Clicking or dragging it pans the canvas there.
+    private func minimapRect() -> CGRect {
+        CGRect(
+            x: 12,
+            y: bounds.height - minimapSize.height - 12,
+            width: minimapSize.width,
+            height: minimapSize.height
+        )
+    }
+
+    /// Bounding box of every non-laser annotation, in world points, padded.
+    private func minimapWorldRect() -> CGRect? {
+        let visible = annotations.filter { $0.kind != .laser }
+        guard let first = visible.first else { return nil }
+        var r = first.rect
+        for a in visible { r = r.union(a.rect) }
+        return r.insetBy(dx: -40, dy: -40)
+    }
+
+    /// (scale, offset-in-minimap-space) mapping world points into the panel.
+    private func minimapTransform() -> (scale: CGFloat, origin: CGPoint)? {
+        guard let wr = minimapWorldRect() else { return nil }
+        let inner = minimapRect().insetBy(dx: 14, dy: 14)
+        let scale = min(inner.width / max(wr.width, 1), inner.height / max(wr.height, 1))
+        let w = wr.width * scale, h = wr.height * scale
+        return (scale, CGPoint(x: inner.midX - w / 2, y: inner.midY - h / 2))
+    }
+
+    private func drawMinimap() {
+        guard minimapVisible, minimapWorldRect() != nil else { return }
+        let r = minimapRect()
+        let bg = NSBezierPath(roundedRect: r, xRadius: 10, yRadius: 10)
+        NSColor(calibratedWhite: 0.07, alpha: 0.82).setFill()
+        bg.fill()
+        NSColor(calibratedWhite: 1, alpha: 0.18).setStroke()
+        bg.lineWidth = 1
+        bg.stroke()
+
+        guard let (scale, origin) = minimapTransform(),
+              let wr = minimapWorldRect() else { return }
+        func mini(_ world: CGPoint) -> CGPoint {
+            CGPoint(x: origin.x + (world.x - wr.minX) * scale,
+                    y: origin.y + (world.y - wr.minY) * scale)
+        }
+        NSGraphicsContext.current?.saveGraphicsState()
+        let clip = NSBezierPath(roundedRect: r.insetBy(dx: 6, dy: 6), xRadius: 7, yRadius: 7)
+        clip.addClip()
+
+        let sorted = annotations.enumerated().sorted { $0.element.zIndex < $1.element.zIndex }
+        for (_, a) in sorted where a.kind != .laser {
+            let topLeft = mini(CGPoint(x: a.rect.minX, y: a.rect.minY))
+            let bottomRight = mini(CGPoint(x: a.rect.maxX, y: a.rect.maxY))
+            let miniRect = CGRect(
+                x: topLeft.x, y: topLeft.y,
+                width: max(1.5, bottomRight.x - topLeft.x),
+                height: max(1.5, bottomRight.y - topLeft.y)
+            )
+            if isLineKind(a.kind), a.points.count > 1 {
+                let path = NSBezierPath()
+                path.move(to: mini(a.points[0]))
+                for p in a.points.dropFirst() { path.line(to: mini(p)) }
+                a.strokeColor.withAlphaComponent(0.9).setStroke()
+                path.lineWidth = max(1, min(2.5, a.strokeWidth * scale))
+                path.lineJoinStyle = .round
+                path.lineCapStyle = .round
+                path.stroke()
+            } else {
+                if shouldFill(a) {
+                    var rr: CGFloat = 0, gg: CGFloat = 0, bb: CGFloat = 0, aa: CGFloat = 1
+                    a.fillColor?.getRed(&rr, green: &gg, blue: &bb, alpha: &aa)
+                    NSColor(calibratedRed: rr, green: gg, blue: bb, alpha: aa * a.fillOpacity * 0.9).setFill()
+                    NSBezierPath(rect: miniRect).fill()
+                }
+                a.strokeColor.withAlphaComponent(0.9).setStroke()
+                NSBezierPath(rect: miniRect).lineWidth = max(0.75, min(2, a.strokeWidth * scale))
+                NSBezierPath(rect: miniRect).stroke()
+            }
+        }
+
+        // Viewport indicator — what's currently on screen.
+        let viewport = screenToWorld(bounds)
+        let vpTL = mini(CGPoint(x: viewport.minX, y: viewport.minY))
+        let vpBR = mini(CGPoint(x: viewport.maxX, y: viewport.maxY))
+        let vp = CGRect(x: vpTL.x, y: vpTL.y, width: vpBR.x - vpTL.x, height: vpBR.y - vpTL.y)
+        NSColor(calibratedRed: 0.55, green: 0.51, blue: 0.98, alpha: 0.35).setFill()
+        NSBezierPath(rect: vp).fill()
+        NSColor(calibratedRed: 0.78, green: 0.74, blue: 1, alpha: 0.95).setStroke()
+        let vpPath = NSBezierPath(rect: vp)
+        vpPath.lineWidth = 1.5
+        vpPath.stroke()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
+    /// Pans the canvas so the world point under a minimap click lands at the
+    /// center of the screen.
+    private func panToMinimap(_ p: CGPoint) {
+        guard let (scale, origin) = minimapTransform(),
+              let wr = minimapWorldRect() else { return }
+        let world = CGPoint(
+            x: wr.minX + (p.x - origin.x) / scale,
+            y: wr.minY + (p.y - origin.y) / scale
+        )
+        canvasOffset = CGPoint(
+            x: bounds.midX - world.x * zoom,
+            y: bounds.midY - world.y * zoom
+        )
+        syncEditingView()
+        needsDisplay = true
     }
 
     private func draw(annotation a: Annotation, index: Int) {
@@ -1995,13 +2540,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
             drawLaser(a)
         default:
             let path = bezierPath(for: a)
-            if let fill = a.fillColor, isClosed(a.kind) {
+            if let fill = a.fillColor, shouldFill(a), a.kind != .set {
                 // Apply fill opacity
                 var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a_comp: CGFloat = 1
                 fill.getRed(&r, green: &g, blue: &b, alpha: &a_comp)
                 let colorWithOpacity = NSColor(calibratedRed: r, green: g, blue: b, alpha: a_comp * a.fillOpacity)
                 colorWithOpacity.setFill()
-                path.fill()
+                if a.kind == .freedraw {
+                    // Freehand loops close explicitly so the seam of the
+                    // start/end gap never shows in the filled area.
+                    let closedPath = path.copy() as! NSBezierPath
+                    closedPath.close()
+                    closedPath.fill()
+                } else {
+                    path.fill()
+                }
             }
             a.strokeColor.setStroke()
             path.lineWidth = a.strokeWidth
@@ -2044,6 +2597,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if a.textInside, !a.text.isEmpty, isClosed(a.kind),
                !(editingView != nil && editingIndex == index) {
                 drawTextInShape(a)
+            }
+            // Node values of a data-structure shape — same treatment: rotate
+            // and scale with the shape, hidden while the edit field is open.
+            if isDataStructure(a.kind),
+               !(editingView != nil && editingIndex == index) {
+                drawDataStructureTexts(a)
             }
         }
 
@@ -2205,10 +2764,23 @@ final class CanvasView: NSView, NSTextViewDelegate {
         func rect(at c: CGPoint) -> CGRect {
             CGRect(x: c.x - s / 2, y: c.y - s / 2, width: s, height: s)
         }
-        if a.kind == .line || a.kind == .arrow {
+        if isLineKind(a.kind) {
             let first = a.points.first ?? .zero
             let last = a.points.last ?? first
-            return [(.startPoint, rect(at: first)), (.endPoint, rect(at: last))]
+            var out: [(ResizeHandle, CGRect)] = [
+                (.startPoint, rect(at: first)),
+                (.endPoint, rect(at: last)),
+            ]
+            if a.points.count == 2 {
+                // One mid handle — dragging it bends the line there.
+                out.append((.bend(1), rect(at: CGPoint(x: (first.x + last.x) / 2, y: (first.y + last.y) / 2))))
+            } else {
+                // One draggable handle per existing bend point.
+                for i in 1..<(a.points.count - 1) {
+                    out.append((.bend(i), rect(at: a.points[i])))
+                }
+            }
+            return out
         }
         let b = a.rect
         return [
@@ -2305,6 +2877,24 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return a
         }
 
+        // Bend handles: drag the midpoint of a straight line to add a bend
+        // there, or drag an existing bend point to reshape the line. Both
+        // snap to shape boundaries so lines can hug boxes.
+        if case .bend(let i) = handle {
+            guard !a.points.isEmpty else { return a }
+            var pts = a.points
+            if pts.count == 2 {
+                let snapped = snappedBoundaryPoint(p, selfIndex: selfIndex)
+                pts.insert(snapped, at: min(i, pts.count))
+            } else {
+                guard i >= 1, i < pts.count - 1 else { return a }
+                pts[i] = snappedBoundaryPoint(p, selfIndex: selfIndex)
+            }
+            a.points = pts
+            a.rect = boundingRect(of: pts)
+            return a
+        }
+
         var minX = orig.minX, maxX = orig.maxX
         var minY = orig.minY, maxY = orig.maxY
         let minSize: CGFloat = 6
@@ -2341,12 +2931,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 // Only change font size, keep width
                 let sy = newRect.height / max(1, orig.height)
                 a.fontSize = max(6, min(300, a.fontSize * sy))
+                a.richTextData = scaledRichTextData(a.richTextData, by: sy)
                 a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: a.fontSize * 1.4)
             } else if cornerHandles.contains(handle) {
                 // Corner handles: change both
                 let sx = newRect.width / max(1, orig.width)
                 let sy = newRect.height / max(1, orig.height)
                 a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
+                a.richTextData = scaledRichTextData(a.richTextData, by: max(sx, sy))
                 a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: a.fontSize * 1.4)
             }
         case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
@@ -2380,13 +2972,23 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     private func drawSelectionHandles(for a: Annotation) {
         let blue = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1)
-        for (_, rect) in handleRects(for: a) {
-            NSColor.white.setFill()
-            NSBezierPath(rect: rect).fill()
-            blue.setStroke()
-            let outline = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
-            outline.lineWidth = 1.5
-            outline.stroke()
+        for (handle, rect) in handleRects(for: a) {
+            if case .bend = handle {
+                // Bend points: smaller hollow circles, easy to grab.
+                let c = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+                NSColor.white.setFill()
+                c.fill()
+                blue.setStroke()
+                c.lineWidth = 1.5
+                c.stroke()
+            } else {
+                NSColor.white.setFill()
+                NSBezierPath(rect: rect).fill()
+                blue.setStroke()
+                let outline = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
+                outline.lineWidth = 1.5
+                outline.stroke()
+            }
         }
     }
 
@@ -2476,6 +3078,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
             drawCodeBlock(a)
             return
         }
+        if let rich = a.richText() {
+            // Markdown-formatted documents render with their own per-line
+            // fonts, colors and paragraph styles.
+            rich.draw(
+                with: a.rect,
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            )
+            return
+        }
         let attrs: [NSAttributedString.Key: Any] = [
             .font: Fonts.nsFont(for: a.fontFamily, size: a.fontSize),
             .foregroundColor: a.strokeColor,
@@ -2487,24 +3098,28 @@ final class CanvasView: NSView, NSTextViewDelegate {
         )
     }
 
-    /// Code blocks: translucent rounded background (visible on white and
-    /// black backdrops) with syntax-highlighted monospaced text.
+    /// Code blocks: a solid, high-contrast block (dark-on-white in light
+    /// mode, light-on-dark in dark mode) so the code stays perfectly readable
+    /// over any wallpaper or app — not just on the white screen. The light /
+    /// dark syntax palettes follow the same mode.
     private func drawCodeBlock(_ a: Annotation) {
         let dark = state.canvasBackground == .black
         let pad: CGFloat = 14
         let bgRect = a.rect.insetBy(dx: -pad, dy: -pad)
         let bg = NSBezierPath(roundedRect: bgRect, xRadius: 8, yRadius: 8)
-        let fill = dark
-            ? NSColor.white.withAlphaComponent(0.12)
-            : NSColor.black.withAlphaComponent(0.08)
-        fill.setFill()
+        let colors = codeBlockColors(dark: dark)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.28)
+        shadow.shadowBlurRadius = 10
+        shadow.shadowOffset = NSSize(width: 0, height: -3)
+        shadow.set()
+        colors.background.setFill()
         bg.fill()
-        let border = dark
-            ? NSColor.white.withAlphaComponent(0.3)
-            : NSColor.black.withAlphaComponent(0.18)
-        border.setStroke()
+        colors.border.setStroke()
         bg.lineWidth = 1
         bg.stroke()
+        NSGraphicsContext.restoreGraphicsState()
 
         let font = Fonts.nsFont(for: "Cascadia Code", size: a.fontSize)
         let para = NSMutableParagraphStyle()
@@ -2513,6 +3128,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
         styled.draw(
             with: a.rect,
             options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+    }
+
+    /// Solid backgrounds/borders for code blocks — shared by the rendered
+    /// block and the live editing field so typing matches the result.
+    private func codeBlockColors(dark: Bool) -> (background: NSColor, border: NSColor) {
+        if dark {
+            return (
+                background: NSColor(srgbRed: 0.10, green: 0.11, blue: 0.14, alpha: 1),
+                border: NSColor(srgbRed: 0.25, green: 0.27, blue: 0.32, alpha: 1)
+            )
+        }
+        return (
+            background: NSColor(srgbRed: 0.975, green: 0.976, blue: 0.98, alpha: 1),
+            border: NSColor(srgbRed: 0.79, green: 0.79, blue: 0.82, alpha: 1)
         )
     }
 
@@ -2728,6 +3358,46 @@ final class CanvasView: NSView, NSTextViewDelegate {
         path.stroke()
     }
 
+    /// Values inside the nodes of a data-structure shape, each fitted and
+    /// centered in its node frame.
+    private func drawDataStructureTexts(_ a: Annotation) {
+        let nodes = dataStructureNodes(for: a)
+        let texts = paddedNodeTexts(a)
+        for (i, node) in nodes.enumerated() {
+            let text = texts[i]
+            guard !text.isEmpty else { continue }
+            let pad: CGFloat = 4
+            let textRect = node.insetBy(dx: pad, dy: pad)
+            guard textRect.width > 6, textRect.height > 4 else { continue }
+            let maxFont = min(a.fontSize, node.height * 0.55)
+            let font = Fonts.nsFont(for: a.fontFamily, size: fittingFontSize(for: text, in: node, fontFamily: a.fontFamily, maxSize: maxFont))
+            let para = NSMutableParagraphStyle()
+            para.alignment = .center
+            para.lineBreakMode = .byWordWrapping
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: a.strokeColor,
+                .paragraphStyle: para,
+            ]
+            let bounds = (text as NSString).boundingRect(
+                with: CGSize(width: textRect.width, height: 100_000),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: attrs
+            )
+            let drawRect = CGRect(
+                x: textRect.minX,
+                y: textRect.midY - bounds.height / 2,
+                width: textRect.width,
+                height: min(bounds.height, textRect.height)
+            )
+            (text as NSString).draw(
+                with: drawRect,
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: attrs
+            )
+        }
+    }
+
     // MARK: - geometry
 
     /// Deterministic seed so a shape's hand-drawn wobble is stable across
@@ -2812,6 +3482,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
             guard pts.count > 1 else { return NSBezierPath() }
             let s = connectionPoint(for: a.connectionStart, fallback: pts[0])
             let e = connectionPoint(for: a.connectionEnd, fallback: pts[pts.count - 1])
+            if pts.count > 2 {
+                // Manually bent line — draw exactly through the bend points
+                // (auto-routing is skipped: the user's bend wins).
+                var all = pts
+                if a.connectionStart != nil { all[0] = s }
+                if a.connectionEnd != nil { all[all.count - 1] = e }
+                let path = NSBezierPath()
+                path.move(to: all[0])
+                for p in all.dropFirst() { path.line(to: p) }
+                return path
+            }
             let sOwner = connectionNormal(for: a.connectionStart).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: s)
             let eOwner = connectionNormal(for: a.connectionEnd).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: e)
             let margin = 8 + a.strokeWidth / 2
@@ -2915,9 +3596,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
             switch a.kind {
             case .doubleArrow, .orthogonal, .connector:
                 let path = NSBezierPath()
-                path.move(to: s)
-                var prev = s
-                for p in pts.dropFirst() {
+                // Sub in the resolved connection points (they follow the glued
+                // boxes) so bent connectors stay glued at both ends.
+                var all = pts
+                if a.connectionStart != nil { all[0] = s }
+                if a.connectionEnd != nil { all[all.count - 1] = e }
+                path.move(to: all[0])
+                var prev = all[0]
+                for p in all.dropFirst() {
                     if a.kind == .orthogonal || a.kind == .connector {
                         path.line(to: CGPoint(x: p.x, y: prev.y))
                         path.line(to: p)
@@ -3179,9 +3865,173 @@ final class CanvasView: NSView, NSTextViewDelegate {
             path.line(to: CGPoint(x: r.maxX - fold, y: r.maxY))
             path.close()
             return path
+        case .linkedList, .stack, .heap, .graph, .set:
+            return dataStructurePath(for: a)
         default:
             return NSBezierPath()
         }
+    }
+
+    // MARK: - data structure shapes
+
+    /// True when the shape is one of the data-structure kinds (linked list,
+    /// stack, heap, graph, set) — multi-node shapes with editable values.
+    private func isDataStructure(_ kind: ShapeKind) -> Bool {
+        switch kind {
+        case .linkedList, .stack, .heap, .graph, .set:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Frames of the individual nodes of a data-structure shape, laid out
+    /// inside the annotation's rect.
+    private func dataStructureNodes(for a: Annotation) -> [CGRect] {
+        let r = a.rect
+        switch a.kind {
+        case .linkedList:
+            let n = 4
+            let w = r.width / CGFloat(n)
+            return (0..<n).map { i in
+                CGRect(x: r.minX + w * CGFloat(i) + 3, y: r.minY + 3, width: w - 6, height: r.height - 6)
+            }
+        case .stack:
+            let n = 4
+            let h = r.height / CGFloat(n)
+            return (0..<n).map { i in
+                CGRect(x: r.minX + 3, y: r.minY + h * CGFloat(n - 1 - i) + 3, width: r.width - 6, height: h - 6)
+            }
+        case .heap:
+            let nodeSize = min(r.width / 4.5, r.height * 0.22)
+            let cx = r.midX
+            let ys: [CGFloat] = [r.minY + r.height * 0.12, r.minY + r.height * 0.5, r.maxY - r.height * 0.12]
+            let xs: [[CGFloat]] = [
+                [cx],
+                [cx - r.width / 4, cx + r.width / 4],
+                [cx - r.width * 3 / 8, cx - r.width / 8, cx + r.width / 8, cx + r.width * 3 / 8],
+            ]
+            var out: [CGRect] = []
+            for row in 0..<3 {
+                for x in xs[row] {
+                    out.append(CGRect(x: x - nodeSize / 2, y: ys[row] - nodeSize / 2, width: nodeSize, height: nodeSize))
+                }
+            }
+            return out
+        case .graph:
+            let s = min(r.width, r.height) * 0.16
+            let insetX = r.width * 0.2
+            let insetY = r.height * 0.2
+            let pts = [
+                CGPoint(x: r.minX + insetX, y: r.minY + insetY),
+                CGPoint(x: r.maxX - insetX, y: r.minY + insetY),
+                CGPoint(x: r.maxX - insetX, y: r.maxY - insetY),
+                CGPoint(x: r.minX + insetX, y: r.maxY - insetY),
+            ]
+            return pts.map { CGRect(x: $0.x - s / 2, y: $0.y - s / 2, width: s, height: s) }
+        case .set:
+            let radius = min(r.width * 0.22, r.height * 0.4)
+            let cy = r.midY
+            let d = r.width * 0.15
+            return [
+                CGRect(x: r.midX - d - radius, y: cy - radius, width: radius * 2, height: radius * 2),
+                CGRect(x: r.midX - radius, y: cy - radius, width: radius * 2, height: radius * 2),
+                CGRect(x: r.midX + d - radius, y: cy - radius, width: radius * 2, height: radius * 2),
+            ]
+        default:
+            return []
+        }
+    }
+
+    /// Connector lines between the nodes of a data-structure shape.
+    private func dataStructureEdges(for a: Annotation) -> [(CGPoint, CGPoint)] {
+        let nodes = dataStructureNodes(for: a)
+        switch a.kind {
+        case .linkedList:
+            return (0..<max(0, nodes.count - 1)).map { i in
+                (CGPoint(x: nodes[i].maxX, y: nodes[i].midY), CGPoint(x: nodes[i + 1].minX, y: nodes[i + 1].midY))
+            }
+        case .heap:
+            var edges: [(CGPoint, CGPoint)] = []
+            for i in 0..<nodes.count {
+                let left = 2 * i + 1
+                let right = 2 * i + 2
+                if left < nodes.count {
+                    edges.append((CGPoint(x: nodes[i].midX, y: nodes[i].maxY), CGPoint(x: nodes[left].midX, y: nodes[left].minY)))
+                }
+                if right < nodes.count {
+                    edges.append((CGPoint(x: nodes[i].midX, y: nodes[i].maxY), CGPoint(x: nodes[right].midX, y: nodes[right].minY)))
+                }
+            }
+            return edges
+        case .graph:
+            let pairs = [(0, 1), (1, 2), (2, 3), (3, 0), (0, 2)]
+            return pairs.map {
+                (CGPoint(x: nodes[$0.0].midX, y: nodes[$0.0].midY), CGPoint(x: nodes[$0.1].midX, y: nodes[$0.1].midY))
+            }
+        default:
+            return []
+        }
+    }
+
+    /// Small filled triangle used as an arrowhead at the end of an edge.
+    private func arrowTriangle(at end: CGPoint, from prev: CGPoint, size: CGFloat) -> NSBezierPath {
+        let dx = end.x - prev.x
+        let dy = end.y - prev.y
+        let len = max(1, sqrt(dx * dx + dy * dy))
+        let ux = dx / len, uy = dy / len
+        let path = NSBezierPath()
+        path.move(to: CGPoint(x: end.x - ux * size + uy * size * 0.45, y: end.y - uy * size - ux * size * 0.45))
+        path.line(to: end)
+        path.line(to: CGPoint(x: end.x - ux * size - uy * size * 0.45, y: end.y - uy * size + ux * size * 0.45))
+        path.close()
+        return path
+    }
+
+    /// Combined outline of a data-structure shape: connector edges plus the
+    /// node frames. For `.set` the circles also fill themselves translucently
+    /// so the Venn overlaps stay visible.
+    private func dataStructurePath(for a: Annotation) -> NSBezierPath {
+        let path = NSBezierPath()
+        if a.kind == .set {
+            if let fill = a.fillColor, shouldFill(a) {
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, al: CGFloat = 1
+                fill.getRed(&r, green: &g, blue: &b, alpha: &al)
+                let tint = NSColor(calibratedRed: r, green: g, blue: b, alpha: al * a.fillOpacity * 0.5)
+                tint.setFill()
+                for node in dataStructureNodes(for: a) {
+                    NSBezierPath(ovalIn: node).fill()
+                }
+            }
+            for node in dataStructureNodes(for: a) {
+                path.appendOval(in: node)
+            }
+            return path
+        }
+        let rad = max(3, min(a.rect.width, a.rect.height) * 0.07)
+        for (start, end) in dataStructureEdges(for: a) {
+            path.move(to: start)
+            path.line(to: end)
+            if a.kind == .linkedList {
+                path.append(arrowTriangle(at: end, from: start, size: max(7, a.strokeWidth * 3.5)))
+            }
+        }
+        for node in dataStructureNodes(for: a) {
+            if a.kind == .heap || a.kind == .graph {
+                path.appendOval(in: node)
+            } else {
+                path.appendRoundedRect(node, xRadius: rad, yRadius: rad)
+            }
+        }
+        return path
+    }
+
+    /// Node texts of a data-structure shape, padded/trimmed to the node count.
+    private func paddedNodeTexts(_ a: Annotation) -> [String] {
+        let count = dataStructureNodes(for: a).count
+        var out = a.nodeTexts
+        while out.count < count { out.append("") }
+        return Array(out.prefix(count))
     }
 
     // MARK: - rough (hand-drawn) path generators
@@ -3612,11 +4462,30 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return out
     }
 
-    private func straightIsBlocked(_ from: CGPoint, _ to: CGPoint, obstacles: [CGRect]) -> Bool {
+    /// True when the straight segment crosses an obstacle. Obstacles that
+    /// contain an endpoint are pierced instead of dodged — a line started or
+    /// ended inside a box is drawn straight out of it, never routed around.
+    /// Only `pierceFrom`/`pierceTo` (the line's real endpoints) may trigger
+    /// the skip; intermediate route points never do, so a route that dips
+    /// into a box is still blocked. The containment test uses a slightly
+    /// deflated rect so points that merely hug an inflated obstacle's edge
+    /// still count as blocked.
+    private func straightIsBlocked(
+        _ from: CGPoint,
+        _ to: CGPoint,
+        obstacles: [CGRect],
+        pierceFrom: CGPoint? = nil,
+        pierceTo: CGPoint? = nil
+    ) -> Bool {
         let mnX = min(from.x, to.x), mxX = max(from.x, to.x)
         let mnY = min(from.y, to.y), mxY = max(from.y, to.y)
-        for ob in obstacles where mxX >= ob.minX && mnX <= ob.maxX && mxY >= ob.minY && mnY <= ob.maxY {
-            return true
+        for ob in obstacles {
+            let core = ob.insetBy(dx: 4, dy: 4)
+            if let pf = pierceFrom, core.contains(pf) { continue }
+            if let pt = pierceTo, core.contains(pt) { continue }
+            if mxX >= ob.minX && mnX <= ob.maxX && mxY >= ob.minY && mnY <= ob.maxY {
+                return true
+            }
         }
         return false
     }
@@ -3625,16 +4494,20 @@ final class CanvasView: NSView, NSTextViewDelegate {
         for k in 1...12 {
             let f = CGFloat(k) / 12
             let q = cubicPoint(p0, c1, c2, p1, t: f)
-            for ob in obstacles where q.x >= ob.minX && q.x <= ob.maxX && q.y >= ob.minY && q.y <= ob.maxY {
-                return true
+            for ob in obstacles {
+                let core = ob.insetBy(dx: 4, dy: 4)
+                if core.contains(p0) || core.contains(p1) { continue }
+                if q.x >= ob.minX && q.x <= ob.maxX && q.y >= ob.minY && q.y <= ob.maxY {
+                    return true
+                }
             }
         }
         return false
     }
 
-    private func routeCollides(_ pts: [CGPoint], obstacles: [CGRect]) -> Bool {
+    private func routeCollides(_ pts: [CGPoint], obstacles: [CGRect], pierceFrom: CGPoint? = nil, pierceTo: CGPoint? = nil) -> Bool {
         for k in 0..<(pts.count - 1) {
-            if straightIsBlocked(pts[k], pts[k + 1], obstacles: obstacles) { return true }
+            if straightIsBlocked(pts[k], pts[k + 1], obstacles: obstacles, pierceFrom: pierceFrom, pierceTo: pierceTo) { return true }
         }
         return false
     }
@@ -3718,7 +4591,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     full.append(q)
                 }
                 if distance(full.last!, end) > 0.5 { full.append(end) }
-                if !routeCollides(full, obstacles: obstacles) {
+                if !routeCollides(full, obstacles: obstacles, pierceFrom: start, pierceTo: end) {
                     return full
                 }
             }
@@ -3823,6 +4696,25 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return rotatedPoint(bestPoint, around: center, by: bestRotation)
     }
 
+    private func isLineKind(_ kind: ShapeKind) -> Bool {
+        switch kind {
+        case .line, .arrow, .doubleArrow, .curvedConnector, .orthogonal, .connector:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// True when the annotation's area gets painted with its fill color —
+    /// includes freehand strokes that loop back onto themselves (the draw
+    /// mode's "closed shape" fill), not just the shape library.
+    private func shouldFill(_ a: Annotation) -> Bool {
+        guard a.fillColor != nil else { return false }
+        if isClosed(a.kind) { return true }
+        if a.kind == .freedraw, isClosedShape(a.points) { return true }
+        return false
+    }
+
     private func isClosed(_ kind: ShapeKind) -> Bool {
         switch kind {
         case .rect, .diamond, .ellipse, .frame, .autoshape,
@@ -3830,7 +4722,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
              .pentagon, .hexagon, .octagon, .star, .star6, .cross,
              .process, .predefinedProcess, .delay, .manualInput, .display,
              .cloud, .serverStack, .queue, .firewall, .cube,
-             .callout, .note:
+             .callout, .note,
+             .linkedList, .stack, .heap, .graph, .set:
             return true
         default:
             return false
@@ -3844,6 +4737,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
             switch a.kind {
             case .text, .image:
                 if a.rect.insetBy(dx: -8, dy: -8).contains(localP) { return i }
+            case .freedraw:
+                // Closed freehand loops are clickable inside the loop (bucket
+                // fill, selection), not just on the stroke.
+                if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points) { return i }
+                fallthrough
             default:
                 let path = bezierPath(for: a)
                 if path.contains(localP) { return i }
@@ -3983,6 +4881,28 @@ final class CanvasView: NSView, NSTextViewDelegate {
             out = next
         }
         return out
+    }
+
+    /// Relative luminance of a color (0 = black, 1 = white).
+    private func colorLuminance(_ c: NSColor) -> CGFloat {
+        let s = c.usingColorSpace(.sRGB) ?? c
+        return 0.2126 * s.redComponent + 0.7152 * s.greenComponent + 0.0722 * s.blueComponent
+    }
+
+    /// Keeps text/shapes visible when the writing surface flips: a dark stroke
+    /// on the black screen becomes white, a light stroke on the white screen
+    /// becomes black. Only kicks in for colors that would be invisible.
+    private func autoContrastStrokeColor() {
+        switch state.canvasBackground {
+        case .black:
+            if colorLuminance(state.strokeColor) < 0.4 {
+                state.strokeColor = Palette.white
+            }
+        case .white, .clear:
+            if colorLuminance(state.strokeColor) > 0.9 {
+                state.strokeColor = Palette.black
+            }
+        }
     }
 
     /// Detects if a shape is closed (initial point meets final point or completes a boundary)

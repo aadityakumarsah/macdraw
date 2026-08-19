@@ -44,6 +44,12 @@ enum ShapeKind: String {
     case curvedConnector
     case orthogonal
     case connector
+    // Data structures — multi-node shapes with editable values in every node
+    case linkedList
+    case stack
+    case heap
+    case graph
+    case set
 }
 
 /// How the outline of a shape is stroked.
@@ -113,6 +119,11 @@ enum Tool: String, CaseIterable {
     case curvedConnector
     case orthogonal
     case connector
+    case linkedList
+    case stack
+    case heap
+    case graph
+    case set
 
     /// Tools that draw rect-based shapes, shown in the shape palette.
     static let shapePalette: [Tool] = [
@@ -122,6 +133,8 @@ enum Tool: String, CaseIterable {
         .manualInput, .display, .cloud, .serverStack, .queue,
         .firewall, .cube, .callout, .note, .arrow, .line,
         .doubleArrow, .curvedConnector, .orthogonal, .connector,
+        // Data structures
+        .linkedList, .stack, .heap, .graph, .set,
     ]
 
     var iconName: String {
@@ -169,6 +182,11 @@ enum Tool: String, CaseIterable {
         case .curvedConnector: return "curved-connector"
         case .orthogonal: return "orthogonal"
         case .connector: return "connector"
+        case .linkedList: return "linked-list"
+        case .stack: return "stack"
+        case .heap: return "heap"
+        case .graph: return "graph"
+        case .set: return "set"
         }
     }
 
@@ -217,6 +235,11 @@ enum Tool: String, CaseIterable {
         case .curvedConnector: return "Curved connector"
         case .orthogonal: return "Orthogonal line"
         case .connector: return "Connector"
+        case .linkedList: return "Linked list"
+        case .stack: return "Stack"
+        case .heap: return "Heap"
+        case .graph: return "Graph"
+        case .set: return "Set"
         }
     }
 
@@ -257,6 +280,11 @@ enum Tool: String, CaseIterable {
         case .curvedConnector: return .curvedConnector
         case .orthogonal: return .orthogonal
         case .connector: return .connector
+        case .linkedList: return .linkedList
+        case .stack: return .stack
+        case .heap: return .heap
+        case .graph: return .graph
+        case .set: return .set
         default: return nil
         }
     }
@@ -312,6 +340,19 @@ struct Annotation {
     /// when toggling back to normal text (nil = never converted).
     var normalFontFamily: String? = nil
     var normalFontSize: CGFloat? = nil
+    /// RTF data of the markdown-formatted rich text (headings, bullets, code,
+    /// bold/italic...) — nil when the text is plain. Rendering and re-editing
+    /// use this; the plain `text` is what the user types.
+    var richTextData: Data? = nil
+    /// Values inside the nodes of a data-structure shape (linked list, stack,
+    /// heap, graph, set). One entry per node; missing entries render empty.
+    var nodeTexts: [String] = []
+
+    /// The stored rich text, or nil when the annotation is plain.
+    func richText() -> NSAttributedString? {
+        guard let data = richTextData else { return nil }
+        return NSAttributedString(rtf: data, documentAttributes: nil)
+    }
 }
 
 /// Where a connector is pinned to a shape's edge. The anchor stays glued to
@@ -338,7 +379,7 @@ final class CanvasState: ObservableObject {
     @Published var strokeColor: NSColor = Palette.black
     @Published var fillColor: NSColor = Palette.red[1]
     @Published var fillEnabled: Bool = false
-    @Published var fillOpacity: CGFloat = 0.3
+    @Published var fillOpacity: CGFloat = 0.5
     @Published var strokeWidth: CGFloat = 3
     @Published var fontFamily: String = "Virgil"
     @Published var fontSize: CGFloat = 28

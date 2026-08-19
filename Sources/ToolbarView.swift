@@ -15,6 +15,8 @@ let accentGradient = LinearGradient(
 
 struct ToolbarView: View {
     @ObservedObject var state: CanvasState
+    @ObservedObject var pages: PagesManager
+    @ObservedObject var updater: AppUpdater
     let onClose: () -> Void
     let onUndo: () -> Void
     let onClear: () -> Void
@@ -23,6 +25,7 @@ struct ToolbarView: View {
     let onDeactivate: () -> Void
     let onToggleCodeBlock: () -> Void
     let onInsertSymbol: (String) -> Void
+    let onSwitchPage: (UUID) -> Void
 
     enum ColorTarget {
         case stroke
@@ -31,6 +34,8 @@ struct ToolbarView: View {
 
     @State private var showShortcuts = false
     @State private var showShapes = false
+    @State private var showPages = false
+    @State private var showUpdate = false
     @State private var colorTarget: ColorTarget = .stroke
 
     var body: some View {
@@ -106,6 +111,10 @@ struct ToolbarView: View {
 
     private var topRow: some View {
         HStack(spacing: 6) {
+            pagesButton
+
+            Divider().frame(height: 22)
+
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     ForEach(Tool.allCases.filter { !Tool.shapePalette.contains($0) }, id: \.self) { tool in
@@ -193,6 +202,93 @@ struct ToolbarView: View {
             }
             .buttonStyle(.plain)
             .help("Close overlay (press ⌃⌥ again)")
+
+            updateButton
+
+            Text("v\(appVersion)")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.trailing, 2)
+                .help("macdraw v\(appVersion)")
+        }
+    }
+
+    // MARK: - pages
+
+    /// Opens the pages popover — add, rename, delete and switch pages. Every
+    /// page is its own drawing, saved forever until deleted.
+    private var pagesButton: some View {
+        Button {
+            showPages.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(pages.currentPageName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 8)
+            .frame(height: 30)
+            .background(
+                showPages ? Color.white.opacity(0.12) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Pages — each page keeps its own drawing, saved forever")
+        .popover(isPresented: $showPages, arrowEdge: .bottom) {
+            PagesView(
+                pages: pages,
+                onSwitch: { id in
+                    showPages = false
+                    onSwitchPage(id)
+                }
+            )
+        }
+    }
+
+    // MARK: - updates
+
+    /// Downloads a new build when one is available on GitHub. Shows a badge
+    /// while there's a newer version, and the popover reports progress while
+    /// downloading. Also lets the user check manually.
+    private var updateButton: some View {
+        Button {
+            if updater.isUpdateAvailable || updater.errorMessage != nil || updater.latestVersion != nil {
+                showUpdate.toggle()
+            } else {
+                updater.checkNow()
+            }
+        } label: {
+            Image(systemName: updater.checking ? "arrow.triangle.2.circlepath" : "arrow.down.circle")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 32, height: 28)
+                .contentShape(Rectangle())
+                .overlay(alignment: .topTrailing) {
+                    if updater.isUpdateAvailable {
+                        Circle()
+                            .fill(Color(nsColor: .systemRed))
+                            .frame(width: 7, height: 7)
+                            .offset(x: 2, y: -2)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .help(updater.isUpdateAvailable
+            ? "Update available: v\(appVersion) → v\(updater.latestLabel)"
+            : "Check for updates")
+        .popover(isPresented: $showUpdate, arrowEdge: .bottom) {
+            UpdateView(updater: updater)
+        }
+        .onChange(of: updater.isUpdateAvailable) { _, available in
+            if available {
+                showUpdate = true
+            }
         }
     }
 
@@ -592,40 +688,49 @@ struct ShortcutsView: View {
             Label("Keyboard shortcuts", systemImage: "keyboard")
                 .font(.headline)
             Divider()
-            ForEach(Shortcuts.all, id: \.key) { s in
-                HStack {
-                    Text(s.tool.label)
-                        .font(.callout)
-                    Spacer()
-                    Text(s.key.uppercased())
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
-                        .frame(width: 24, height: 22)
-                        .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 5))
+            ScrollView(showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Shortcuts.all, id: \.key) { s in
+                        HStack {
+                            Text(s.tool.label)
+                                .font(.callout)
+                            Spacer()
+                            Text(s.key.uppercased())
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                                .frame(width: 24, height: 22)
+                                .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 5))
+                        }
+                    }
+                    Divider()
+                    ForEach([
+                        ("Draw on / off", "Toolbar button"),
+                        ("Pause drawing", "Draw button again"),
+                        ("Pan canvas", "Minimap / Space + drag / scroll"),
+                        ("Zoom canvas", "Pinch / ⌘ + scroll"),
+                        ("Reset view", "⌘0"),
+                        ("Undo", "⌘Z"),
+                        ("Copy selection", "⌘C"),
+                        ("Paste", "⌘V"),
+                        ("Select all", "⌘A"),
+                        ("Delete selection", "⌫"),
+                        ("Bend a line/arrow", "Drag its middle handle"),
+                        ("Close overlay", "⌃⌥ again"),
+                        ("Quit macdraw", "Status bar menu"),
+                    ], id: \.0) { name, key in
+                        HStack {
+                            Text(name).font(.callout)
+                            Spacer()
+                            Text(key).font(.system(size: 12, weight: .bold, design: .rounded))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
+                .padding(.trailing, 4)
             }
-            Divider()
-            ForEach([
-                ("Draw on / off", "Toolbar button"),
-                ("Pause drawing", "Draw button again"),
-                ("Pan canvas", "Space + drag / two-finger scroll"),
-                ("Zoom canvas", "Pinch / ⌘ + scroll"),
-                ("Reset view", "⌘0"),
-                ("Undo", "⌘Z"),
-                ("Select all", "⌘A"),
-                ("Delete selection", "⌫"),
-                ("Close overlay", "⌃⌥ again"),
-                ("Quit macdraw", "Status bar menu"),
-            ], id: \.0) { name, key in
-                HStack {
-                    Text(name).font(.callout)
-                    Spacer()
-                    Text(key).font(.system(size: 12, weight: .bold, design: .rounded))
-                        .foregroundStyle(.secondary)
-                }
-            }
+            .frame(height: 300)
         }
         .padding(14)
-        .frame(width: 240)
+        .frame(width: 250)
     }
 }
 
@@ -664,6 +769,7 @@ struct ShapesPaletteView: View {
         ShapeGroup(title: "Architecture", tools: [.cloud, .serverStack, .queue, .firewall, .cube]),
         ShapeGroup(title: "Communication", tools: [.callout, .note]),
         ShapeGroup(title: "Connectors", tools: [.doubleArrow, .curvedConnector, .orthogonal, .connector]),
+        ShapeGroup(title: "Data structures", tools: [.linkedList, .stack, .heap, .graph, .set]),
     ]
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 6), count: 5)
@@ -834,3 +940,342 @@ struct WaveIcon: View {
     }
 }
 
+
+// MARK: - pages popover
+
+/// Lists every page with its name (inline rename) and description (inline
+/// edit), a delete button, and a "New page" action at the bottom. Clicking a
+/// row switches to that page.
+struct PagesView: View {
+    @ObservedObject var pages: PagesManager
+    let onSwitch: (UUID) -> Void
+    @State private var newPageName = ""
+    @State private var newPageNote = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Pages")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.secondary)
+
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(pages.pages) { page in
+                        PageRow(
+                            page: page,
+                            isCurrent: page.id == pages.currentPageID,
+                            canDelete: pages.pages.count > 1,
+                            onSwitch: { onSwitch(page.id) },
+                            onRename: { pages.renamePage(id: page.id, to: $0) },
+                            onSetNote: { pages.setNote(id: page.id, to: $0) },
+                            onDelete: { pages.deletePage(id: page.id) }
+                        )
+                    }
+                }
+            }
+            .frame(maxHeight: 220)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    TextField("Page name", text: $newPageName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+
+                    Button {
+                        addPage()
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11, weight: .bold))
+                            .frame(width: 24, height: 22)
+                            .background(macdrawAccent.opacity(0.85), in: RoundedRectangle(cornerRadius: 6))
+                            .foregroundStyle(.white)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Add a new page")
+                }
+
+                TextField("Description (optional)", text: $newPageNote)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                    .onSubmit {
+                        addPage()
+                    }
+            }
+        }
+        .padding(12)
+        .frame(width: 260)
+    }
+
+    private func addPage() {
+        let name = newPageName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = pages.addPage(
+            named: name.isEmpty ? "New page" : name,
+            description: newPageNote
+        )
+        newPageName = ""
+        newPageNote = ""
+        onSwitch(id)
+    }
+}
+
+private struct PageRow: View {
+    let page: CanvasPage
+    let isCurrent: Bool
+    let canDelete: Bool
+    let onSwitch: () -> Void
+    let onRename: (String) -> Void
+    let onSetNote: (String) -> Void
+    let onDelete: () -> Void
+    @State private var editing = false
+    @State private var draft = ""
+    @State private var editingNote = false
+    @State private var noteDraft = ""
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: isCurrent ? "doc.fill" : "doc")
+                .font(.system(size: 11))
+                .foregroundStyle(isCurrent ? macdrawAccent : .secondary)
+
+            VStack(alignment: .leading, spacing: 1) {
+                if editing {
+                    TextField("Name", text: $draft)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .onSubmit {
+                            onRename(draft)
+                            editing = false
+                        }
+                        .onExitCommand {
+                            editing = false
+                        }
+                } else {
+                    Text(page.name)
+                        .font(.system(size: 12, weight: isCurrent ? .semibold : .regular))
+                        .lineLimit(1)
+                        .onTapGesture(count: 2) {
+                            draft = page.name
+                            editing = true
+                        }
+                }
+
+                if editingNote {
+                    TextField("Description", text: $noteDraft)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 10))
+                        .onSubmit {
+                            onSetNote(noteDraft)
+                            editingNote = false
+                        }
+                        .onExitCommand {
+                            editingNote = false
+                        }
+                } else if !page.note.isEmpty {
+                    Text(page.note)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .onTapGesture(count: 2) {
+                            noteDraft = page.note
+                            editingNote = true
+                        }
+                } else {
+                    Text("Add description…")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .onTapGesture {
+                            noteDraft = ""
+                            editingNote = true
+                        }
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            if !isCurrent {
+                Button(action: onSwitch) {
+                    Text("Open")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(macdrawAccent.opacity(0.85), in: RoundedRectangle(cornerRadius: 5))
+                        .foregroundStyle(.white)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Switch to this page")
+            }
+
+            Button {
+                draft = page.name
+                editing = true
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10))
+                    .frame(width: 22, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Rename page (or double-click the name)")
+
+            Button {
+                onDelete()
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 10))
+                    .frame(width: 22, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(canDelete ? Color.secondary : Color.secondary.opacity(0.35))
+            .disabled(!canDelete)
+            .help(canDelete ? "Delete this page" : "Keep at least one page")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            isCurrent ? macdrawAccent.opacity(0.16) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if !isCurrent {
+                onSwitch()
+            }
+        }
+    }
+}
+
+// MARK: - update popover
+
+/// Status + action panel for the auto-updater: shows whether this build is
+/// current, and lets the user download and install a newer release with
+/// live progress.
+struct UpdateView: View {
+    @ObservedObject var updater: AppUpdater
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: statusIcon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(statusColor)
+                Text(statusTitle)
+                    .font(.system(size: 13, weight: .bold))
+                Spacer()
+                if updater.checking {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text(statusSubtitle)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if updater.isUpdateAvailable, let notes = updater.releaseNotes, !notes.isEmpty {
+                ScrollView {
+                    Text(notes)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 90)
+                .padding(6)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            if let error = updater.errorMessage {
+                Text(error)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color(nsColor: .systemRed))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if updater.downloading {
+                VStack(spacing: 4) {
+                    ProgressView(value: updater.downloadProgress)
+                        .progressViewStyle(.linear)
+                        .tint(macdrawAccent)
+                    Text("Downloading update… \(Int(updater.downloadProgress * 100))%")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if updater.isUpdateAvailable, !updater.downloading {
+                Button {
+                    updater.downloadAndInstall()
+                } label: {
+                    Text("Download & Update")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(
+                            accentGradient,
+                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .center)
+            } else if !updater.downloading {
+                Button {
+                    updater.checkNow()
+                } label: {
+                    Text("Check again")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(macdrawAccent)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
+    }
+
+    private var statusIcon: String {
+        if updater.downloading { return "arrow.down.circle.fill" }
+        if updater.isUpdateAvailable { return "exclamationmark.circle.fill" }
+        if updater.checking { return "arrow.triangle.2.circlepath" }
+        return "checkmark.circle.fill"
+    }
+
+    private var statusColor: Color {
+        if updater.isUpdateAvailable || updater.downloading { return macdrawAccent }
+        if updater.errorMessage != nil { return Color(nsColor: .systemRed) }
+        return Color(nsColor: .systemGreen)
+    }
+
+    private var statusTitle: String {
+        if updater.downloading { return "Updating…" }
+        if updater.isUpdateAvailable { return "Update available" }
+        if updater.checking { return "Checking…" }
+        if updater.errorMessage != nil { return "Update check failed" }
+        return "You're up to date"
+    }
+
+    private var statusSubtitle: String {
+        if updater.isUpdateAvailable {
+            return "macdraw v\(appVersion) → v\(updater.latestLabel). The app downloads the new build, replaces itself and relaunches."
+        }
+        if updater.errorMessage != nil {
+            return "The update server could not be reached. Check your connection and try again."
+        }
+        return "You're running v\(appVersion), the latest release."
+    }
+}

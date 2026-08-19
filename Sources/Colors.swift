@@ -64,6 +64,11 @@ enum Palette {
 
     // quick picks (5-slot strips)
     static let strokePicks = [black, red[4], green[4], blue[4], yellow[4]]
-    static let backgroundPicks: [NSColor?] = [nil, red[1], green[1], blue[1], yellow[1]]
+    /// Fill quick picks — the "no fill" slot plus a wide set of soft fills
+    /// (light shades are used so the shape outline stays readable).
+    static let backgroundPicks: [NSColor?] = [
+        nil, red[1], red[3], green[1], green[3], blue[1], blue[3],
+        yellow[1], yellow[3], violet[1], teal[1], orange[1],
+    ]
     static let canvasPicks = [white, NSColor(hexString: "#f8f9fa"), NSColor(hexString: "#f5faff"), NSColor(hexString: "#fffce8"), NSColor(hexString: "#fdf8f6")]
 }

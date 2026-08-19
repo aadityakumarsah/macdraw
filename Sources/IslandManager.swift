@@ -44,6 +44,8 @@ private final class ContainerView: NSView {
 final class IslandManager {
     private let window = OverlayWindow()
     private let state: CanvasState
+    let pages = PagesManager()
+    let updater = AppUpdater()
     private weak var canvas: CanvasView?
     private var toolbarHost: NSView?
     private var undoMonitor: Any?
@@ -212,7 +214,7 @@ final class IslandManager {
         let container = ContainerView(frame: screen.frame)
         container.wantsLayer = true
 
-        let canvas = CanvasView(state: state)
+        let canvas = CanvasView(state: state, pages: pages)
         canvas.frame = screen.frame
         container.addSubview(canvas)
         self.canvas = canvas
@@ -220,6 +222,8 @@ final class IslandManager {
         let toolbar = NSHostingView(
             rootView: ToolbarView(
                 state: state,
+                pages: pages,
+                updater: updater,
                 onClose: { [weak self] in self?.hide() },
                 onUndo: { [weak canvas] in canvas?.undo() },
                 onClear: { [weak canvas] in canvas?.clearAll() },
@@ -231,6 +235,12 @@ final class IslandManager {
                     guard let self, let canvas = self.canvas else { return }
                     let p = canvas.convert(self.window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
                     canvas.insertSymbol(symbol, at: p)
+                },
+                onSwitchPage: { [weak self] id in
+                    guard let self, let canvas = self.canvas else { return }
+                    canvas.saveViewStateToPages()
+                    self.pages.switchPage(id: id)
+                    canvas.applyCurrentPage()
                 }
             )
         )
@@ -257,6 +267,8 @@ final class IslandManager {
             ctx.duration = 0.25
             toolbar.animator().alphaValue = 1
         }
+
+        updater.checkNow()
 
         undoMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, let canvas = self.canvas else { return event }
@@ -286,8 +298,21 @@ final class IslandManager {
                 return event
             }
             if !mods.isEmpty {
-                if mods.contains(.command), event.charactersIgnoringModifiers == "z" {
+                let key = event.charactersIgnoringModifiers?.lowercased()
+                if mods.contains(.command), key == "z" {
                     canvas.undo()
+                    return nil
+                }
+                if mods.contains(.command), key == "c" {
+                    canvas.copySelection()
+                    return nil
+                }
+                if mods.contains(.command), key == "x" {
+                    canvas.cutSelection()
+                    return nil
+                }
+                if mods.contains(.command), key == "v" {
+                    canvas.paste()
                     return nil
                 }
                 return event
@@ -388,6 +413,7 @@ final class IslandManager {
 
     func runSelfTest(log: @escaping (String) -> Void) {
         log("showing overlay")
+        pages.selftestReset()
         show()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
             guard let self else {
@@ -949,13 +975,34 @@ final class IslandManager {
                         }
                         let midRect = canvas.annotations[mid].rect
                         let pathPts = canvas.selftestPathPoints(link2)
-                        let inside = pathPts.contains { midRect.contains($0) }
-                        let maxY = pathPts.map(\.y).max() ?? 0
-                        if inside || maxY < midRect.maxY {
-                            log("FAIL: connector should clear the mid box, inside=\(inside) maxY=\(maxY) midTop=\(midRect.maxY) pts=\(pathPts)")
+                        func segHitsRect(_ a: CGPoint, _ b: CGPoint, _ r: CGRect) -> Bool {
+                            if r.contains(a) || r.contains(b) { return true }
+                            let edges: [(CGPoint, CGPoint)] = [
+                                (CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY)),
+                                (CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.maxX, y: r.maxY)),
+                                (CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)),
+                                (CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.minX, y: r.minY)),
+                            ]
+                            for (e1, e2) in edges {
+                                let dx1 = b.x - a.x, dy1 = b.y - a.y
+                                let dx2 = e2.x - e1.x, dy2 = e2.y - e1.y
+                                let denom = dx1 * dy2 - dy1 * dx2
+                                let diffX = e1.x - a.x, diffY = e1.y - a.y
+                                let t = denom != 0 ? (diffX * dy2 - diffY * dx2) / denom : -1
+                                let u = denom != 0 ? (diffX * dy1 - diffY * dx1) / denom : -1
+                                if t >= 0 && t <= 1 && u >= 0 && u <= 1 { return true }
+                            }
+                            return false
+                        }
+                        var pierced = false
+                        for k in 0..<(pathPts.count - 1) where segHitsRect(pathPts[k], pathPts[k + 1], midRect) {
+                            pierced = true
+                        }
+                        if pierced {
+                            log("FAIL: connector should clear the mid box, pts=\(pathPts) midRect=\(midRect) connStart=\(String(describing: link2.connectionStart)) connEnd=\(String(describing: link2.connectionEnd)) annotations=\(canvas.annotations.map { "\($0.kind.rawValue)@\($0.rect)" })")
                             exit(1)
                         }
-                        log("mid-box dodge: connector cleared the box over the top (maxY=\(maxY))")
+                        log("mid-box dodge: connector cleared the box (maxY=\(pathPts.map(\.y).max() ?? 0))")
                         log("shape library test: palette contents are all drawable tools")
                         if Tool.shapePalette.count < 25 {
                             log("FAIL: shape palette should contain at least 25 shapes, got \(Tool.shapePalette.count)")
@@ -1045,12 +1092,14 @@ final class IslandManager {
                                 exit(1)
                             }
                             log("code block toggle test: converting back to plain text")
+                            canvas.selftestSelect([canvas.annotations.count - 1])
                             canvas.toggleCodeBlock()
                             if canvas.annotations.last?.isCode != false {
                                 log("FAIL: toggle should clear the code flag")
                                 exit(1)
                             }
                             log("code block toggle test: converting forward again")
+                            canvas.selftestSelect([canvas.annotations.count - 1])
                             canvas.toggleCodeBlock()
                             if canvas.annotations.last?.isCode != true {
                                 log("FAIL: toggle should re-apply the code flag")
@@ -1078,6 +1127,170 @@ final class IslandManager {
                                 log("FAIL: converting back should restore \(origFamily)/\(origSize), got \(canvas.annotations[tIdx].fontFamily)/\(canvas.annotations[tIdx].fontSize)")
                                 exit(1)
                             }
+                            log("pages test: adding a page, drawing on it, renaming, switching back, deleting")
+                            let p1 = self.pages.currentPageID
+                            let page1Count = canvas.annotations.count
+                            canvas.saveViewStateToPages()
+                            let p2 = self.pages.addPage(named: "Lang graph")
+                            self.pages.switchPage(id: p2)
+                            canvas.applyCurrentPage()
+                            if canvas.annotations.count != 0 {
+                                log("FAIL: a fresh page should start empty, got \(canvas.annotations.count)")
+                                exit(1)
+                            }
+                            self.state.tool = .rectangle
+                            let pg1 = self.win(CGPoint(x: 150, y: 150))
+                            let pg2 = self.win(CGPoint(x: 250, y: 250))
+                            canvas.mouseDown(with: self.mouseEvent(at: pg1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: pg2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: pg2, type: .leftMouseUp))
+                            if canvas.annotations.count != 1 {
+                                log("FAIL: drawing on the new page should leave 1 annotation, got \(canvas.annotations.count)")
+                                exit(1)
+                            }
+                            self.pages.renamePage(id: p2, to: "LM walkthrough")
+                            if self.pages.currentPageName != "LM walkthrough" {
+                                log("FAIL: page should be renamed, got \(self.pages.currentPageName)")
+                                exit(1)
+                            }
+                            canvas.saveViewStateToPages()
+                            self.pages.switchPage(id: p1)
+                            canvas.applyCurrentPage()
+                            if canvas.annotations.count != page1Count {
+                                log("FAIL: switching back should restore \(page1Count) annotations, got \(canvas.annotations.count)")
+                                exit(1)
+                            }
+                            let afterDelete = self.pages.deletePage(id: p2)
+                            if afterDelete != p1 || canvas.annotations.count != page1Count {
+                                log("FAIL: deleting the second page should keep page 1 intact")
+                                exit(1)
+                            }
+                            log("pages test: PASS")
+                            log("page description test: creating a page with a description persists it")
+                            let p3 = self.pages.addPage(named: "Spec", description: "Wireframes for onboarding")
+                            if self.pages.pages.first(where: { $0.id == p3 })?.note != "Wireframes for onboarding" {
+                                log("FAIL: page description should be saved at creation")
+                                exit(1)
+                            }
+                            self.pages.setNote(id: p3, to: "Updated description")
+                            if self.pages.pages.first(where: { $0.id == p3 })?.note != "Updated description" {
+                                log("FAIL: page description should update via setNote")
+                                exit(1)
+                            }
+                            _ = self.pages.deletePage(id: p3)
+                            log("page description test: PASS")
+                            log("markdown test: typing markdown styles the edit field live and stores rich text")
+                            self.state.codeBlockMode = false
+                            self.state.tool = .text
+                            self.state.lastNonTextTool = .selection
+                            let md1 = self.win(CGPoint(x: 500, y: 300))
+                            canvas.mouseDown(with: self.mouseEvent(at: md1, type: .leftMouseDown))
+                            canvas.mouseUp(with: self.mouseEvent(at: md1, type: .leftMouseUp))
+                            canvas.selftestSetText("# Heading\n\n- bullet one\n- bullet two\n\n**bold** and *italic*")
+                            // Index map: 0-8 "# Heading", 11-21 "- bullet one",
+                            // 23-34 "- bullet two", 38-45 "**bold**", 47-49 "and".
+                            let headingSize = canvas.selftestEditingFontSize(at: 3)
+                            let bulletSize = canvas.selftestEditingFontSize(at: 30)
+                            let headingBold = canvas.selftestEditingIsBold(at: 3)
+                            let emphasisBold = canvas.selftestEditingIsBold(at: 41)
+                            let plainBold = canvas.selftestEditingIsBold(at: 47)
+                            if headingSize == nil || bulletSize == nil
+                                || headingSize! <= bulletSize! * 1.4 || !headingBold {
+                                log("FAIL: heading should be styled larger and bold than body (heading=\(String(describing: headingSize)) bullet=\(String(describing: bulletSize)) bold=\(headingBold))")
+                                exit(1)
+                            }
+                            if !emphasisBold || plainBold {
+                                log("FAIL: **bold** run should be bold and plain runs not (bold=\(emphasisBold) plain=\(plainBold))")
+                                exit(1)
+                            }
+                            _ = self.win(CGPoint(x: 500, y: 300))
+                            canvas.selftestCommitEditing()
+                            guard let md = canvas.annotations.last, md.kind == .text, md.richTextData != nil else {
+                                log("FAIL: committed markdown text should store richTextData")
+                                exit(1)
+                            }
+                            if md.text != "# Heading\n\n- bullet one\n- bullet two\n\n**bold** and *italic*" {
+                                log("FAIL: committed text should keep the typed plain text, got: '\(md.text)'")
+                                exit(1)
+                            }
+                            // Re-edit: the field should come back styled.
+                            let md2 = self.win(canvas.selftestWorldToScreen(md.rect.origin))
+                            canvas.mouseDown(with: self.mouseEvent(at: md2, type: .leftMouseDown, clickCount: 2))
+                            canvas.mouseUp(with: self.mouseEvent(at: md2, type: .leftMouseUp, clickCount: 2))
+                            let rHeading = canvas.selftestEditingFontSize(at: 3)
+                            let rBody = canvas.selftestEditingFontSize(at: 30)
+                            if rHeading == nil || rBody == nil || rHeading! <= rBody! * 1.4 {
+                                log("FAIL: re-editing should restore the styled heading, got \(String(describing: rHeading)) vs \(String(describing: rBody))")
+                                exit(1)
+                            }
+                            canvas.selftestCommitEditing()
+                            log("markdown test: PASS")
+                            log("data structure test: linked list draws 4 nodes and each node stores a typed value")
+                            self.state.codeBlockMode = false
+                            self.state.tool = .linkedList
+                            self.state.lastNonTextTool = .selection
+                            let ds1 = self.win(CGPoint(x: 700, y: 650))
+                            let ds2 = self.win(CGPoint(x: 1150, y: 750))
+                            canvas.mouseDown(with: self.mouseEvent(at: ds1, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: ds2, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: ds2, type: .leftMouseUp))
+                            guard let ds = canvas.annotations.last, ds.kind == .linkedList else {
+                                log("FAIL: dragging should create a linked list, got \(String(describing: canvas.annotations.last?.kind))")
+                                exit(1)
+                            }
+                            let nodeRects = canvas.selftestNodeRects(canvas.annotations.count - 1)
+                            if nodeRects.count != 4 {
+                                log("FAIL: linked list should have 4 nodes, got \(nodeRects.count)")
+                                exit(1)
+                            }
+                            // Double-click node 0 and type a value.
+                            self.state.tool = .selection
+                            self.state.lastNonTextTool = .selection
+                            let n0 = self.win(canvas.selftestWorldToScreen(CGPoint(x: nodeRects[0].midX, y: nodeRects[0].midY)))
+                            canvas.mouseDown(with: self.mouseEvent(at: n0, type: .leftMouseDown, clickCount: 2))
+                            canvas.mouseUp(with: self.mouseEvent(at: n0, type: .leftMouseUp, clickCount: 2))
+                            canvas.selftestSetText("42")
+                            canvas.selftestCommitEditing()
+                            let texts0 = canvas.selftestNodeTexts(canvas.annotations.count - 1)
+                            if texts0 != ["42", "", "", ""] {
+                                log("FAIL: node 0 should hold 42, got \(texts0)")
+                                exit(1)
+                            }
+                            // Double-click node 2 and type another value.
+                            self.state.tool = .selection
+                            self.state.lastNonTextTool = .selection
+                            let n2 = self.win(canvas.selftestWorldToScreen(CGPoint(x: nodeRects[2].midX, y: nodeRects[2].midY)))
+                            canvas.mouseDown(with: self.mouseEvent(at: n2, type: .leftMouseDown, clickCount: 2))
+                            canvas.mouseUp(with: self.mouseEvent(at: n2, type: .leftMouseUp, clickCount: 2))
+                            canvas.selftestSetText("7")
+                            canvas.selftestCommitEditing()
+                            let texts2 = canvas.selftestNodeTexts(canvas.annotations.count - 1)
+                            if texts2 != ["42", "", "7", ""] {
+                                log("FAIL: node 2 should hold 7, got \(texts2)")
+                                exit(1)
+                            }
+                            log("linked list test: PASS")
+                            log("data structure test: stack/heap/graph/set draw the right node counts")
+                            let shapes: [(Tool, Int)] = [(.stack, 4), (.heap, 7), (.graph, 4), (.set, 3)]
+                            for (tool, nodes) in shapes {
+                                self.state.tool = tool
+                                self.state.lastNonTextTool = .selection
+                                let s1 = self.win(CGPoint(x: 700, y: 900))
+                                let s2 = self.win(CGPoint(x: 1000, y: 1100))
+                                canvas.mouseDown(with: self.mouseEvent(at: s1, type: .leftMouseDown))
+                                canvas.mouseDragged(with: self.mouseEvent(at: s2, type: .leftMouseDragged))
+                                canvas.mouseUp(with: self.mouseEvent(at: s2, type: .leftMouseUp))
+                                guard let shape = canvas.annotations.last, shape.kind == tool.shapeKind else {
+                                    log("FAIL: tool \(tool) should draw \(String(describing: tool.shapeKind))")
+                                    exit(1)
+                                }
+                                let rects = canvas.selftestNodeRects(canvas.annotations.count - 1)
+                                if rects.count != nodes {
+                                    log("FAIL: \(tool) should have \(nodes) nodes, got \(rects.count)")
+                                    exit(1)
+                                }
+                            }
+                            log("data structure test: PASS")
                             log("SELFTEST PASS")
                             exit(0)
                         }

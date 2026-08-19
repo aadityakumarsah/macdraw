@@ -49,7 +49,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sub.addItem(item)
         }
         sub.addItem(.separator())
-        for (name, key) in [("Undo", "⌘Z"), ("Delete selection", "⌫"), ("Close overlay", "Esc")] {
+        for (name, key) in [
+            ("Undo", "⌘Z"), ("Copy selection", "⌘C"), ("Paste", "⌘V"),
+            ("Delete selection", "⌫"), ("Close overlay", "Esc"),
+        ] {
             let item = NSMenuItem(title: "\(name) — \(key)", action: nil, keyEquivalent: "")
             item.isEnabled = false
             sub.addItem(item)
