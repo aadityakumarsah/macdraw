@@ -164,14 +164,43 @@ enum LocalModelRuntime {
                 guard let url = URL(string: endpoint + "/models") else { return "The endpoint URL is invalid." }
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 8
-                let (_, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                     return "Ollama is not responding at \(endpoint)."
                 }
-                return "Connected"
+                let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                let models = payload?["models"] as? [[String: Any]] ?? []
+                let wanted = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+                let available = models.compactMap { $0["name"] as? String }
+                if !wanted.isEmpty && !available.contains(where: { $0 == wanted || $0.hasPrefix(wanted + ":") }) {
+                    return "Ollama connected, but \(wanted) is not downloaded yet."
+                }
+                return "Connected (Ollama)"
+            }
+            if settings.provider != .anthropic {
+                return await healthCheck(settings: settings)
             }
             _ = try await request(prompt: "Return an empty diagram.", settings: settings, maxTokens: 40)
             return "Connected"
+        } catch { return error.localizedDescription }
+    }
+
+    private static func healthCheck(settings: AISettings) async -> String {
+        let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: endpoint + "/models") else { return "The endpoint URL is invalid." }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if !settings.apiKey.isEmpty { request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization") }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return "No response from provider." }
+            guard (200..<300).contains(http.statusCode) else {
+                let text = String(data: data, encoding: .utf8) ?? "Unknown error"
+                return "Provider returned \(http.statusCode): \(text.prefix(180))"
+            }
+            return "Connected (API key accepted)"
         } catch { return error.localizedDescription }
     }
     private static func request(prompt: String, settings: AISettings, maxTokens: Int = 1400) async throws -> String {
@@ -279,25 +308,33 @@ private struct AISettingsView: View {
     @ObservedObject var settings: AISettings
     @State private var testing = false
     @State private var installing = false
+    @State private var setupStatus = ""
     var body: some View { VStack(alignment: .leading, spacing: 8) {
         Picker("Provider", selection: $settings.provider) { ForEach(AIProvider.allCases) { Text($0.rawValue).tag($0) } }.onChange(of: settings.provider) { _, _ in settings.useProviderDefaults() }
         TextField("Endpoint", text: $settings.endpoint).textFieldStyle(.roundedBorder)
         TextField("Model", text: $settings.model).textFieldStyle(.roundedBorder)
         if settings.provider != .local { SecureField("API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder) }
         if settings.provider == .local {
-            Button(installing ? "Setting up…" : "Set up Ollama & pull model") {
-                installing = true
-                settings.testStatus = "Installing Ollama and downloading \(settings.model)…"
-                Task {
-                    do {
-                        try await LocalModelRuntime.setUp(model: settings.model)
-                        let status = await DiagramAI.test(settings: settings)
-                        await MainActor.run { settings.testStatus = status; installing = false }
-                    } catch {
-                        await MainActor.run { settings.testStatus = error.localizedDescription; installing = false }
+            HStack(spacing: 8) {
+                if installing { ProgressView().controlSize(.small) }
+                Button(installing ? "Setting up…" : "Set up Ollama & pull model") {
+                    installing = true
+                    setupStatus = "Checking for Ollama…"
+                    settings.testStatus = "Installing Ollama and downloading \(settings.model)…"
+                    Task {
+                        do {
+                            await MainActor.run { setupStatus = "Starting local runtime and checking model…" }
+                            try await LocalModelRuntime.setUp(model: settings.model)
+                            await MainActor.run { setupStatus = "Testing local connection…" }
+                            let status = await DiagramAI.test(settings: settings)
+                            await MainActor.run { settings.testStatus = status; setupStatus = "Done"; installing = false }
+                        } catch {
+                            await MainActor.run { settings.testStatus = error.localizedDescription; setupStatus = "Setup failed"; installing = false }
+                        }
                     }
-                }
-            }.disabled(installing)
+                }.disabled(installing)
+            }
+            if installing || !setupStatus.isEmpty { Text(setupStatus).font(.system(size: 10)).foregroundStyle(.secondary) }
             Text("Uses local Ollama; setup installs it through Homebrew and pulls the selected model. Prompts never leave localhost.").font(.system(size: 10)).foregroundStyle(.secondary)
         }
         HStack { Button(testing ? "Testing…" : "Test connection") { testing = true; Task { let status = await DiagramAI.test(settings: settings); await MainActor.run { settings.testStatus = status; testing = false } } }.disabled(testing); Text(settings.testStatus).font(.system(size: 11)).foregroundStyle(settings.testStatus == "Connected" ? .green : .secondary) }
