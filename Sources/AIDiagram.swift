@@ -116,18 +116,25 @@ enum KeychainStore {
 /// Installs Ollama through the user's Homebrew setup when needed and pulls the
 /// selected model. The model stays local; Macdraw only talks to its localhost
 /// OpenAI-compatible endpoint afterward.
-enum LocalModelRuntime {
+@MainActor enum LocalModelRuntime {
     private static var server: Process?
 
-    static func setUp(model: String) async throws {
+    struct SetupProgress {
+        let message: String
+        let fraction: Double?
+    }
+
+    static func setUp(model: String, progress: (SetupProgress) -> Void = { _ in }) async throws {
         let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else {
             throw NSError(domain: "MacdrawAI", code: 20, userInfo: [NSLocalizedDescriptionKey: "Enter a local model name first."])
         }
 
+        progress(SetupProgress(message: "Checking for Ollama…", fraction: nil))
         var executable = findExecutable(named: "ollama")
         if executable == nil {
             if let brew = findExecutable(named: "brew") {
+                progress(SetupProgress(message: "Installing Ollama…", fraction: nil))
                 let install = try await run(brew, ["install", "ollama"])
                 guard install.status == 0 else { throw failure("Ollama installation", install) }
                 executable = findExecutable(named: "ollama")
@@ -136,7 +143,7 @@ enum LocalModelRuntime {
                 // official app into the user's Applications directory, which
                 // avoids sudo/password prompts and works for Finder-launched
                 // macdraw processes with a minimal PATH.
-                executable = try await installOfficialOllama()
+                executable = try await installOfficialOllama(progress: progress)
             }
         }
         guard let executable else {
@@ -146,6 +153,7 @@ enum LocalModelRuntime {
         // Ollama may already be running as a menu-bar app or a launch agent.
         // Only start a child process when the local API is not ready.
         if !(await isServerReady()) && server?.isRunning != true {
+            progress(SetupProgress(message: "Starting Ollama…", fraction: nil))
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = ["serve"]
@@ -158,8 +166,9 @@ enum LocalModelRuntime {
             throw NSError(domain: "MacdrawAI", code: 23, userInfo: [NSLocalizedDescriptionKey: "Ollama did not become ready. Open the Ollama app or run `ollama serve`, then try again."])
         }
 
-        let pull = try await run(executable, ["pull", model])
-        guard pull.status == 0 else { throw failure("Model download", pull) }
+        progress(SetupProgress(message: "Preparing \(model)…", fraction: nil))
+        try await pullModel(model, progress: progress)
+        progress(SetupProgress(message: "\(model) is ready.", fraction: 1))
     }
 
     private static func findExecutable(named name: String) -> String? {
@@ -182,7 +191,7 @@ enum LocalModelRuntime {
         return (pathCandidates + fixedCandidates).first { fm.isExecutableFile(atPath: $0) }
     }
 
-    private static func installOfficialOllama() async throws -> String {
+    private static func installOfficialOllama(progress: (SetupProgress) -> Void) async throws -> String {
         guard #available(macOS 14.0, *) else {
             throw NSError(domain: "MacdrawAI", code: 21, userInfo: [NSLocalizedDescriptionKey: "Automatic Ollama installation requires macOS 14 or newer. Open ollama.com/download/mac, install Ollama, then click setup again."])
         }
@@ -191,10 +200,12 @@ enum LocalModelRuntime {
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
 
+        progress(SetupProgress(message: "Downloading Ollama…", fraction: nil))
         let archive = work.appendingPathComponent("Ollama-darwin.zip")
         let download = try await run("/usr/bin/curl", ["--fail", "--location", "--silent", "--show-error", "--output", archive.path, "https://ollama.com/download/Ollama-darwin.zip"])
         guard download.status == 0 else { throw failure("Ollama download", download) }
 
+        progress(SetupProgress(message: "Installing Ollama…", fraction: nil))
         let extracted = work.appendingPathComponent("extracted")
         try fm.createDirectory(at: extracted, withIntermediateDirectories: true)
         let unpack = try await run("/usr/bin/ditto", ["-x", "-k", archive.path, extracted.path])
@@ -210,6 +221,55 @@ enum LocalModelRuntime {
         if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
         try fm.copyItem(at: downloadedApp, to: destination)
         return destination.appendingPathComponent("Contents/Resources/ollama").path
+    }
+
+    private static func pullModel(_ model: String, progress: (SetupProgress) -> Void) async throws {
+        guard let url = URL(string: "http://127.0.0.1:11434/api/pull") else {
+            throw NSError(domain: "MacdrawAI", code: 24, userInfo: [NSLocalizedDescriptionKey: "The local Ollama URL is invalid."])
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60 * 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["model": model, "stream": true])
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "MacdrawAI", code: 25, userInfo: [NSLocalizedDescriptionKey: "No response from Ollama while downloading the model."])
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            var text = ""
+            for try await line in bytes.lines {
+                text += line
+                if text.count > 240 { break }
+            }
+            let detail = text.isEmpty ? "HTTP \(http.statusCode)" : text
+            throw NSError(domain: "MacdrawAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Ollama could not download \(model): \(detail)"])
+        }
+
+        var didSucceed = false
+        for try await line in bytes.lines where !line.isEmpty {
+            guard let data = line.data(using: .utf8),
+                  let update = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let error = update["error"] as? String {
+                throw NSError(domain: "MacdrawAI", code: 26, userInfo: [NSLocalizedDescriptionKey: "Ollama could not download \(model): \(error)"])
+            }
+            let status = update["status"] as? String ?? "Downloading \(model)…"
+            let total = (update["total"] as? NSNumber)?.doubleValue ?? 0
+            let completed = (update["completed"] as? NSNumber)?.doubleValue ?? 0
+            let fraction = total > 0 ? min(1, completed / total) : nil
+            let message: String
+            if let fraction {
+                message = "\(status.capitalized) — \(Int((fraction * 100).rounded()))%"
+            } else {
+                message = status.capitalized
+            }
+            progress(SetupProgress(message: message, fraction: fraction))
+            if status.lowercased() == "success" { didSucceed = true }
+        }
+        guard didSucceed else {
+            throw NSError(domain: "MacdrawAI", code: 27, userInfo: [NSLocalizedDescriptionKey: "Ollama stopped before \(model) finished downloading. Click Download model to try again."])
+        }
     }
 
     private static func isServerReady() async -> Bool {
@@ -275,10 +335,14 @@ enum LocalModelRuntime {
                     return "Ollama is not responding at \(endpoint)."
                 }
                 let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                let models = payload?["models"] as? [[String: Any]] ?? []
+                // Native Ollama uses "models"/"name", while its OpenAI-
+                // compatible /v1/models endpoint uses "data"/"id".
+                let models = (payload?["models"] as? [[String: Any]])
+                    ?? (payload?["data"] as? [[String: Any]])
+                    ?? []
                 let wanted = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
-                let available = models.compactMap { $0["name"] as? String }
-                if !wanted.isEmpty && !available.contains(where: { $0 == wanted || $0.hasPrefix(wanted + ":") }) {
+                let available = models.compactMap { ($0["name"] ?? $0["id"] ?? $0["model"]) as? String }
+                if !wanted.isEmpty && !available.contains(where: { modelNameMatches($0, wanted: wanted) }) {
                     return "Ollama connected, but \(wanted) is not downloaded yet."
                 }
                 return "Connected (Ollama)"
@@ -290,6 +354,15 @@ enum LocalModelRuntime {
             _ = try await request(prompt: "Return an empty diagram.", settings: settings, maxTokens: 40)
             return "Connected"
         } catch { return error.localizedDescription }
+    }
+
+    private static func modelNameMatches(_ available: String, wanted: String) -> Bool {
+        let available = available.trimmingCharacters(in: .whitespacesAndNewlines)
+        let wanted = wanted.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !available.isEmpty, !wanted.isEmpty else { return false }
+        if available == wanted { return true }
+        if !wanted.contains(":") { return available.hasPrefix(wanted + ":") }
+        return false
     }
 
     private static func healthCheck(settings: AISettings) async -> String {
@@ -449,6 +522,7 @@ private struct AISettingsView: View {
     @State private var installing = false
     @State private var setupStatus = ""
     @State private var setupNeedsHelp = false
+    @State private var downloadFraction: Double?
     var body: some View { VStack(alignment: .leading, spacing: 8) {
         Picker("Provider", selection: $settings.provider) { ForEach(AIProvider.allCases) { Text($0.rawValue).tag($0) } }.onChange(of: settings.provider) { _, _ in settings.useProviderDefaults() }
         TextField("Endpoint", text: $settings.endpoint).textFieldStyle(.roundedBorder)
@@ -462,24 +536,15 @@ private struct AISettingsView: View {
         }
         if settings.provider == .local {
             HStack(spacing: 8) {
-                if installing { ProgressView().controlSize(.small) }
-                Button(installing ? "Setting up…" : "Set up Ollama & pull model") {
-                    installing = true
-                    setupNeedsHelp = false
-                    setupStatus = "Checking for Ollama…"
-                    settings.testStatus = "Installing Ollama and downloading \(settings.model)…"
-                    Task {
-                        do {
-                            await MainActor.run { setupStatus = "Starting local runtime and checking model…" }
-                            try await LocalModelRuntime.setUp(model: settings.model)
-                            await MainActor.run { setupStatus = "Testing local connection…" }
-                            let status = await DiagramAI.test(settings: settings)
-                            await MainActor.run { settings.testStatus = status; setupStatus = "Ollama is ready."; installing = false }
-                        } catch {
-                            await MainActor.run { settings.testStatus = "Needs setup"; setupStatus = error.localizedDescription; setupNeedsHelp = true; installing = false }
-                        }
+                if installing {
+                    if let downloadFraction {
+                        ProgressView(value: downloadFraction).frame(width: 72)
+                        Text("\(Int((downloadFraction * 100).rounded()))%").font(.system(size: 10)).monospacedDigit()
+                    } else {
+                        ProgressView().controlSize(.small)
                     }
-                }.disabled(installing)
+                }
+                Button(setupButtonTitle) { setUpOllama() }.disabled(installing)
             }
             if installing || !setupStatus.isEmpty { Text(setupStatus).font(.system(size: 10)).foregroundStyle(setupNeedsHelp ? .orange : .secondary) }
             if setupNeedsHelp {
@@ -503,6 +568,54 @@ private struct AISettingsView: View {
 
     private func openOllamaDownloadPage() {
         if let url = URL(string: "https://ollama.com/download/mac") { NSWorkspace.shared.open(url) }
+    }
+
+    private var modelIsMissing: Bool {
+        settings.testStatus.hasPrefix("Ollama connected, but")
+    }
+
+    private var setupButtonTitle: String {
+        if installing { return "Setting up…" }
+        if modelIsMissing {
+            let model = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            return model.isEmpty ? "Download model" : "Download \(model)"
+        }
+        return "Set up Ollama & pull model"
+    }
+
+    private func setUpOllama() {
+        installing = true
+        setupNeedsHelp = false
+        downloadFraction = nil
+        setupStatus = "Checking for Ollama…"
+        settings.testStatus = "Preparing Ollama…"
+        Task {
+            do {
+                try await LocalModelRuntime.setUp(model: settings.model) { update in
+                    Task { @MainActor in
+                        setupStatus = update.message
+                        downloadFraction = update.fraction
+                    }
+                }
+                await MainActor.run { setupStatus = "Testing local connection…" }
+                let status = await DiagramAI.test(settings: settings)
+                await MainActor.run {
+                    settings.testStatus = status
+                    setupNeedsHelp = !status.hasPrefix("Connected")
+                    setupStatus = status.hasPrefix("Connected") ? "Ollama is ready." : "The model is still unavailable. Click Download model to try again."
+                    downloadFraction = nil
+                    installing = false
+                }
+            } catch {
+                await MainActor.run {
+                    settings.testStatus = "Needs setup"
+                    setupStatus = error.localizedDescription
+                    setupNeedsHelp = true
+                    downloadFraction = nil
+                    installing = false
+                }
+            }
+        }
     }
 }
 
