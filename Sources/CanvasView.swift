@@ -223,7 +223,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private let state: CanvasState
     private let pages: PagesManager
     private(set) var annotations: [Annotation] = [] {
-        didSet { scheduleSave() }
+        didSet {
+            // Transient laser strokes are pruned every timer tick — they must
+            // not invalidate the (laser-less) minimap. Only real content edits
+            // mark the minimap dirty.
+            let old = oldValue.lazy.filter { $0.kind != .laser }.count
+            let new = annotations.lazy.filter { $0.kind != .laser }.count
+            if old != new { minimapDirty = true }
+            scheduleSave()
+        }
     }
     private var undoStack: [[Annotation]] = []
     private var saveWorkItem: DispatchWorkItem?
@@ -2544,12 +2552,212 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return img
     }
 
+    // MARK: - render caches (Excalidraw-style: only re-rasterize what changed)
+
+    private var frameCounter = 0
+    /// Per-element bitmap cache — each annotation is rasterized once (at the
+    /// current zoom) and then blitted on later frames, so panning, zooming,
+    /// the laser fade and live strokes never re-paint the static scene.
+    private var elementCache: [Int: ElementCacheEntry] = [:]
+    private struct ElementCacheEntry {
+        var image: NSImage
+        var pad: CGFloat
+        var fingerprint: Int
+        var renderZoom: CGFloat
+        var lastUsed: Int
+    }
+    /// Path cache — skips rebuilding NSBezierPaths (and connector routing
+    /// inputs) on every frame for elements that haven't changed.
+    private var pathCache: [Int: PathCacheEntry] = [:]
+    private struct PathCacheEntry {
+        var path: NSBezierPath
+        var fingerprint: Int
+        var lastUsed: Int
+    }
+    private var minimapImage: NSImage?
+    private var minimapDirty = true
+    private var cachedMinimapWorld: CGRect?
+    private var cachedMinimapTransform: (scale: CGFloat, origin: CGPoint)?
+
+    /// Combines every render input of an annotation into a stable hash so a
+    /// cached bitmap/path can be reused while the annotation is unchanged.
+    /// Mutations (even in-place `annotations[i].x = y`) always produce a new
+    /// fingerprint, so stale caches are never blitted.
+    private func renderFingerprint(_ a: Annotation) -> Int {
+        var h = Hasher()
+        h.combine(a.kind.rawValue)
+        h.combine(a.rect.origin.x); h.combine(a.rect.origin.y)
+        h.combine(a.rect.width); h.combine(a.rect.height)
+        h.combine(a.rotation)
+        h.combine(a.rx); h.combine(a.ry)
+        h.combine(a.strokeWidth)
+        h.combine(a.fillOpacity)
+        h.combine(a.opacity)
+        h.combine(a.sloppiness); h.combine(a.edgeRoughness)
+        h.combine(a.strokeStyle.rawValue)
+        h.combine(a.arrowStart.rawValue); h.combine(a.arrowEnd.rawValue)
+        h.combine(a.dynamicWidth)
+        h.combine(a.text)
+        h.combine(a.fontFamily)
+        h.combine(a.fontSize)
+        h.combine(a.isCode)
+        h.combine(a.textInside)
+        h.combine(a.textAnchor.rawValue)
+        h.combine(a.textAutoResize)
+        h.combine(a.symbol)
+        h.combine(a.richTextData?.count ?? 0)
+        h.combine(a.nodeTexts)
+        h.combine(a.createdAt)
+        h.combine(state.canvasBackground.rawValue)
+        h.combine(colorHash(a.strokeColor))
+        h.combine(a.fillColor.map { colorHash($0) } ?? -1)
+        if let img = a.image { h.combine(ObjectIdentifier(img).hashValue) } else { h.combine(0) }
+        h.combine(a.points.count)
+        // Long freehand strokes are only ever transformed as a whole after
+        // being finalized, so sampling is a safe, cheap fingerprint.
+        let step = max(1, a.points.count / 128)
+        var i = 0
+        while i < a.points.count {
+            h.combine(a.points[i].x); h.combine(a.points[i].y)
+            i += step
+        }
+        return h.finalize()
+    }
+
+    private func colorHash(_ c: NSColor) -> Int {
+        let s = c.usingColorSpace(.sRGB) ?? c
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
+        s.getRed(&r, green: &g, blue: &b, alpha: &a)
+        var h = Hasher()
+        h.combine(r); h.combine(g); h.combine(b); h.combine(a)
+        return h.finalize()
+    }
+
+    /// Extra world-space room a rotated shape needs so its corners (which can
+    /// swing out past its axis-aligned rect) don't clip at the bitmap edge.
+    private func rotationPad(for a: Annotation) -> CGFloat {
+        guard abs(a.rotation) > 0.001 else { return 0 }
+        let d = sqrt(a.rect.width * a.rect.width + a.rect.height * a.rect.height)
+        return max(d / 2 - min(a.rect.width, a.rect.height) / 2, 0)
+    }
+
+    /// Padding around an element's rect its rendered bitmap must include
+    /// (arrowheads, text overflow, code-block shadow, rotation swing).
+    private func renderPadding(for a: Annotation) -> CGFloat {
+        24 + rotationPad(for: a)
+    }
+
+    private func isRoutedKind(_ kind: ShapeKind) -> Bool {
+        switch kind {
+        case .arrow, .doubleArrow, .curvedConnector, .orthogonal, .connector:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Routed connectors/arrows depend on every other shape's rect (their path
+    /// is obstacle-routed live), so they can never be cached.
+    private func isRoutedElement(_ a: Annotation) -> Bool {
+        a.connectionStart != nil || a.connectionEnd != nil || isRoutedKind(a.kind)
+    }
+
+    /// A cached bitmap stays valid until the zoom drifts ~35% from the zoom it
+    /// was rendered at; between bucket crossings the blit is scaled slightly.
+    private func isZoomCached(_ cached: CGFloat, current: CGFloat) -> Bool {
+        abs(current / cached - 1) <= 0.35
+    }
+
+    private func cachedPath(for a: Annotation, index: Int) -> NSBezierPath {
+        if isRoutedElement(a) { return bezierPath(for: a) }
+        let fp = renderFingerprint(a)
+        if var e = pathCache[index], e.fingerprint == fp {
+            e.lastUsed = frameCounter
+            pathCache[index] = e
+            return e.path
+        }
+        let p = bezierPath(for: a)
+        pathCache[index] = PathCacheEntry(path: p, fingerprint: fp, lastUsed: frameCounter)
+        return p
+    }
+
+    /// Visible annotations in z-order (viewport culling — off-screen elements
+    /// are skipped entirely, which is the big win with dense canvases).
+    private func visibleAnnotations(in worldVisible: CGRect) -> [Int] {
+        var indices: [Int] = []
+        for (i, a) in annotations.enumerated() {
+            guard a.rect.width > 0, a.rect.height > 0 else { continue }
+            let pad = 32 + a.strokeWidth + rotationPad(for: a)
+            let inflated = worldVisible.insetBy(dx: -pad, dy: -pad)
+            if inflated.intersects(a.rect) { indices.append(i) }
+        }
+        return indices.sorted { annotations[$0].zIndex < annotations[$1].zIndex }
+    }
+
+    /// Rasterizes one annotation into its own bitmap at the current zoom and
+    /// backing scale. Returns nil when the element is too large to cache
+    /// cheaply — it is then drawn live instead.
+    private func renderElementBitmap(_ a: Annotation, fingerprint: Int) -> ElementCacheEntry? {
+        let scale = window?.backingScaleFactor ?? 2
+        let pad = renderPadding(for: a)
+        let local = a.rect.insetBy(dx: -pad, dy: -pad)
+        let bw = Int(ceil(local.width * zoom * scale))
+        let bh = Int(ceil(local.height * zoom * scale))
+        guard bw > 1, bh > 1 else { return nil }
+        guard CGFloat(bw) * CGFloat(bh) <= 4_000_000 else { return nil }
+        guard let cg = CGContext(
+            data: nil, width: bw, height: bh,
+            bitsPerComponent: 8, bytesPerRow: bw * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        cg.clear(CGRect(x: 0, y: 0, width: bw, height: bh))
+        // Match the view's flipped (y-down) coordinate system so text and
+        // rotation render exactly as they do on screen.
+        let ctx = NSGraphicsContext(cgContext: cg, flipped: true)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        let s = zoom * scale
+        cg.scaleBy(x: s, y: s)
+        cg.translateBy(x: -local.minX, y: -local.minY)
+        draw(annotation: a, index: -1)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let image = cg.makeImage() else { return nil }
+        let img = NSImage(cgImage: image, size: NSSize(width: local.width * zoom, height: local.height * zoom))
+        return ElementCacheEntry(
+            image: img, pad: pad, fingerprint: fingerprint,
+            renderZoom: zoom, lastUsed: frameCounter
+        )
+    }
+
+    /// Applies the canvas pan/zoom transform, runs `body` in world space.
+    private func drawTransformed(_ body: () -> Void) {
+        let ctx = NSGraphicsContext.current
+        ctx?.saveGraphicsState()
+        let t = NSAffineTransform()
+        t.translateX(by: canvasOffset.x, yBy: canvasOffset.y)
+        t.scale(by: zoom)
+        t.concat()
+        body()
+        ctx?.restoreGraphicsState()
+    }
+
+    private func evictCaches() {
+        if elementCache.count > 1024 {
+            elementCache = elementCache.filter { $0.value.lastUsed > frameCounter - 2 }
+        }
+        if pathCache.count > max(512, annotations.count * 2) {
+            pathCache.removeAll()
+        }
+    }
+
     // MARK: - drawing
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        guard let ctx = NSGraphicsContext.current else { return }
+        guard NSGraphicsContext.current != nil else { return }
+        frameCounter += 1
 
         // Solid backdrop — "writing on a white/black screen" mode.
         switch state.canvasBackground {
@@ -2563,79 +2771,121 @@ final class CanvasView: NSView, NSTextViewDelegate {
             break
         }
 
-        ctx.saveGraphicsState()
-        let t = NSAffineTransform()
-        t.translateX(by: canvasOffset.x, yBy: canvasOffset.y)
-        t.scale(by: zoom)
-        t.concat()
+        // Only elements that actually intersect the viewport are painted.
+        let sortedVisible = visibleAnnotations(in: screenToWorld(bounds))
+        var sceneChanged = editingView != nil
 
-        // Sort annotations by z-index for proper layering
-        let sortedAnnotations = annotations.enumerated().sorted { $0.element.zIndex < $1.element.zIndex }
-        for (i, a) in sortedAnnotations {
-            draw(annotation: a, index: i)
-        }
-
-        if let c = current, c.kind != .text, c.kind != .image {
-            draw(annotation: c, index: -1)
-        }
-
-        if lassoPoly.count > 1 {
-            let path = NSBezierPath()
-            path.move(to: lassoPoly[0])
-            for p in lassoPoly.dropFirst() { path.line(to: p) }
-            path.close()
-            NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.18).setFill()
-            path.fill()
-            NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.9).setStroke()
-            path.lineWidth = 1.5
-            path.setLineDash([6, 4], count: 2, phase: 0)
-            path.stroke()
-        }
-
-        // Box/marquee selection rectangle, drawn while dragging.
-        if marqueeRect.width > 1 || marqueeRect.height > 1 {
-            let path = NSBezierPath(rect: marqueeRect)
-            NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.08).setFill()
-            path.fill()
-            NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.9).setStroke()
-            path.lineWidth = 1.5
-            path.setLineDash([6, 4], count: 2, phase: 0)
-            path.stroke()
-        }
-
-        if let sel = selected.first, sel >= 0, sel < annotations.count {
-            drawSelectionOverlay(for: annotations[sel])
-        }
-
-        // Connection dots on box edges for connector tools — grab one to
-        // glue a line to that box. The grabbed dot and the hovered target
-        // dot are highlighted.
-        if isConnectorTool(state.tool) {
-            var dotShapes: Set<Int> = []
-            if let i = hoverShapeIndex { dotShapes.insert(i) }
-            if let c = current, let cs = c.connectionStart { dotShapes.insert(cs.annotationIndex) }
-            for i in dotShapes where annotations.indices.contains(i) {
-                let a = annotations[i]
-                guard isClosed(a.kind), a.kind != .laser else { continue }
-                for (side, p) in connectionDots(for: a) {
-                    let isSource = current?.connectionStart?.annotationIndex == i && current?.connectionStart?.side == side
-                    let isTarget = hoverShapeIndex == i && hoverSide == side && current != nil
-                    if isSource || isTarget {
-                        NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).setFill()
-                        NSBezierPath(ovalIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10)).fill()
-                        NSColor.white.setStroke()
-                        let ring = NSBezierPath(ovalIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10))
-                        ring.lineWidth = 1.5
-                        ring.stroke()
-                    } else {
-                        NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.55).setFill()
-                        NSBezierPath(ovalIn: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8)).fill()
+        for i in sortedVisible {
+            let a = annotations[i]
+            if isRoutedElement(a) || a.kind == .laser {
+                // Routed connectors depend on every shape; lasers animate —
+                // both are always drawn live, never cached.
+                if a.kind != .laser { sceneChanged = true }
+                drawTransformed {
+                    draw(annotation: a, index: i)
+                    if selected.contains(i) { drawSelectionBox(a) }
+                }
+                continue
+            }
+            // While its edit field is open the annotation's old content is
+            // hidden under the field — never blit a stale cached bitmap.
+            if editingView != nil, editingIndex == i {
+                drawTransformed { draw(annotation: a, index: i) }
+                continue
+            }
+            let fp = renderFingerprint(a)
+            if var e = elementCache[i],
+               e.fingerprint == fp,
+               isZoomCached(e.renderZoom, current: zoom) {
+                e.lastUsed = frameCounter
+                elementCache[i] = e
+                e.image.draw(in: worldToScreen(a.rect.insetBy(dx: -e.pad, dy: -e.pad)))
+                if selected.contains(i) {
+                    drawTransformed { drawSelectionBox(a) }
+                }
+            } else {
+                sceneChanged = true
+                if let entry = renderElementBitmap(a, fingerprint: fp) {
+                    elementCache[i] = entry
+                    entry.image.draw(in: worldToScreen(a.rect.insetBy(dx: -entry.pad, dy: -entry.pad)))
+                    if selected.contains(i) {
+                        drawTransformed { drawSelectionBox(a) }
+                    }
+                } else {
+                    drawTransformed {
+                        draw(annotation: a, index: i)
+                        if selected.contains(i) { drawSelectionBox(a) }
                     }
                 }
             }
         }
 
-        ctx.restoreGraphicsState()
+        // Transient interaction UI — the in-progress stroke, lasso, marquee,
+        // selection overlay and connector dots — drawn live on top.
+        drawTransformed {
+            if let c = current, c.kind != .text, c.kind != .image {
+                draw(annotation: c, index: -1)
+            }
+
+            if lassoPoly.count > 1 {
+                let path = NSBezierPath()
+                path.move(to: lassoPoly[0])
+                for p in lassoPoly.dropFirst() { path.line(to: p) }
+                path.close()
+                NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.18).setFill()
+                path.fill()
+                NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.9).setStroke()
+                path.lineWidth = 1.5
+                path.setLineDash([6, 4], count: 2, phase: 0)
+                path.stroke()
+            }
+
+            // Box/marquee selection rectangle, drawn while dragging.
+            if marqueeRect.width > 1 || marqueeRect.height > 1 {
+                let path = NSBezierPath(rect: marqueeRect)
+                NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.08).setFill()
+                path.fill()
+                NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.9).setStroke()
+                path.lineWidth = 1.5
+                path.setLineDash([6, 4], count: 2, phase: 0)
+                path.stroke()
+            }
+
+            if let sel = selected.first, sel >= 0, sel < annotations.count {
+                drawSelectionOverlay(for: annotations[sel])
+            }
+
+            // Connection dots on box edges for connector tools — grab one to
+            // glue a line to that box. The grabbed dot and the hovered target
+            // dot are highlighted.
+            if isConnectorTool(state.tool) {
+                var dotShapes: Set<Int> = []
+                if let i = hoverShapeIndex { dotShapes.insert(i) }
+                if let c = current, let cs = c.connectionStart { dotShapes.insert(cs.annotationIndex) }
+                for i in dotShapes where annotations.indices.contains(i) {
+                    let a = annotations[i]
+                    guard isClosed(a.kind), a.kind != .laser else { continue }
+                    for (side, p) in connectionDots(for: a) {
+                        let isSource = current?.connectionStart?.annotationIndex == i && current?.connectionStart?.side == side
+                        let isTarget = hoverShapeIndex == i && hoverSide == side && current != nil
+                        if isSource || isTarget {
+                            NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).setFill()
+                            NSBezierPath(ovalIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10)).fill()
+                            NSColor.white.setStroke()
+                            let ring = NSBezierPath(ovalIn: CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10))
+                            ring.lineWidth = 1.5
+                            ring.stroke()
+                        } else {
+                            NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 0.55).setFill()
+                            NSBezierPath(ovalIn: CGRect(x: p.x - 4, y: p.y - 4, width: 8, height: 8)).fill()
+                        }
+                    }
+                }
+            }
+        }
+
+        if sceneChanged { minimapDirty = true }
+        evictCaches()
 
         if state.drawingMode {
             drawMinimap()
@@ -2675,8 +2925,81 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     private func drawMinimap() {
-        guard minimapVisible, minimapWorldRect() != nil else { return }
+        guard minimapVisible else { return }
+        if minimapDirty || minimapImage == nil { rebuildMinimapImage() }
+        guard let img = minimapImage else { return }
         let r = minimapRect()
+        img.draw(in: r)
+
+        // Viewport indicator — what's currently on screen. Drawn live because
+        // it moves with pan/zoom while the minimap image stays cached.
+        guard let wr = cachedMinimapWorld,
+              let (scale, origin) = cachedMinimapTransform else { return }
+        func mini(_ world: CGPoint) -> CGPoint {
+            CGPoint(x: origin.x + (world.x - wr.minX) * scale,
+                    y: origin.y + (world.y - wr.minY) * scale)
+        }
+        NSGraphicsContext.current?.saveGraphicsState()
+        let clip = NSBezierPath(roundedRect: r.insetBy(dx: 6, dy: 6), xRadius: 7, yRadius: 7)
+        clip.addClip()
+        let viewport = screenToWorld(bounds)
+        let vpTL = mini(CGPoint(x: viewport.minX, y: viewport.minY))
+        let vpBR = mini(CGPoint(x: viewport.maxX, y: viewport.maxY))
+        let vp = CGRect(x: vpTL.x, y: vpTL.y, width: vpBR.x - vpTL.x, height: vpBR.y - vpTL.y)
+        NSColor(calibratedRed: 0.55, green: 0.51, blue: 0.98, alpha: 0.35).setFill()
+        NSBezierPath(rect: vp).fill()
+        NSColor(calibratedRed: 0.78, green: 0.74, blue: 1, alpha: 0.95).setStroke()
+        let vpPath = NSBezierPath(rect: vp)
+        vpPath.lineWidth = 1.5
+        vpPath.stroke()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
+    /// Renders the whole-drawing miniature into a bitmap once, reused every
+    /// frame until an annotation changes (set `minimapDirty`).
+    private func rebuildMinimapImage() {
+        guard minimapVisible else {
+            minimapImage = nil
+            minimapDirty = true
+            return
+        }
+        guard let wr = minimapWorldRect() else {
+            minimapImage = nil
+            cachedMinimapWorld = nil
+            cachedMinimapTransform = nil
+            minimapDirty = true
+            return
+        }
+        cachedMinimapWorld = wr
+        cachedMinimapTransform = minimapTransform()
+
+        let backing = window?.backingScaleFactor ?? 2
+        let r = minimapRect()
+        let bw = Int(ceil(r.width * backing)), bh = Int(ceil(r.height * backing))
+        guard bw > 1, bh > 1,
+              let cg = CGContext(
+                  data: nil, width: bw, height: bh,
+                  bitsPerComponent: 8, bytesPerRow: bw * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else { return }
+        cg.clear(CGRect(x: 0, y: 0, width: bw, height: bh))
+        let ctx = NSGraphicsContext(cgContext: cg, flipped: true)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        cg.scaleBy(x: backing, y: backing)
+        cg.translateBy(x: -r.minX, y: -r.minY)
+        drawMinimapContent(r: r)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let image = cg.makeImage() else { return }
+        let img = NSImage(cgImage: image, size: minimapSize)
+        minimapImage = img
+        minimapDirty = false
+    }
+
+    /// The static part of the minimap — panel background + every annotation
+    /// drawn simplified. Runs inside the cached bitmap's context.
+    private func drawMinimapContent(r: CGRect) {
         let bg = NSBezierPath(roundedRect: r, xRadius: 10, yRadius: 10)
         NSColor(calibratedWhite: 0.07, alpha: 0.82).setFill()
         bg.fill()
@@ -2684,8 +3007,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         bg.lineWidth = 1
         bg.stroke()
 
-        guard let (scale, origin) = minimapTransform(),
-              let wr = minimapWorldRect() else { return }
+        guard let (scale, origin) = cachedMinimapTransform,
+              let wr = cachedMinimapWorld else { return }
         func mini(_ world: CGPoint) -> CGPoint {
             CGPoint(x: origin.x + (world.x - wr.minX) * scale,
                     y: origin.y + (world.y - wr.minY) * scale)
@@ -2724,26 +3047,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 NSBezierPath(rect: miniRect).stroke()
             }
         }
-
-        // Viewport indicator — what's currently on screen.
-        let viewport = screenToWorld(bounds)
-        let vpTL = mini(CGPoint(x: viewport.minX, y: viewport.minY))
-        let vpBR = mini(CGPoint(x: viewport.maxX, y: viewport.maxY))
-        let vp = CGRect(x: vpTL.x, y: vpTL.y, width: vpBR.x - vpTL.x, height: vpBR.y - vpTL.y)
-        NSColor(calibratedRed: 0.55, green: 0.51, blue: 0.98, alpha: 0.35).setFill()
-        NSBezierPath(rect: vp).fill()
-        NSColor(calibratedRed: 0.78, green: 0.74, blue: 1, alpha: 0.95).setStroke()
-        let vpPath = NSBezierPath(rect: vp)
-        vpPath.lineWidth = 1.5
-        vpPath.stroke()
         NSGraphicsContext.current?.restoreGraphicsState()
     }
 
     /// Pans the canvas so the world point under a minimap click lands at the
     /// center of the screen.
     private func panToMinimap(_ p: CGPoint) {
-        guard let (scale, origin) = minimapTransform(),
-              let wr = minimapWorldRect() else { return }
+        if cachedMinimapTransform == nil { rebuildMinimapImage() }
+        guard let (scale, origin) = cachedMinimapTransform,
+              let wr = cachedMinimapWorld else { return }
         let world = CGPoint(
             x: wr.minX + (p.x - origin.x) / scale,
             y: wr.minY + (p.y - origin.y) / scale
@@ -2779,7 +3091,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .laser:
             drawLaser(a)
         default:
-            let path = bezierPath(for: a)
+            let path = cachedPath(for: a, index: index)
             if let fill = a.fillColor, shouldFill(a), a.kind != .set {
                 // Apply fill opacity
                 var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a_comp: CGFloat = 1
@@ -2845,16 +3157,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 drawDataStructureTexts(a)
             }
         }
+    }
 
-        if selected.contains(index) {
-            let outline = a.rect.insetBy(dx: -4, dy: -4)
-            let sel = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1)
-            sel.setStroke()
-            let op = NSBezierPath(rect: outline)
-            op.lineWidth = 1.5
-            op.setLineDash([5, 3], count: 2, phase: 0)
-            op.stroke()
-        }
+    /// Dashed blue outline shown around every selected annotation — drawn live
+    /// so it stays crisp on top of cached element bitmaps.
+    private func drawSelectionBox(_ a: Annotation) {
+        let outline = a.rect.insetBy(dx: -4, dy: -4)
+        let sel = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1)
+        sel.setStroke()
+        let op = NSBezierPath(rect: outline)
+        op.lineWidth = 1.5
+        op.setLineDash([5, 3], count: 2, phase: 0)
+        op.stroke()
     }
 
     // MARK: - pressure (dynamic width) strokes
@@ -4694,7 +5008,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let a = annotations[bestIndex]
         let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
         let local = rotatedPoint(p, around: center, by: -a.rotation)
-        let boundary = flattenedPoints(bezierPath(for: a), step: 3)
+        let boundary = flattenedPoints(cachedPath(for: a, index: bestIndex), step: 3)
         guard !boundary.isEmpty else { return nil }
         var bestPt = boundary[0]
         var bestD = distance(local, bestPt)
@@ -4964,7 +5278,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             guard isClosed(a.kind), a.kind != .laser, a.rect.width > 0, a.rect.height > 0 else { continue }
             let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
             let local = rotatedPoint(p, around: center, by: -a.rotation)
-            for q in flattenedPoints(bezierPath(for: a), step: 3) {
+            for q in flattenedPoints(cachedPath(for: a, index: i), step: 3) {
                 let d = distance(local, q)
                 if d < bestDist {
                     bestDist = d
@@ -5025,7 +5339,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points) { return i }
                 fallthrough
             default:
-                let path = bezierPath(for: a)
+                let path = cachedPath(for: a, index: i)
                 if path.contains(localP) { return i }
                 let threshold = max(10, a.strokeWidth / 2 + 6)
                 if distanceToPath(localP, path) < threshold { return i }
