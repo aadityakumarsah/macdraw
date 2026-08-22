@@ -1294,7 +1294,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
         editingFontFamily = family
         editingWorldFontSize = size
         self.editingIndex = editingIndex
-        editingTextAutoResize = existing?.textAutoResize ?? true
+        // Code blocks should begin at a practical readable width and wrap
+        // long lines. Letting them auto-grow horizontally makes their height
+        // calculation appear to stop after the visible rows.
+        editingTextAutoResize = existing?.isCode == true
+            ? false
+            : (existing?.textAutoResize ?? !code)
         if let idx = editingIndex, annotations.indices.contains(idx),
            isDataStructure(annotations[idx].kind) {
             // Editing a data-structure shape: the click picks which node's
@@ -1573,10 +1578,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     /// Makes the edit field and its canvas rectangle agree on exactly the
-    /// same measured content.  Free text grows horizontally (and vertically
-    /// for explicit newlines); horizontally resized text retains that width
-    /// and wraps.  This prevents the editor from clipping characters that the
-    /// renderer thinks are outside the stored rectangle.
+    /// same measured content. Long plain text and code wrap at a readable
+    /// maximum width, then grow vertically to include every row. Measuring
+    /// with NSTextView's current container height only reports laid-out,
+    /// visible rows, so never use that for the document's final height.
     private func resizeEditingFieldToFitContent(_ tv: NSTextView) {
         let isStandaloneText = editingIndex.map {
             annotations.indices.contains($0) && annotations[$0].kind == .text
@@ -1584,7 +1589,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         guard isStandaloneText else { return }
 
         var frame = tv.frame
-        let inset = tv.textContainerInset.width * 2
+        let horizontalInset = tv.textContainerInset.width * 2
         if editingTextAutoResize {
             let storage: NSAttributedString
             if let textStorage = tv.textStorage {
@@ -1598,15 +1603,22 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 with: CGSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading]
             )
-            frame.size.width = max(60, ceil(natural.width) + ceil(inset) + 2)
+            // Avoid an off-screen one-line editor for pasted paragraphs while
+            // retaining natural sizing for short labels.
+            let maxWidth = max(240, min(720, bounds.width - 48))
+            frame.size.width = max(60, min(maxWidth, ceil(natural.width) + ceil(horizontalInset) + 2))
         }
 
-        tv.frame = frame
-        guard let layoutManager = tv.layoutManager, let container = tv.textContainer else { return }
-        layoutManager.ensureLayout(for: container)
-        let used = layoutManager.usedRect(for: container)
-        frame = tv.frame
-        frame.size.height = max(34, ceil(used.height) + tv.textContainerInset.height * 2 + 2)
+        let storage = tv.textStorage ?? NSAttributedString(
+            string: tv.string,
+            attributes: [.font: tv.font ?? Fonts.nsFont(for: state.fontFamily, size: state.fontSize * zoom)]
+        )
+        let textWidth = max(1, frame.width - horizontalInset)
+        let measured = storage.boundingRect(
+            with: CGSize(width: textWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        frame.size.height = max(34, ceil(measured.height) + tv.textContainerInset.height * 2 + 2)
         tv.frame = frame
 
         // Existing text (and eagerly-created code) must be updated while the
@@ -1975,16 +1987,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return nil
         }
 
-        let font = tv.font ?? Fonts.nsFont(for: family, size: size)
         let width = max(60, tv.frame.width)
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        let bounds = (str as NSString).boundingRect(
-            with: NSSize(width: width, height: 100_000),
+        let contentWidth = max(1, width - tv.textContainerInset.width * 2)
+        let textBounds = tv.attributedString().boundingRect(
+            with: NSSize(width: contentWidth, height: .greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: attrs
         )
         var r = tv.frame
-        r.size = CGSize(width: width, height: max(bounds.height, size * 1.4))
+        r.size = CGSize(
+            width: width,
+            height: max(34, ceil(textBounds.height) + tv.textContainerInset.height * 2 + 2)
+        )
         // The field lives in screen space; the annotation is stored in world
         // points, so convert back before committing.
         let worldRect = screenToWorld(r)
@@ -3529,8 +3542,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
         switch a.kind {
         case .text:
-            // Horizontal resize: change width only, keep font size constant
-            // Vertical resize: change font size based on height change
+            // Text handles resize the text area, never the font. Scaling on
+            // the y-axis made every glyph huge when a user simply wanted to
+            // reveal more rows of a long document.
             let horizontalHandles: [ResizeHandle] = [.midLeft, .midRight]
             let verticalHandles: [ResizeHandle] = [.topMid, .bottomMid]
             let cornerHandles: [ResizeHandle] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
@@ -3543,19 +3557,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 let h = measuredTextHeight(for: a, width: newRect.width)
                 a.rect = CGRect(x: newRect.minX, y: orig.minY, width: newRect.width, height: h)
             } else if verticalHandles.contains(handle) {
-                // Only change font size, keep width
-                let sy = newRect.height / max(1, orig.height)
-                a.fontSize = max(6, min(300, a.fontSize * sy))
-                a.richTextData = scaledRichTextData(a.richTextData, by: sy)
-                a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: measuredTextHeight(for: a, width: orig.width))
-            } else if cornerHandles.contains(handle) {
-                // Corner handles: change both
-                let sx = newRect.width / max(1, orig.width)
-                let sy = newRect.height / max(1, orig.height)
-                a.fontSize = max(6, min(300, a.fontSize * max(sx, sy)))
-                a.richTextData = scaledRichTextData(a.richTextData, by: max(sx, sy))
                 a.textAutoResize = false
-                a.rect = CGRect(x: newRect.minX, y: newRect.minY, width: newRect.width, height: measuredTextHeight(for: a, width: newRect.width))
+                a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: newRect.height)
+            } else if cornerHandles.contains(handle) {
+                // Corners resize the box while retaining the selected font.
+                a.textAutoResize = false
+                a.rect = newRect
             }
         case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             let fixedX: CGFloat

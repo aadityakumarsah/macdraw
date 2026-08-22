@@ -3,7 +3,7 @@ import Combine
 
 /// The version this build reports. The GitHub release must be tagged
 /// `v<appVersion>` (e.g. `v1.9.0`) for the update check to work.
-let appVersion = "1.11.2"
+let appVersion = "1.11.3"
 
 /// The GitHub repository the update check talks to. Releases should attach a
 /// `macdraw-v<version>.zip` (produced by build.sh) containing macdraw.app.
