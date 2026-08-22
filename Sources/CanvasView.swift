@@ -2557,17 +2557,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let scale: CGFloat = 2
         let w = Int(r.width * scale), h = Int(r.height * scale)
         guard w > 1, h > 1,
-              let rep = NSBitmapImageRep(
-                  bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
-                  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-                  isPlanar: false, colorSpaceName: .deviceRGB,
-                  bytesPerRow: 0, bitsPerPixel: 0
+              let cg = CGContext(
+                  data: nil, width: w, height: h,
+                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else { return nil }
         NSGraphicsContext.saveGraphicsState()
-        guard let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
-            NSGraphicsContext.restoreGraphicsState()
-            return nil
-        }
+        // `isFlipped` is as important as the CTM below: AppKit uses it when
+        // laying out glyphs. A y-flipped bitmap context marked unflipped
+        // makes committed text (and copied text) appear inverted.
+        let ctx = NSGraphicsContext(cgContext: cg, flipped: true)
         NSGraphicsContext.current = ctx
         // The canvas is flipped (y down); bitmap contexts are not — flip so
         // the render matches what the user sees on screen.
@@ -2580,9 +2580,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             draw(annotation: a, index: -1)
         }
         NSGraphicsContext.restoreGraphicsState()
-        let img = NSImage(size: NSSize(width: w, height: h))
-        img.addRepresentation(rep)
-        return img
+        guard let image = cg.makeImage() else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: r.width, height: r.height))
     }
 
     // MARK: - render caches (Excalidraw-style: only re-rasterize what changed)
@@ -2755,14 +2754,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let bh = Int(ceil(local.height * zoom * scale))
         guard bw > 1, bh > 1 else { return nil }
         guard CGFloat(bw) * CGFloat(bh) <= 4_000_000 else { return nil }
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: bw, pixelsHigh: bh,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-            isPlanar: false, colorSpaceName: .deviceRGB,
-            bytesPerRow: 0, bitsPerPixel: 0
-        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        guard let cg = CGContext(
+            data: nil, width: bw, height: bh,
+            bitsPerComponent: 8, bytesPerRow: bw * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
         NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = ctx
+        // The explicit CTM gives the backing bitmap the canvas's y-down
+        // geometry; `flipped: true` also gives AppKit the matching text
+        // layout semantics. Both are required for final cached text to match
+        // the live NSTextView exactly.
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: cg, flipped: true)
         // Bitmap contexts are y-up while CanvasView is y-down. Use the same
         // explicit transform as clipboard rendering, rather than relying on
         // NSGraphicsContext's flipped flag (which differs for bitmap-backed
@@ -2776,8 +2779,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         t.concat()
         draw(annotation: a, index: -1)
         NSGraphicsContext.restoreGraphicsState()
-        let img = NSImage(size: NSSize(width: local.width * zoom, height: local.height * zoom))
-        img.addRepresentation(rep)
+        guard let image = cg.makeImage() else { return nil }
+        let img = NSImage(cgImage: image, size: NSSize(width: local.width * zoom, height: local.height * zoom))
         return ElementCacheEntry(
             image: img, pad: pad, fingerprint: fingerprint,
             renderZoom: zoom, lastUsed: frameCounter
