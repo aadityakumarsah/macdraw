@@ -225,11 +225,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private(set) var annotations: [Annotation] = [] {
         didSet {
             // Transient laser strokes are pruned every timer tick — they must
-            // not invalidate the (laser-less) minimap. Only real content edits
-            // mark the minimap dirty.
-            let old = oldValue.lazy.filter { $0.kind != .laser }.count
-            let new = annotations.lazy.filter { $0.kind != .laser }.count
-            if old != new { minimapDirty = true }
+            // not invalidate the (laser-less) minimap. Geometry/style changes
+            // to real content do, including moves and rotations (not merely
+            // insertions/removals as before).
+            if minimapFingerprint(oldValue) != minimapFingerprint(annotations) {
+                minimapDirty = true
+            }
             scheduleSave()
         }
     }
@@ -265,6 +266,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var rotateIndex: Int?
     private var rotateStartPoint: CGPoint = .zero
     private var rotateBaseRotation: CGFloat = 0
+    /// Snapshot captured before a move/resize/rotate.  The old implementation
+    /// captured undo after mutating the annotation, which made an interaction
+    /// impossible to undo and could leave a partially transformed element
+    /// behind when input was interrupted.
+    private var interactionUndoSnapshot: [Annotation]?
+    private var interactionChanged = false
     private var lassoPoly: [CGPoint] = []
     private var marqueeStart: CGPoint?
     private var marqueeRect: CGRect = .zero
@@ -410,6 +417,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Zooms the canvas by `factor` around `screenPoint` (keeps the world
     /// point under the cursor fixed). Also used for keyboard zoom.
     private func zoomCanvas(by factor: CGFloat, around screenPoint: CGPoint) {
+        guard factor.isFinite, factor > 0 else { return }
         let newZoom = min(8, max(0.15, zoom * factor))
         let actual = newZoom / zoom
         guard abs(actual - 1) > 0.001 else { return }
@@ -418,6 +426,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
         zoom = newZoom
         syncEditingView()
         needsDisplay = true
+    }
+
+    private func beginTransformInteraction() {
+        interactionUndoSnapshot = annotations
+        interactionChanged = false
+    }
+
+    private func finishTransformInteraction() {
+        defer { interactionUndoSnapshot = nil; interactionChanged = false }
+        guard interactionChanged, let snapshot = interactionUndoSnapshot else { return }
+        undoStack.append(snapshot)
+        if undoStack.count > 50 { undoStack.removeFirst() }
     }
 
     /// Resets zoom to 100% and centers the canvas back at the screen origin.
@@ -574,9 +594,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
             guard let self else { return }
             guard self.annotations.contains(where: { $0.kind == .laser }) else { return }
             let gone = Date().addingTimeInterval(-(self.laserFadeStart + self.laserFadeDuration))
-            self.annotations.removeAll { laser in
+            let expired = self.annotations.contains { laser in
                 laser.kind == .laser
                     && (laser.pointTimes.last ?? laser.createdAt) < gone
+            }
+            if expired {
+                self.annotations.removeAll { laser in
+                    laser.kind == .laser
+                        && (laser.pointTimes.last ?? laser.createdAt) < gone
+                }
             }
             // Redraw every tick while a laser exists so the fade animates.
             self.needsDisplay = true
@@ -772,12 +798,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if let sel = selected.first, sel < annotations.count {
                 let a = annotations[sel]
                 if rotateHandle(at: adjustedP, for: a) {
+                    beginTransformInteraction()
                     rotateIndex = sel
                     rotateStartPoint = adjustedP
                     rotateBaseRotation = a.rotation
                     movingOriginals = [:]
                 } else if let h = handle(at: adjustedP, for: a) {
                     // Dragging a handle of the currently selected shape resizes it.
+                    beginTransformInteraction()
                     resizeIndex = sel
                     resizeHandle = h
                     resizeOriginal = annotations[sel]
@@ -789,12 +817,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
                         movingOriginals = Dictionary(uniqueKeysWithValues: selected.compactMap { s in
                             annotations.indices.contains(s) ? (s, annotations[s]) : nil
                         })
+                        beginTransformInteraction()
                     } else if event.modifierFlags.contains(.shift) {
                         selected.insert(i)
                         movingOriginals = [i: annotations[i]]
+                        beginTransformInteraction()
                     } else {
                         selected = [i]
                         movingOriginals = [i: annotations[i]]
+                        beginTransformInteraction()
                     }
                 } else {
                     // Clicking empty space starts a marquee (box) selection.
@@ -811,12 +842,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     movingOriginals = Dictionary(uniqueKeysWithValues: selected.compactMap { s in
                         annotations.indices.contains(s) ? (s, annotations[s]) : nil
                     })
+                    beginTransformInteraction()
                 } else if event.modifierFlags.contains(.shift) {
                     selected.insert(i)
                     movingOriginals = [i: annotations[i]]
+                    beginTransformInteraction()
                 } else {
                     selected = [i]
                     movingOriginals = [i: annotations[i]]
+                    beginTransformInteraction()
                 }
             } else {
                 // Clicking empty space starts a marquee (box) selection.
@@ -935,14 +969,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 let startAngle = atan2(rotateStartPoint.y - center.y, rotateStartPoint.x - center.x)
                 let currentAngle = atan2(adjustedP.y - center.y, adjustedP.x - center.x)
                 annotations[i].rotation = rotateBaseRotation + (currentAngle - startAngle)
+                interactionChanged = true
             } else if let i = resizeIndex, let h = resizeHandle, let orig = resizeOriginal {
                 annotations[i] = resizedAnnotation(orig, handle: h, p: adjustedP, selfIndex: i)
+                interactionChanged = true
             } else if !movingOriginals.isEmpty {
                 let delta = adjustedP - dragStart
                 for (i, orig) in movingOriginals {
                     annotations[i].rect.origin = orig.rect.origin + delta
                     annotations[i].points = orig.points.map { $0 + delta }
                 }
+                interactionChanged = true
             }
         case .hand:
             canvasOffset = dragOriginOffset + (p - dragStart)
@@ -1034,19 +1071,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     needsDisplay = true
                 }
             } else if rotateIndex != nil {
-                if distance(dragStart, adjustedP) > 1 {
-                    pushUndo()
-                }
+                finishTransformInteraction()
                 rotateIndex = nil
             } else if resizeIndex != nil {
-                if distance(dragStart, adjustedP) > 1 {
-                    pushUndo()
-                }
+                finishTransformInteraction()
                 resizeIndex = nil
                 resizeHandle = nil
                 resizeOriginal = nil
-            } else if !movingOriginals.isEmpty, distance(dragStart, adjustedP) > 1 {
-                pushUndo()
+            } else if !movingOriginals.isEmpty {
+                finishTransformInteraction()
             }
             movingOriginals = [:]
             scheduleSave()
@@ -2579,6 +2612,23 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var cachedMinimapWorld: CGRect?
     private var cachedMinimapTransform: (scale: CGFloat, origin: CGPoint)?
 
+    /// Hash only the information the minimap represents. This keeps laser
+    /// animation from rebuilding it, while ensuring move/resize/rotate/style
+    /// edits never leave a stale viewport preview behind.
+    private func minimapFingerprint(_ items: [Annotation]) -> Int {
+        var h = Hasher()
+        for a in items where a.kind != .laser {
+            h.combine(a.kind.rawValue)
+            h.combine(a.rect.origin.x); h.combine(a.rect.origin.y)
+            h.combine(a.rect.width); h.combine(a.rect.height)
+            h.combine(a.rotation); h.combine(a.strokeWidth); h.combine(a.fillOpacity)
+            h.combine(a.zIndex); h.combine(colorHash(a.strokeColor))
+            h.combine(a.fillColor.map { colorHash($0) } ?? -1)
+            for p in a.points { h.combine(p.x); h.combine(p.y) }
+        }
+        return h.finalize()
+    }
+
     /// Combines every render input of an annotation into a stable hash so a
     /// cached bitmap/path can be reused while the annotation is unchanged.
     /// Mutations (even in-place `annotations[i].x = y`) always produce a new
@@ -2605,7 +2655,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         h.combine(a.textAnchor.rawValue)
         h.combine(a.textAutoResize)
         h.combine(a.symbol)
-        h.combine(a.richTextData?.count ?? 0)
+        h.combine(a.richTextData)
         h.combine(a.nodeTexts)
         h.combine(a.createdAt)
         h.combine(state.canvasBackground.rawValue)
@@ -2705,25 +2755,29 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let bh = Int(ceil(local.height * zoom * scale))
         guard bw > 1, bh > 1 else { return nil }
         guard CGFloat(bw) * CGFloat(bh) <= 4_000_000 else { return nil }
-        guard let cg = CGContext(
-            data: nil, width: bw, height: bh,
-            bitsPerComponent: 8, bytesPerRow: bw * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        cg.clear(CGRect(x: 0, y: 0, width: bw, height: bh))
-        // Match the view's flipped (y-down) coordinate system so text and
-        // rotation render exactly as they do on screen.
-        let ctx = NSGraphicsContext(cgContext: cg, flipped: true)
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: bw, pixelsHigh: bh,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+            isPlanar: false, colorSpaceName: .deviceRGB,
+            bytesPerRow: 0, bitsPerPixel: 0
+        ), let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ctx
+        // Bitmap contexts are y-up while CanvasView is y-down. Use the same
+        // explicit transform as clipboard rendering, rather than relying on
+        // NSGraphicsContext's flipped flag (which differs for bitmap-backed
+        // contexts and was causing finalized cached elements to appear
+        // vertically inverted/rotated relative to the live stroke).
         let s = zoom * scale
-        cg.scaleBy(x: s, y: s)
-        cg.translateBy(x: -local.minX, y: -local.minY)
+        let t = NSAffineTransform()
+        t.translateX(by: 0, yBy: CGFloat(bh))
+        t.scaleX(by: s, yBy: -s)
+        t.translateX(by: -local.minX, yBy: -local.minY)
+        t.concat()
         draw(annotation: a, index: -1)
         NSGraphicsContext.restoreGraphicsState()
-        guard let image = cg.makeImage() else { return nil }
-        let img = NSImage(cgImage: image, size: NSSize(width: local.width * zoom, height: local.height * zoom))
+        let img = NSImage(size: NSSize(width: local.width * zoom, height: local.height * zoom))
+        img.addRepresentation(rep)
         return ElementCacheEntry(
             image: img, pad: pad, fingerprint: fingerprint,
             renderZoom: zoom, lastUsed: frameCounter

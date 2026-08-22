@@ -252,11 +252,15 @@ final class IslandManager {
     // MARK: - content
 
     private func installContent(on screen: NSScreen) {
-        let container = ContainerView(frame: screen.frame)
+        // Window content coordinates always start at (0, 0).  Using the
+        // display's global frame here displaced the canvas and every HUD on
+        // secondary displays, making hit-testing and zoom anchors disagree.
+        let contentFrame = CGRect(origin: .zero, size: screen.frame.size)
+        let container = ContainerView(frame: contentFrame)
         container.wantsLayer = true
 
         let canvas = CanvasView(state: state, pages: pages)
-        canvas.frame = screen.frame
+        canvas.frame = contentFrame
         container.addSubview(canvas)
         self.canvas = canvas
 
@@ -319,8 +323,8 @@ final class IslandManager {
         )
         toolbar.frame = CGRect(
             x: 12,
-            y: screen.frame.maxY - 112,
-            width: max(0, screen.frame.width - 24),
+            y: contentFrame.height - 112,
+            width: max(0, contentFrame.width - 24),
             height: 92
         )
         toolbar.alphaValue = 0
