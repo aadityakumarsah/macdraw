@@ -464,6 +464,7 @@ struct ToolbarView: View {
     private var bottomRow: some View {
         HStack(spacing: 8) {
             targetPicker
+            arrowModePicker
             quickPicks
             Divider().frame(height: 24)
             fillToggle
@@ -508,6 +509,35 @@ struct ToolbarView: View {
         }
         .menuStyle(.borderlessButton)
         .help("Stroke style: \(state.strokeStyle.label)")
+    }
+
+    /// Always-visible arrow mode selector. This supplements the compact
+    /// toolbar shortcut so the box-aware arrow never has to be searched for.
+    private var arrowModePicker: some View {
+        Menu {
+            Button {
+                state.lastNonTextTool = .arrow
+                state.tool = .arrow
+            } label: {
+                Label("Straight arrow", systemImage: state.tool == .arrow ? "checkmark" : "arrow.right")
+            }
+            Button {
+                state.lastNonTextTool = .bendingArrow
+                state.tool = .bendingArrow
+            } label: {
+                Label("Bending arrow (for boxes)", systemImage: state.tool == .bendingArrow ? "checkmark" : "arrow.triangle.turn.up.right.diamond")
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: state.tool == .bendingArrow ? "arrow.triangle.turn.up.right.diamond" : "arrow.right")
+                Text(state.tool == .bendingArrow ? "Bending arrow" : "Arrow")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .frame(height: 22)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .help("Choose straight or box-aware bending arrow")
     }
 
     private var zoomControls: some View {
