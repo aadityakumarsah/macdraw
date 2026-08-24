@@ -527,6 +527,21 @@ struct ToolbarView: View {
             }
             .buttonStyle(.plain)
             .help(state.zoomLocked ? "Zoom locked — click to enable zoom" : "Lock zoom")
+            Button {
+                state.lastNonTextTool = .bendingArrow
+                state.tool = .bendingArrow
+            } label: {
+                Image(nsImage: SVGIconRenderer.image(named: "connector", tint: .white, target: 16))
+                    .resizable()
+                    .frame(width: 16, height: 16)
+                    .frame(width: 24, height: 24)
+                    .background(
+                        state.tool == .bendingArrow ? AnyShapeStyle(accentGradient) : AnyShapeStyle(Color.clear),
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+            }
+            .buttonStyle(.plain)
+            .help("Bending arrow — routes around boxes")
         }
     }
 
