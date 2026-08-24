@@ -520,21 +520,18 @@ struct ToolbarView: View {
             .buttonStyle(.plain).help("Reset zoom to 100%")
             Button(action: onZoomIn) { Image(systemName: "plus").frame(width: 20, height: 24) }
                 .buttonStyle(.plain).disabled(state.zoomLocked)
-            Button { state.zoomLocked.toggle() } label: {
-                Image(systemName: state.zoomLocked ? "lock.fill" : "lock.open")
-                    .frame(width: 24, height: 24)
-                    .foregroundStyle(state.zoomLocked ? macdrawAccent : .primary)
-            }
-            .buttonStyle(.plain)
-            .help(state.zoomLocked ? "Zoom locked — click to enable zoom" : "Lock zoom")
             Button {
                 state.lastNonTextTool = .bendingArrow
                 state.tool = .bendingArrow
             } label: {
-                Image(nsImage: SVGIconRenderer.image(named: "connector", tint: .white, target: 16))
-                    .resizable()
-                    .frame(width: 16, height: 16)
-                    .frame(width: 24, height: 24)
+                HStack(spacing: 3) {
+                    Image(nsImage: SVGIconRenderer.image(named: "connector", tint: .white, target: 14))
+                        .resizable()
+                        .frame(width: 14, height: 14)
+                    Text("Bend")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .frame(width: 46, height: 24)
                     .background(
                         state.tool == .bendingArrow ? AnyShapeStyle(accentGradient) : AnyShapeStyle(Color.clear),
                         in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -542,6 +539,13 @@ struct ToolbarView: View {
             }
             .buttonStyle(.plain)
             .help("Bending arrow — routes around boxes")
+            Button { state.zoomLocked.toggle() } label: {
+                Image(systemName: state.zoomLocked ? "lock.fill" : "lock.open")
+                    .frame(width: 24, height: 24)
+                    .foregroundStyle(state.zoomLocked ? macdrawAccent : .primary)
+            }
+            .buttonStyle(.plain)
+            .help(state.zoomLocked ? "Zoom locked — click to enable zoom" : "Lock zoom")
         }
     }
 
