@@ -62,6 +62,7 @@ struct PersistedAnnotation: Codable {
     var strokeStyle: String?
     var arrowStart: String?
     var arrowEnd: String?
+    var routesAroundObstacles: Bool?
     var sloppiness: CGFloat?
     var edgeRoughness: CGFloat?
     var rx: CGFloat?
@@ -135,6 +136,7 @@ private extension Annotation {
             strokeStyle: strokeStyle.rawValue,
             arrowStart: arrowStart.rawValue,
             arrowEnd: arrowEnd.rawValue,
+            routesAroundObstacles: routesAroundObstacles,
             sloppiness: sloppiness,
             edgeRoughness: edgeRoughness,
             rx: rx,
@@ -198,6 +200,7 @@ private extension Annotation {
             strokeStyle: StrokeStyle(rawValue: p.strokeStyle ?? "") ?? .solid,
             arrowStart: ArrowheadStyle(rawValue: p.arrowStart ?? "") ?? .none,
             arrowEnd: ArrowheadStyle(rawValue: p.arrowEnd ?? "") ?? ((ShapeKind(rawValue: p.kind) == .line) ? .none : .arrow),
+            routesAroundObstacles: p.routesAroundObstacles ?? false,
             sloppiness: p.sloppiness ?? 0,
             edgeRoughness: p.edgeRoughness ?? 0,
             rx: rx,
@@ -417,13 +420,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Zooms the canvas by `factor` around `screenPoint` (keeps the world
     /// point under the cursor fixed). Also used for keyboard zoom.
     private func zoomCanvas(by factor: CGFloat, around screenPoint: CGPoint) {
-        guard factor.isFinite, factor > 0 else { return }
+        guard !state.zoomLocked, factor.isFinite, factor > 0 else { return }
         let newZoom = min(8, max(0.15, zoom * factor))
         let actual = newZoom / zoom
         guard abs(actual - 1) > 0.001 else { return }
         canvasOffset.x = screenPoint.x - (screenPoint.x - canvasOffset.x) * actual
         canvasOffset.y = screenPoint.y - (screenPoint.y - canvasOffset.y) * actual
         zoom = newZoom
+        state.zoomPercent = Int((zoom * 100).rounded())
         syncEditingView()
         needsDisplay = true
     }
@@ -444,8 +448,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
     func resetView() {
         canvasOffset = .zero
         zoom = 1
+        state.zoomPercent = 100
         syncEditingView()
         needsDisplay = true
+    }
+
+    func zoomIn() {
+        zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY))
+    }
+
+    func zoomOut() {
+        zoomCanvas(by: 0.8, around: CGPoint(x: bounds.midX, y: bounds.midY))
     }
 
     /// Applies the current zoom to an open text edit view (recomputes its
@@ -716,7 +729,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// Trackpad pinch — zoom around the cursor.
     override func magnify(with event: NSEvent) {
-        guard state.drawingMode else { return }
+        guard state.drawingMode, !state.zoomLocked else { return }
         let p = convert(event.locationInWindow, from: nil)
         zoomCanvas(by: 1 + event.magnification, around: p)
     }
@@ -746,6 +759,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     override func scrollWheel(with event: NSEvent) {
         guard state.drawingMode else { return }
         if event.modifierFlags.contains(.command) {
+            guard !state.zoomLocked else { return }
             let p = convert(event.locationInWindow, from: nil)
             let factor = event.hasPreciseScrollingDeltas
                 ? 1 + event.scrollingDeltaY * 0.01
@@ -933,6 +947,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 ry: state.cornerRadiusY,
                 dynamicWidth: state.pressureMode == .dynamic
             )
+            // Straight arrows are predictable by default. The explicit
+            // Bending arrow tool is reserved for box-avoiding diagram links.
+            current?.routesAroundObstacles = state.tool == .bendingArrow
             // Connector tools grab the connection dot under the cursor, so
             // the line starts glued to that box's edge.
             if isConnectorTool(state.tool), let (i, s) = connectionDot(at: adjustedP) {
@@ -1160,10 +1177,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
             resetView()
         } else if event.modifierFlags.contains(.command),
                   event.charactersIgnoringModifiers?.lowercased() == "=" {
-            zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY))
+            zoomIn()
         } else if event.modifierFlags.contains(.command),
                   event.charactersIgnoringModifiers?.lowercased() == "-" {
-            zoomCanvas(by: 0.8, around: CGPoint(x: bounds.midX, y: bounds.midY))
+            zoomOut()
         } else {
             super.keyDown(with: event)
         }
@@ -1268,6 +1285,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return
         }
 
+        c.zIndex = (annotations.map(\.zIndex).max() ?? 0) + 1
         pushUndo()
         annotations.append(c)
         // Keep the drawn shape selected (so pressing V lets you move/resize it
@@ -1377,7 +1395,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 rotation: 0,
                 createdAt: Date(),
                 locked: false,
-                zIndex: 0,
+                zIndex: (annotations.map(\.zIndex).max() ?? 0) + 1,
                 strokeStyle: .solid,
                 sloppiness: 0,
                 edgeRoughness: 0,
@@ -2059,7 +2077,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             rotation: 0,
             createdAt: Date(),
             locked: false,
-            zIndex: 0,
+            zIndex: (annotations.map(\.zIndex).max() ?? 0) + 1,
             strokeStyle: .solid,
             sloppiness: 0,
             edgeRoughness: 0,
@@ -2210,7 +2228,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     rotation: 0,
                     createdAt: Date(),
                     locked: false,
-                    zIndex: 0
+                    zIndex: (self.annotations.map(\.zIndex).max() ?? 0) + 1
                 ))
                 self.needsDisplay = true
             }
@@ -2247,7 +2265,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     rotation: 0,
                     createdAt: Date(),
                     locked: false,
-                    zIndex: 0
+                    zIndex: (self.annotations.map(\.zIndex).max() ?? 0) + 1
                 ))
                 self.needsDisplay = true
             }
@@ -2422,6 +2440,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let (pan, z) = pages.viewState()
         canvasOffset = pan
         zoom = min(8, max(0.15, z))
+        state.zoomPercent = Int((zoom * 100).rounded())
         commitPendingText()
         needsDisplay = true
     }
@@ -3980,7 +3999,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let len = max(1, sqrt(dx * dx + dy * dy))
         let ux = dx / len
         let uy = dy / len
-        let size = max(10, width * 3)
+        // Large fixed heads overwhelm short arrows. Cap the head at a share
+        // of the shaft so even a tiny arrow still visibly has a direction.
+        let size = min(max(6, width * 2.5), max(4, len * 0.65))
         let p1 = CGPoint(x: end.x - ux * size + uy * size * 0.5, y: end.y - uy * size - ux * size * 0.5)
         let p2 = CGPoint(x: end.x - ux * size - uy * size * 0.5, y: end.y - uy * size + ux * size * 0.5)
         switch style {
@@ -4154,7 +4175,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             // obstacle router as connectors. A user-created bend always wins
             // (the early return above), so automatic routing never rewrites
             // deliberate geometry. Plain lines remain straight.
-            if a.kind == .arrow {
+            if a.kind == .arrow && a.routesAroundObstacles {
                 let startOwner = connectionNormal(for: a.connectionStart).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: s)
                 let endOwner = connectionNormal(for: a.connectionEnd).map { ConnectorOwner(normal: $0) } ?? connectorOwner(at: e)
                 let obstacles = connectorObstacles(for: a, margin: 8 + a.strokeWidth / 2)
@@ -4983,7 +5004,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     private func isConnectorTool(_ tool: Tool) -> Bool {
         switch tool {
-        case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
+        case .arrow, .bendingArrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             return true
         default:
             return false

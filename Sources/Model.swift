@@ -119,7 +119,10 @@ enum Tool: String, CaseIterable {
     case rectangle
     case diamond
     case ellipse
+    /// A direct arrow. It never reroutes around other objects.
     case arrow
+    /// An arrow intended for diagrams: it routes around boxes when needed.
+    case bendingArrow
     case line
     case freedraw
     case text
@@ -170,6 +173,7 @@ enum Tool: String, CaseIterable {
         .star, .star6, .cross, .process, .predefinedProcess, .delay,
         .manualInput, .display, .cloud, .serverStack, .queue,
         .firewall, .cube, .callout, .note, .arrow, .line,
+        .bendingArrow,
         .doubleArrow, .curvedConnector, .orthogonal, .connector,
         // Data structures
         .linkedList, .stack, .heap, .graph, .set,
@@ -183,6 +187,7 @@ enum Tool: String, CaseIterable {
         case .diamond: return "diamond"
         case .ellipse: return "ellipse"
         case .arrow: return "arrow"
+        case .bendingArrow: return "connector"
         case .line: return "line"
         case .freedraw: return "freedraw"
         case .text: return "text"
@@ -235,7 +240,8 @@ enum Tool: String, CaseIterable {
         case .rectangle: return "Rectangle"
         case .diamond: return "Diamond"
         case .ellipse: return "Ellipse"
-        case .arrow: return "Arrow"
+        case .arrow: return "Straight arrow"
+        case .bendingArrow: return "Bending arrow"
         case .line: return "Line"
         case .freedraw: return "Sketch"
         case .text: return "Text"
@@ -286,7 +292,7 @@ enum Tool: String, CaseIterable {
         case .rectangle: return .rect
         case .diamond: return .diamond
         case .ellipse: return .ellipse
-        case .arrow: return .arrow
+        case .arrow, .bendingArrow: return .arrow
         case .line: return .line
         case .freedraw: return .freedraw
         case .autoshape: return .autoshape
@@ -354,6 +360,8 @@ struct Annotation {
     var strokeStyle: StrokeStyle = .solid
     var arrowStart: ArrowheadStyle = .none
     var arrowEnd: ArrowheadStyle = .arrow
+    /// Only the Bending arrow tool enables automatic obstacle routing.
+    var routesAroundObstacles: Bool = false
     /// 0 = perfect vector lines, 1 = heavily hand-drawn wobble (Rough.js style).
     var sloppiness: CGFloat = 0
     /// 0 = clean corners, 1 = sketchy over-drawn corners that stick out.
@@ -436,6 +444,8 @@ final class CanvasState: ObservableObject {
     @Published var fontFamily: String = "Virgil"
     @Published var fontSize: CGFloat = 28
     @Published var canvasBackground: CanvasBackground = .clear
+    @Published var zoomLocked: Bool = false
+    @Published var zoomPercent: Int = 100
 
     // Stroke appearance — new shapes pick these up, selected shapes update live.
     // Pressure mode drives line dynamics; rectangles keep slightly curved corners.

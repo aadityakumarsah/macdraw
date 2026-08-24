@@ -40,7 +40,22 @@ func tintedSymbolAttachment(_ symbol: String, pointSize: CGFloat, color: NSColor
 
 protocol LogoPaletteDelegate: AnyObject {
     func logoPaletteDidPick(_ item: LogoItem)
+    func logoPaletteDidPickTool(_ tool: Tool)
     func logoPaletteDidClose()
+}
+
+/// Entries offered by the `/` command palette. Tools are included alongside
+/// symbols so every drawable shape can be found by typing its name.
+private enum QuickPaletteItem {
+    case symbol(LogoItem)
+    case tool(Tool)
+
+    var name: String {
+        switch self {
+        case .symbol(let item): return item.name
+        case .tool(let tool): return tool.label
+        }
+    }
 }
 
 struct LogoItem {
@@ -315,15 +330,14 @@ enum LogoCatalog {
     }
 }
 
-/// The "/" search palette: a search field on top and a list of logo results
-/// below. ↑/↓ navigate, ↵ inserts, Esc closes.
+/// The "/" command palette: searches every tool/shape as well as symbols.
 final class LogoPaletteView: NSView, NSTextFieldDelegate {
     weak var delegate: LogoPaletteDelegate?
 
     let searchField = NSTextField()
     private let footer = NSTextField(labelWithString: "↑↓ navigate  ·  ↵ insert  ·  Esc close")
     private var rows: [NSButton] = []
-    private var currentResults: [LogoItem] = []
+    private var currentResults: [QuickPaletteItem] = []
     private var highlightedRow = 0
 
     private static let rowHeight: CGFloat = 38
@@ -343,7 +357,7 @@ final class LogoPaletteView: NSView, NSTextFieldDelegate {
 
         let search = searchField
         search.frame = CGRect(x: 12, y: 12, width: bounds.width - 24, height: 30)
-        search.placeholderString = "Search logos…"
+        search.placeholderString = "Search shapes, tools, or symbols…"
         search.isBordered = false
         search.drawsBackground = true
         search.backgroundColor = NSColor(calibratedWhite: 1, alpha: 0.1)
@@ -368,7 +382,10 @@ final class LogoPaletteView: NSView, NSTextFieldDelegate {
     }
 
     func reload() {
-        currentResults = LogoCatalog.results(for: searchField.stringValue)
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespaces).lowercased()
+        let tools = Tool.allCases.filter { query.isEmpty || $0.label.lowercased().contains(query) }
+        let symbols = LogoCatalog.results(for: query)
+        currentResults = tools.map(QuickPaletteItem.tool) + symbols.map(QuickPaletteItem.symbol)
         highlightedRow = 0
         rebuildRows()
     }
@@ -392,9 +409,14 @@ final class LogoPaletteView: NSView, NSTextFieldDelegate {
             button.wantsLayer = true
             button.layer?.cornerRadius = 6
             let title = NSMutableAttributedString()
-            if let attach = tintedSymbolAttachment(item.symbol, pointSize: 15, color: .white) {
-                title.append(NSAttributedString(attachment: attach))
-                title.append(NSAttributedString(string: "  "))
+            switch item {
+            case .symbol(let symbol):
+                if let attach = tintedSymbolAttachment(symbol.symbol, pointSize: 15, color: .white) {
+                    title.append(NSAttributedString(attachment: attach))
+                    title.append(NSAttributedString(string: "  "))
+                }
+            case .tool:
+                title.append(NSAttributedString(string: "◇  ", attributes: [.font: NSFont.systemFont(ofSize: 16)]))
             }
             title.append(NSAttributedString(
                 string: item.name,
@@ -422,7 +444,10 @@ final class LogoPaletteView: NSView, NSTextFieldDelegate {
 
     private func pickRow(_ i: Int) {
         guard i >= 0, i < currentResults.count else { return }
-        delegate?.logoPaletteDidPick(currentResults[i])
+        switch currentResults[i] {
+        case .symbol(let item): delegate?.logoPaletteDidPick(item)
+        case .tool(let tool): delegate?.logoPaletteDidPickTool(tool)
+        }
     }
 
     // MARK: - search field delegate
@@ -459,7 +484,7 @@ final class LogoPaletteView: NSView, NSTextFieldDelegate {
         reload()
     }
 
-    var selftestResults: [LogoItem] { currentResults }
+    var selftestResults: [String] { currentResults.map(\.name) }
 
     func selftestPickRow(_ i: Int) {
         pickRow(i)

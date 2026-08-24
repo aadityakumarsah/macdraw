@@ -306,6 +306,8 @@ final class IslandManager {
                 onUndo: { [weak canvas] in canvas?.undo() },
                 onClear: { [weak canvas] in canvas?.clearAll() },
                 onResetView: { [weak canvas] in canvas?.resetView() },
+                onZoomIn: { [weak canvas] in canvas?.zoomIn() },
+                onZoomOut: { [weak canvas] in canvas?.zoomOut() },
                 onActivate: { [weak self] in self?.activate() },
                 onDeactivate: { [weak self] in self?.deactivate() },
                 onToggleCodeBlock: { [weak canvas] in canvas?.toggleCodeBlock() },
@@ -1530,6 +1532,12 @@ extension IslandManager: LogoPaletteDelegate {
         guard let canvas else { return }
         let p = canvas.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
         canvas.insertSymbol(item.symbol, at: p)
+    }
+
+    func logoPaletteDidPickTool(_ tool: Tool) {
+        closeLogoPalette()
+        if tool != .text { state.lastNonTextTool = tool }
+        state.tool = tool
     }
 
     func logoPaletteDidClose() {

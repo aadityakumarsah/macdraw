@@ -21,6 +21,8 @@ struct ToolbarView: View {
     let onUndo: () -> Void
     let onClear: () -> Void
     let onResetView: () -> Void
+    let onZoomIn: () -> Void
+    let onZoomOut: () -> Void
     let onActivate: () -> Void
     let onDeactivate: () -> Void
     let onToggleCodeBlock: () -> Void
@@ -199,6 +201,8 @@ struct ToolbarView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Reset view — zoom 100%, recenter (⌘0)")
+
+                    zoomControls
                 }
             }
 
@@ -495,11 +499,7 @@ struct ToolbarView: View {
     private var strokeStyleMenu: some View {
         Menu {
             ForEach(StrokeStyle.allCases, id: \.self) { style in
-                Button {
-                    state.strokeStyle = style
-                } label: {
-                    Label(style.label, systemImage: style.iconName)
-                }
+                Button { state.strokeStyle = style } label: { Label(style.label, systemImage: style.iconName) }
             }
         } label: {
             Image(systemName: state.strokeStyle.iconName)
@@ -508,6 +508,26 @@ struct ToolbarView: View {
         }
         .menuStyle(.borderlessButton)
         .help("Stroke style: \(state.strokeStyle.label)")
+    }
+
+    private var zoomControls: some View {
+        HStack(spacing: 1) {
+            Button(action: onZoomOut) { Image(systemName: "minus").frame(width: 20, height: 24) }
+                .buttonStyle(.plain).disabled(state.zoomLocked)
+            Button(action: onResetView) {
+                Text("\(state.zoomPercent)%").font(.system(size: 10, weight: .semibold)).monospacedDigit().frame(width: 42, height: 24)
+            }
+            .buttonStyle(.plain).help("Reset zoom to 100%")
+            Button(action: onZoomIn) { Image(systemName: "plus").frame(width: 20, height: 24) }
+                .buttonStyle(.plain).disabled(state.zoomLocked)
+            Button { state.zoomLocked.toggle() } label: {
+                Image(systemName: state.zoomLocked ? "lock.fill" : "lock.open")
+                    .frame(width: 24, height: 24)
+                    .foregroundStyle(state.zoomLocked ? macdrawAccent : .primary)
+            }
+            .buttonStyle(.plain)
+            .help(state.zoomLocked ? "Zoom locked — click to enable zoom" : "Lock zoom")
+        }
     }
 
     private func arrowheadMenu(title: String, selection: Binding<ArrowheadStyle>) -> some View {
@@ -845,7 +865,7 @@ struct ShapesPaletteView: View {
         ShapeGroup(title: "Flowchart", tools: [.process, .predefinedProcess, .delay, .manualInput, .display]),
         ShapeGroup(title: "Architecture", tools: [.cloud, .serverStack, .queue, .firewall, .cube]),
         ShapeGroup(title: "Communication", tools: [.callout, .note]),
-        ShapeGroup(title: "Connectors", tools: [.doubleArrow, .curvedConnector, .orthogonal, .connector]),
+        ShapeGroup(title: "Connectors", tools: [.bendingArrow, .doubleArrow, .curvedConnector, .orthogonal, .connector]),
         ShapeGroup(title: "Data structures", tools: [.linkedList, .stack, .heap, .graph, .set]),
     ]
 
