@@ -2833,6 +2833,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var cachedMinimapWorld: CGRect?
     private var cachedMinimapTransform: (scale: CGFloat, origin: CGPoint)?
 
+    /// Re-rendered SF-Symbol glyphs (the "/" palette icons) keyed by symbol +
+    /// tint + on-screen pixel size, so icons stay crisp at any zoom level.
+    private var symbolRasterCache: [String: NSImage] = [:]
+
     /// Hash only the information the minimap represents. This keeps laser
     /// animation from rebuilding it, while ensuring move/resize/rotate/style
     /// edits never leave a stale viewport preview behind.
@@ -3363,7 +3367,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .text:
             drawText(a)
         case .image:
-            a.image?.draw(in: a.rect)
+            drawImageAnnotation(a)
         case .laser:
             drawLaser(a)
         default:
@@ -4012,6 +4016,37 @@ final class CanvasView: NSView, NSTextViewDelegate {
             options: [.usesLineFragmentOrigin, .usesFontLeading],
             attributes: attrs
         )
+    }
+
+    /// Renders SF-Symbol annotations (the "/" palette icons: delivery, wifi,
+    /// router, …) at the on-screen resolution so they stay razor-sharp at any
+    /// zoom instead of scaling the small baked thumbnail. The glyph is
+    /// re-rendered (and cached) per visible pixel size, with the rotation
+    /// baked into the covered area so tilted icons never crop.
+    private func drawImageAnnotation(_ a: Annotation) {
+        guard let symbol = a.symbol else {
+            a.image?.draw(in: a.rect)
+            return
+        }
+        let screen = worldToScreen(a.rect)
+        guard screen.width > 1, screen.height > 1 else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        let angle = a.rotation
+        let extW = abs(screen.width * cos(angle)) + abs(screen.height * sin(angle))
+        let extH = abs(screen.width * sin(angle)) + abs(screen.height * cos(angle))
+        let px = max(12, Int(ceil(extW * scale)))
+        let py = max(12, Int(ceil(extH * scale)))
+        let key = "\(symbol)|\(a.strokeColor.hexDescription)|\(px)|\(py)"
+        if let hit = symbolRasterCache[key] {
+            hit.draw(in: a.rect)
+            return
+        }
+        guard let image = tintedSymbolImage(named: symbol, pixelSize: CGSize(width: px, height: py), color: a.strokeColor) else { return }
+        symbolRasterCache[key] = image
+        if symbolRasterCache.count > 96 {
+            symbolRasterCache.removeAll(keepingCapacity: true)
+        }
+        image.draw(in: a.rect)
     }
 
     /// Code blocks: a solid, high-contrast block (dark-on-white in light

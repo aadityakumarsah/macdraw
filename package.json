@@ -1,6 +1,6 @@
 {
   "name": "macdraw",
-  "version": "1.16.1",
+  "version": "1.16.2",
   "private": true,
   "description": "Macdraw backend: Supabase + Prisma",
   "type": "module",

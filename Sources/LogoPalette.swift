@@ -38,6 +38,35 @@ func tintedSymbolAttachment(_ symbol: String, pointSize: CGFloat, color: NSColor
     return attach
 }
 
+/// Tinted SF Symbol rendered at an exact pixel size. Used at draw time so
+/// symbol annotations (the "/" palette icons) stay razor-sharp at any zoom —
+/// the annotated rect grows with the zoom, and this re-renders the glyph at a
+/// matching resolution instead of upscaling the small baked thumbnail.
+func tintedSymbolImage(named symbol: String, pixelSize: CGSize, color: NSColor) -> NSImage? {
+    guard let base = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) else { return nil }
+    let config = NSImage.SymbolConfiguration(pointSize: pixelSize.width, weight: .regular)
+    guard let sized = base.withSymbolConfiguration(config) else { return nil }
+    let px = max(4, Int(ceil(pixelSize.width)))
+    let py = max(4, Int(ceil(pixelSize.height)))
+    let logical = NSSize(width: pixelSize.width, height: pixelSize.height)
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: py,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+    ) else { return nil }
+    rep.size = logical
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSGraphicsContext.current?.imageInterpolation = .high
+    sized.draw(in: NSRect(origin: .zero, size: logical), from: .zero, operation: .sourceOver, fraction: 1)
+    color.setFill()
+    NSRect(origin: .zero, size: logical).fill(using: .sourceAtop)
+    NSGraphicsContext.restoreGraphicsState()
+    let out = NSImage(size: logical)
+    out.addRepresentation(rep)
+    return out
+}
+
 protocol LogoPaletteDelegate: AnyObject {
     func logoPaletteDidPick(_ item: LogoItem)
     func logoPaletteDidPickTool(_ tool: Tool)
