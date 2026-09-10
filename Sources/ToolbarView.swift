@@ -27,7 +27,7 @@ struct ToolbarView: View {
     let onDeactivate: () -> Void
     let onToggleCodeBlock: () -> Void
     let onInsertSymbol: (String) -> Void
-    let onSwitchPage: (UUID) -> Void
+    let onSwitchPage: (String) -> Void
     let onToggleSidebar: () -> Void
     let onToggleAI: () -> Void
 
@@ -1094,7 +1094,7 @@ struct WaveIcon: View {
 /// row switches to that page.
 struct PagesView: View {
     @ObservedObject var pages: PagesManager
-    let onSwitch: (UUID) -> Void
+    let onSwitch: (String) -> Void
     @State private var newPageName = ""
     @State private var newPageNote = ""
 

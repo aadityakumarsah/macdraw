@@ -1,6 +1,26 @@
 import AppKit
 import Combine
 
+/// Lightweight haptic feedback wrapper. Uses the trackpad's Force-Touch
+/// "tick" so interactions like drawing, moving, resizing and snapping a line
+/// onto a shape give a subtle physical confirmation. On machines without a
+/// haptic-capable input device this is a silent no-op.
+enum Haptics {
+    private static var lastTick: Date = .distantPast
+
+    /// Fires a soft selection "tick". Successive calls within 60ms are
+    /// coalesced so fast drags don't buzz non-stop.
+    static func tick() {
+        let now = Date()
+        guard now.timeIntervalSince(lastTick) > 0.06 else { return }
+        lastTick = now
+        NSHapticFeedbackManager.defaultPerformer.perform(
+            .generic,
+            performanceTime: .drawCompleted
+        )
+    }
+}
+
 private func + (l: CGPoint, r: CGPoint) -> CGPoint {
     CGPoint(x: l.x + r.x, y: l.y + r.y)
 }
@@ -155,16 +175,11 @@ private extension Annotation {
     }
 
     static func restored(from p: PersistedAnnotation) -> Annotation {
-        var fillColor: NSColor?
-        if let fill = p.fill {
-            fillColor = color(fromComponents: fill)
-            // Apply opacity to the fill color
-            if let color = fillColor {
-                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
-                color.getRed(&r, green: &g, blue: &b, alpha: &a)
-                fillColor = NSColor(calibratedRed: r, green: g, blue: b, alpha: a * p.fillOpacity)
-            }
-        }
+        // Keep the fill color at full alpha here — opacity is stored separately
+        // in `fillOpacity` and applied at render time. Baking it into the color
+        // here used to double the transparency on every load, making filled
+        // shapes look nearly invisible after reopening the app.
+        let fillColor: NSColor? = p.fill.map { color(fromComponents: $0) }
 
         // Legacy frames/embeddable shapes were stored with a plain `rounded`
         // flag — map that onto the new corner-radius fields so they render the
@@ -299,6 +314,16 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Standalone text grows to its measured content until the user drags a
     /// horizontal handle, at which point its width becomes a wrap constraint.
     private var editingTextAutoResize = true
+    /// The field's rectangle in world (unzoomed) points while an edit field is
+    /// open. This is the single source of truth for the field's geometry: the
+    /// screen frame is always derived as `worldToScreen(editingWorldRect)`, so
+    /// panning the canvas for caret visibility, two-finger scrolling or pinch
+    /// zooming moves the field WITH the canvas instead of pinning it in screen
+    /// space. Pinning a brand-new field while the canvas pans underneath is
+    /// what made long notes "vanish" — the committed text ended up detached
+    /// from where it was typed. Excalidraw keeps its WYSIWYG textarea glued to
+    /// the element's world rect for exactly the same reason.
+    private var editingWorldRect: CGRect?
     /// True when the current edit pushed its undo snapshot up front (code
     /// edits mutate the annotation live while typing, so the snapshot must
     /// be taken before the first keystroke, not at commit).
@@ -419,8 +444,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// Zooms the canvas by `factor` around `screenPoint` (keeps the world
     /// point under the cursor fixed). Also used for keyboard zoom.
-    private func zoomCanvas(by factor: CGFloat, around screenPoint: CGPoint) {
-        guard !state.zoomLocked, factor.isFinite, factor > 0 else { return }
+    private func zoomCanvas(by factor: CGFloat, around screenPoint: CGPoint, ignoreLock: Bool = false) {
+        guard (ignoreLock || !state.zoomLocked), factor.isFinite, factor > 0 else { return }
         let newZoom = min(8, max(0.15, zoom * factor))
         let actual = newZoom / zoom
         guard abs(actual - 1) > 0.001 else { return }
@@ -454,39 +479,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     func zoomIn() {
-        zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY))
+        zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY), ignoreLock: true)
     }
 
     func zoomOut() {
-        zoomCanvas(by: 0.8, around: CGPoint(x: bounds.midX, y: bounds.midY))
+        zoomCanvas(by: 0.8, around: CGPoint(x: bounds.midX, y: bounds.midY), ignoreLock: true)
     }
 
-    /// Applies the current zoom to an open text edit view (recomputes its
-    /// frame from the world rect so the field stays glued to the text).
+    /// Applies the current zoom/pan to an open text edit view (recomputes its
+    /// frame from the stored world rect so the field stays glued to the text).
+    /// Panning for caret visibility, two-finger scrolling, minimap jumps and
+    /// pinch zoom all land here: the frame is always derived from the world
+    /// rect, so the field moves WITH the canvas and can never be pinned in
+    /// screen space while the drawing slides underneath it.
     private func syncEditingView() {
-        guard let tv = editingView else { return }
-        let worldRect: CGRect
-        if let idx = editingIndex, annotations.indices.contains(idx) {
-            let a = annotations[idx]
-            if a.kind == .text {
-                worldRect = CGRect(
-                    x: a.rect.minX,
-                    y: a.rect.minY,
-                    width: max(60, a.rect.width),
-                    height: max(34, a.rect.height)
-                )
-            } else {
-                let pad: CGFloat = 10
-                worldRect = CGRect(
-                    x: a.rect.minX + pad,
-                    y: a.rect.minY + pad,
-                    width: max(60, a.rect.width - pad * 2),
-                    height: max(28, a.rect.height - pad * 2)
-                )
-            }
-        } else {
-            worldRect = screenToWorld(tv.frame)
-        }
+        guard let tv = editingView, let worldRect = editingWorldRect else { return }
         let screenRect = worldToScreen(worldRect)
         var f = tv.frame
         f.origin = screenRect.origin
@@ -959,6 +966,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     current = c
                 }
             }
+            Haptics.tick()
         }
     }
 
@@ -1036,6 +1044,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 if let (i, s) = connectionDot(at: adjustedP) {
                     c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
                     endP = connectionPoint(for: c.connectionEnd, fallback: adjustedP)
+                    Haptics.tick()
                 } else {
                     c.connectionEnd = nil
                     endP = snappedBoundaryPoint(adjustedP)
@@ -1090,13 +1099,16 @@ final class CanvasView: NSView, NSTextViewDelegate {
             } else if rotateIndex != nil {
                 finishTransformInteraction()
                 rotateIndex = nil
+                Haptics.tick()
             } else if resizeIndex != nil {
                 finishTransformInteraction()
                 resizeIndex = nil
                 resizeHandle = nil
                 resizeOriginal = nil
+                Haptics.tick()
             } else if !movingOriginals.isEmpty {
                 finishTransformInteraction()
+                Haptics.tick()
             }
             movingOriginals = [:]
             scheduleSave()
@@ -1288,6 +1300,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         c.zIndex = (annotations.map(\.zIndex).max() ?? 0) + 1
         pushUndo()
         annotations.append(c)
+        Haptics.tick()
         // Keep the drawn shape selected (so pressing V lets you move/resize it
         // right away) but stay on the current tool — no need to re-press D.
         selected = [annotations.count - 1]
@@ -1363,6 +1376,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 height: max(28, a.rect.height - pad * 2)
             )
         } ?? CGRect(x: p.x, y: p.y, width: codeWidth, height: 34)
+        // Remember the field's world rect — the screen frame is always derived
+        // from it, so panning/zooming keeps the field glued to the canvas.
+        editingWorldRect = rect
         // The edit field is a plain subview (screen space) — scale its frame
         // and font by the canvas zoom so it sits exactly on the world rect.
         let screenRect = worldToScreen(rect)
@@ -1421,7 +1437,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         // Code fields live on a solid block — pin the base text color to the
         // block mode so plain text is never invisible while typing.
         tv.textColor = code
-            ? (state.canvasBackground == .black
+            ? (state.canvasBackground.isDark
                 ? NSColor(calibratedWhite: 0.93, alpha: 1)
                 : NSColor(calibratedWhite: 0.12, alpha: 1))
             : (existing?.strokeColor ?? state.strokeColor)
@@ -1432,24 +1448,38 @@ final class CanvasView: NSView, NSTextViewDelegate {
         tv.isAutomaticTextReplacementEnabled = false
         tv.isAutomaticSpellingCorrectionEnabled = false
         tv.textContainer?.widthTracksTextView = true
-        tv.textContainer?.lineBreakMode = .byWordWrapping
+        // Free text edits on an unbounded line (Excalidraw's `white-space:
+        // pre`): the field grows with the content and the canvas pans to keep
+        // the caret visible. Only text with a real wrap constraint — polygon
+        // labels, wrapped documents, code blocks — wraps inside its box, and
+        // even then only at the width the user set, never arbitrarily.
+        let isFreeText = editingIndex.map { i in
+            annotations.indices.contains(i) && annotations[i].kind == .text
+        } ?? true
+        tv.textContainer?.lineBreakMode = (isFreeText && editingTextAutoResize)
+            ? .byClipping
+            : .byWordWrapping
+        if isFreeText && editingTextAutoResize {
+            // Default is 5pt of padding per side — that would clip the last
+            // glyph once the frame sits exactly on the measured content width.
+            tv.textContainer?.lineFragmentPadding = 0
+        }
         tv.alignment = editingPolygon ? .center : .left
         tv.wantsLayer = true
         if code {
             // The code "editor" look: solid rounded block that stays readable
             // on any backdrop, matching the committed code block exactly.
-            let dark = state.canvasBackground == .black
+            let dark = state.canvasBackground.isDark
             let colors = codeBlockColors(dark: dark)
             tv.textContainerInset = NSSize(width: 8, height: 6)
             tv.layer?.cornerRadius = 8
             tv.layer?.backgroundColor = colors.background.cgColor
             tv.layer?.borderWidth = 1
             tv.layer?.borderColor = colors.border.cgColor
-        } else {
-            tv.layer?.cornerRadius = 4
-            tv.layer?.borderWidth = 1
-            tv.layer?.borderColor = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).cgColor
         }
+        // Plain text is borderless while typing — only the characters are on
+        // the canvas, exactly as they'll be committed (Excalidraw's WYSIWYG
+        // textarea has no frame either).
         if let existing {
             let fieldFont = tv.font ?? Fonts.nsFont(for: family, size: size * zoom)
             // The field always edits the source text — the plain markdown the
@@ -1474,6 +1504,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 var f = tv.frame
                 f.size.height = max(f.height, ceil(bounds.height) + 8)
                 tv.frame = f
+                editingWorldRect = screenToWorld(f)
             }
         }
         tv.delegate = self
@@ -1506,7 +1537,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         guard !isHighlightingCode else { return }
         isHighlightingCode = true
         defer { isHighlightingCode = false }
-        let dark = state.canvasBackground == .black
+        let dark = state.canvasBackground.isDark
         let font = tv.font ?? Fonts.nsFont(for: "Cascadia Code", size: 15)
         let styled = syntaxHighlighted(tv.string, font: font, dark: dark)
         let sel = tv.selectedRange()
@@ -1538,7 +1569,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 tv.string,
                 baseFont: baseFont,
                 baseColor: baseColor,
-                dark: state.canvasBackground == .black,
+                dark: state.canvasBackground.isDark,
                 codeHighlighter: { [weak self] text, font, dark in
                     self?.syntaxHighlighted(text, font: font, dark: dark)
                         ?? NSAttributedString(string: text, attributes: [.font: font])
@@ -1586,7 +1617,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             str,
             baseFont: Fonts.nsFont(for: family, size: size),
             baseColor: color,
-            dark: state.canvasBackground == .black,
+            dark: state.canvasBackground.isDark,
             display: true,
             codeHighlighter: { [weak self] text, font, dark in
                 self?.syntaxHighlighted(text, font: font, dark: dark)
@@ -1621,10 +1652,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 with: CGSize(width: 100_000, height: CGFloat.greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading]
             )
-            // Avoid an off-screen one-line editor for pasted paragraphs while
-            // retaining natural sizing for short labels.
-            let maxWidth = max(240, min(720, bounds.width - 48))
-            frame.size.width = max(60, min(maxWidth, ceil(natural.width) + ceil(horizontalInset) + 2))
+            // Free text grows to its content instead of wrapping at a fixed
+            // width (the Excalidraw auto-resize behavior — no boundary to
+            // typing). `natural` is measured with the zoomed screen font so it
+            // is in screen points; there is no cap: a long line simply runs
+            // wide and the canvas pans to keep the caret visible. Width is
+            // therefore always the widest measured line, height only ever
+            // grows when the user inserts an explicit newline.
+            frame.size.width = max(60, ceil(natural.width) + ceil(horizontalInset) + 2)
         }
 
         let storage = tv.textStorage ?? NSAttributedString(
@@ -1639,10 +1674,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
         frame.size.height = max(34, ceil(measured.height) + tv.textContainerInset.height * 2 + 2)
         tv.frame = frame
 
+        // Keep the field's world rect in sync with its measured screen frame so
+        // zooming/panning never restore a stale (clipped or drifted) size.
+        let worldRect = screenToWorld(frame)
+        editingWorldRect = worldRect
+
         // Existing text (and eagerly-created code) must be updated while the
         // overlay is open so zooming/panning cannot restore stale dimensions.
         if let idx = editingIndex, annotations.indices.contains(idx) {
-            annotations[idx].rect = screenToWorld(frame)
+            annotations[idx].rect = worldRect
             annotations[idx].textAutoResize = editingTextAutoResize
             if isCodeEditingContext {
                 annotations[idx].text = tv.string
@@ -1667,6 +1707,51 @@ final class CanvasView: NSView, NSTextViewDelegate {
             }
         }
         resizeEditingFieldToFitContent(tv)
+        keepEditingCaretVisible()
+    }
+
+    /// Pans the canvas while typing so the insertion point never leaves the
+    /// visible area. Long text and multi-line code blocks grow downward (and
+    /// auto-resize text grows rightward) faster than the window shows; without
+    /// this the caret — and the line you're typing — silently scrolls out of
+    /// sight. The pan moves the whole canvas (the field is glued to it through
+    /// `editingWorldRect`) so the note stays exactly where the user typed it.
+    private func keepEditingCaretVisible() {
+        guard let tv = editingView, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
+        let sel = tv.selectedRange()
+        guard sel.location != NSNotFound, lm.numberOfGlyphs > 0 else { return }
+        lm.ensureLayout(for: tc)
+        // Track the caret itself (nothing fancy for a multi-character
+        // selection — just the character at the selection's end).
+        var glyphLocation = sel.length > 0 ? sel.location + sel.length : sel.location
+        if glyphLocation >= lm.numberOfGlyphs { glyphLocation = max(0, lm.numberOfGlyphs - 1) }
+        let rect = lm.boundingRect(forGlyphRange: NSRange(location: glyphLocation, length: 1), in: tc)
+        let caretTop = tv.frame.minY + tv.textContainerInset.height + rect.minY
+        let caretBottom = tv.frame.minY + tv.textContainerInset.height + rect.maxY
+        let caretLeft = tv.frame.minX + tv.textContainerInset.width + rect.minX
+        let caretRight = tv.frame.minX + tv.textContainerInset.width + rect.maxX
+        let vis = visibleRect
+        // Screen = world × zoom + offset, so to bring content that drifted
+        // past the bottom/right edges back into view we nudge the offset the
+        // other way (negative dx/dy); content past the top/left needs positive.
+        var dx: CGFloat = 0
+        if caretRight > vis.maxX {
+            dx = vis.maxX - caretRight - 36
+        } else if caretLeft < vis.minX - 36 {
+            dx = vis.minX - caretLeft - 36
+        }
+        var dy: CGFloat = 0
+        if caretBottom > vis.maxY {
+            dy = vis.maxY - caretBottom - 36
+        } else if caretTop < vis.minY - 24 {
+            dy = vis.minY - caretTop - 24
+        }
+        if abs(dx) > 0.5 || abs(dy) > 0.5 {
+            canvasOffset.x += dx
+            canvasOffset.y += dy
+            syncEditingView()
+            needsDisplay = true
+        }
     }
 
     /// Pushes the editing view's text onto its canvas annotation (code edits
@@ -1821,6 +1906,37 @@ final class CanvasView: NSView, NSTextViewDelegate {
         worldToScreen(p)
     }
 
+    /// Self-test hook: opens a brand-new standalone text field at a
+    /// canvas-local point, skipping hit-testing against existing shapes so
+    /// tests always land on the exact anchor they assert against.
+    func selftestBeginNewText(at p: CGPoint) {
+        guard editingView == nil else { return }
+        beginTextEditing(at: screenToWorld(p))
+    }
+
+    /// Self-test hook: screen → world conversion for synthetic clicks.
+    func selftestScreenToWorld(_ p: CGPoint) -> CGPoint {
+        screenToWorld(p)
+    }
+
+    /// Self-test hook: pans the canvas (two-finger scroll equivalent) so tests
+    /// can verify the open edit field stays glued to its world rect.
+    func selftestPanCanvas(dx: CGFloat, dy: CGFloat) {
+        canvasOffset.x += dx
+        canvasOffset.y += dy
+        syncEditingView()
+        needsDisplay = true
+    }
+
+    /// Self-test hook: zooms around the canvas center (pinch/⌘+scroll
+    /// equivalent) while an edit field is open.
+    func selftestZoom(_ factor: CGFloat) {
+        zoomCanvas(by: factor, around: CGPoint(x: bounds.midX, y: bounds.midY))
+    }
+
+    /// Self-test hook: screen frame of the open edit field.
+    var selftestEditingFrame: CGRect? { editingView?.frame }
+
     /// Self-test hook: moves the cursor in the open editing view.
     func selftestSetCursor(location: Int) {
         editingView?.setSelectedRange(NSRange(location: location, length: 0))
@@ -1971,6 +2087,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let idx = editingIndex
         let wasCode = isCodeEditingContext
         editingIndex = nil
+        editingWorldRect = nil
         editingFontFamily = nil
         editingWorldFontSize = 0
         let nodeIdx = editingNodeIndex
@@ -2848,16 +2965,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
         guard NSGraphicsContext.current != nil else { return }
         frameCounter += 1
 
-        // Solid backdrop — "writing on a white/black screen" mode.
-        switch state.canvasBackground {
-        case .white:
-            NSColor.white.setFill()
+        // Solid backdrop — "writing on a white/black/colored screen" mode.
+        if let bgColor = state.canvasBackground.environmentColor {
+            bgColor.setFill()
             bounds.fill()
-        case .black:
-            NSColor.black.setFill()
-            bounds.fill()
-        case .clear:
-            break
         }
 
         // Only elements that actually intersect the viewport are painted.
@@ -2872,7 +2983,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 if a.kind != .laser { sceneChanged = true }
                 drawTransformed {
                     draw(annotation: a, index: i)
-                    if selected.contains(i) { drawSelectionBox(a) }
+                    if selected.contains(i) { drawSelectionBox(a, index: i) }
                 }
                 continue
             }
@@ -2890,7 +3001,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 elementCache[i] = e
                 e.image.draw(in: worldToScreen(a.rect.insetBy(dx: -e.pad, dy: -e.pad)))
                 if selected.contains(i) {
-                    drawTransformed { drawSelectionBox(a) }
+                    drawTransformed { drawSelectionBox(a, index: i) }
                 }
             } else {
                 sceneChanged = true
@@ -2898,12 +3009,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     elementCache[i] = entry
                     entry.image.draw(in: worldToScreen(a.rect.insetBy(dx: -entry.pad, dy: -entry.pad)))
                     if selected.contains(i) {
-                        drawTransformed { drawSelectionBox(a) }
+                        drawTransformed { drawSelectionBox(a, index: i) }
                     }
                 } else {
                     drawTransformed {
                         draw(annotation: a, index: i)
-                        if selected.contains(i) { drawSelectionBox(a) }
+                        if selected.contains(i) { drawSelectionBox(a, index: i) }
                     }
                 }
             }
@@ -3249,8 +3360,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     /// Dashed blue outline shown around every selected annotation — drawn live
-    /// so it stays crisp on top of cached element bitmaps.
-    private func drawSelectionBox(_ a: Annotation) {
+    /// so it stays crisp on top of cached element bitmaps. Hidden while that
+    /// annotation's edit field is open: typing renders cleanly on the canvas
+    /// without a selection box floating around it (Excalidraw shows none).
+    private func drawSelectionBox(_ a: Annotation, index: Int) {
+        guard !(editingView != nil && editingIndex == index) else { return }
         let outline = a.rect.insetBy(dx: -4, dy: -4)
         let sel = NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1)
         sel.setStroke()
@@ -3561,9 +3675,6 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
         switch a.kind {
         case .text:
-            // Text handles resize the text area, never the font. Scaling on
-            // the y-axis made every glyph huge when a user simply wanted to
-            // reveal more rows of a long document.
             let horizontalHandles: [ResizeHandle] = [.midLeft, .midRight]
             let verticalHandles: [ResizeHandle] = [.topMid, .bottomMid]
             let cornerHandles: [ResizeHandle] = [.topLeft, .topRight, .bottomLeft, .bottomRight]
@@ -3576,12 +3687,37 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 let h = measuredTextHeight(for: a, width: newRect.width)
                 a.rect = CGRect(x: newRect.minX, y: orig.minY, width: newRect.width, height: h)
             } else if verticalHandles.contains(handle) {
-                a.textAutoResize = false
-                a.rect = CGRect(x: orig.minX, y: newRect.minY, width: orig.width, height: newRect.height)
+                // Vertical handles scale the font like a corner drag
+                // (Excalidraw's resizeSingleTextElement n/s branch), so
+                // shrinking the box never hides the text behind it. Only a
+                // deliberately-wrapped document keeps the box-height
+                // behavior instead (reveal/hide wrapped rows at a fixed font).
+                let scale = newRect.height / max(1, orig.height)
+                let size = scaledTextBox(for: &a, scale: scale, keepWrapped: !a.textAutoResize)
+                let fixedY = (handle == .topMid) ? orig.maxY : orig.minY
+                let y = (handle == .topMid) ? fixedY - size.height : fixedY
+                a.rect = CGRect(x: orig.minX, y: y, width: size.width, height: size.height)
             } else if cornerHandles.contains(handle) {
-                // Corners resize the box while retaining the selected font.
-                a.textAutoResize = false
-                a.rect = newRect
+                // Corners scale the text like a vector image (Excalidraw's
+                // resizeSingleTextElement / measureFontSizeFromWidth): the font
+                // grows and shrinks with the drag so every glyph stays inside
+                // the box instead of clipping, and the field re-measures to the
+                // new font so a double-click re-edit opens at the new size.
+                let scale = newRect.height / max(1, orig.height)
+                let size = scaledTextBox(for: &a, scale: scale, keepWrapped: !a.textAutoResize)
+                let fixedX: CGFloat
+                switch handle {
+                case .topLeft, .midLeft, .bottomLeft: fixedX = orig.maxX
+                default: fixedX = orig.minX
+                }
+                let fixedY: CGFloat
+                switch handle {
+                case .topLeft, .topMid, .topRight: fixedY = orig.maxY
+                default: fixedY = orig.minY
+                }
+                let x = (handle == .topLeft || handle == .bottomLeft) ? fixedX - size.width : fixedX
+                let y = (handle == .topLeft || handle == .topRight) ? fixedY - size.height : fixedY
+                a.rect = CGRect(x: x, y: y, width: size.width, height: size.height)
             }
         case .freedraw, .autoshape, .laser, .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             let fixedX: CGFloat
@@ -3622,6 +3758,56 @@ final class CanvasView: NSView, NSTextViewDelegate {
             options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
         return max(ceil(bounds.height), ceil(a.fontSize * 1.4))
+    }
+
+    /// Natural (unwrapped) extent of the annotation's text at its current
+    /// font — the exact box free text needs to render every glyph. Mirrors
+    /// Excalidraw's measureText for auto-resize text: width = widest line,
+    /// height = number of explicit lines.
+    private func naturalTextSize(of a: Annotation) -> CGSize {
+        let attributed = a.richText() ?? NSAttributedString(
+            string: a.text,
+            attributes: [.font: Fonts.nsFont(for: a.fontFamily, size: a.fontSize)]
+        )
+        return naturalTextSize(ofText: attributed, minHeight: a.fontSize * 1.4)
+    }
+
+    /// Natural (unwrapped) extent of an attributed string — width = widest
+    /// line, height = number of explicit lines.
+    private func naturalTextSize(ofText text: NSAttributedString, minHeight: CGFloat) -> CGSize {
+        let bounds = text.boundingRect(
+            with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return CGSize(width: max(ceil(bounds.width), 1), height: max(ceil(bounds.height), ceil(minHeight)))
+    }
+
+    /// Applies a corner-drag scale to a text annotation's font and returns
+    /// the box size that shows the whole text at that font. The stored rich
+    /// text (even plain text commits as RTF) is rescaled run-by-run so
+    /// rendering and re-editing agree with `fontSize`, preserving any
+    /// heading/bold size hierarchy. Free text is re-measured so the box is
+    /// exactly its natural extent; deliberately wrapped text scales its
+    /// whole box proportionally (glyphs scale with the font so the wrapped
+    /// lines still fill the box). Always returns a size that fits every
+    /// glyph — text never clips.
+    private func scaledTextBox(for a: inout Annotation, scale: CGFloat, keepWrapped: Bool) -> CGSize {
+        let next = max(6, min(300, a.fontSize * scale))
+        let ratio = next / max(1, a.fontSize)
+        a.fontSize = next
+        if let rich = a.richText() {
+            a.richTextData = rtfData(scaledRichText(rich, by: ratio))
+        }
+        if keepWrapped {
+            return CGSize(
+                width: a.rect.width * scale,
+                height: a.rect.height * scale
+            )
+        }
+        a.textAutoResize = true
+        return a.richTextData != nil
+            ? naturalTextSize(ofText: a.richText() ?? NSAttributedString(), minHeight: a.fontSize * 1.4)
+            : naturalTextSize(of: a)
     }
 
     private func drawSelectionHandles(for a: Annotation) {
@@ -3757,7 +3943,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// over any wallpaper or app — not just on the white screen. The light /
     /// dark syntax palettes follow the same mode.
     private func drawCodeBlock(_ a: Annotation) {
-        let dark = state.canvasBackground == .black
+        let dark = state.canvasBackground.isDark
         let pad: CGFloat = 14
         let bgRect = a.rect.insetBy(dx: -pad, dy: -pad)
         let bg = NSBezierPath(roundedRect: bgRect, xRadius: 8, yRadius: 8)
@@ -5574,6 +5760,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// on the black screen becomes white, a light stroke on the white screen
     /// becomes black. Only kicks in for colors that would be invisible.
     private func autoContrastStrokeColor() {
+        // Colored backdrops (once the palette grows beyond white/black/clear)
+        // would pick whichever end of the luminance range the current stroke is
+        // furthest from; for now the backdrop is always one of the three cases
+        // below, so flip only when the stroke is effectively invisible.
         switch state.canvasBackground {
         case .black:
             if colorLuminance(state.strokeColor) < 0.4 {

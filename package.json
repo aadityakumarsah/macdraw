@@ -1,0 +1,27 @@
+{
+  "name": "macdraw",
+  "version": "1.13.0",
+  "private": true,
+  "description": "Macdraw backend: Supabase + Prisma",
+  "type": "module",
+  "scripts": {
+    "generate": "prisma generate",
+    "db:pull": "prisma db pull",
+    "migrate": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "bootstrap": "node scripts/bootstrap.mjs"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "@supabase/server": "^1.4.1",
+    "@supabase/supabase-js": "^2.109.0",
+    "dotenv": "^17.4.2",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "prisma": "^7.10.0",
+    "typescript": "^7.0.2"
+  }
+}

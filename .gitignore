@@ -3,3 +3,7 @@ dist/
 .DS_Store
 *.dmg
 *.zip
+node_modules/
+.env
+.env.*
+*.log

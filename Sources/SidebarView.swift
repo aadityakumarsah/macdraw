@@ -7,9 +7,15 @@ struct SidebarView: View {
     @ObservedObject var state: CanvasState
     @ObservedObject var pages: PagesManager
     let onClose: () -> Void
-    let onSwitchPage: (UUID) -> Void
+    let onSwitchPage: (String) -> Void
     let onClear: () -> Void
     let onResetView: () -> Void
+    let onOpenDashboard: () -> Void
+    let onToggleTheme: () -> Void
+    let onToggleSync: () -> Void
+
+    @ObservedObject private var sync = SyncService.shared
+    @ObservedObject private var theme = ThemeManager.shared
 
     @State private var newPageName = ""
 
@@ -17,18 +23,23 @@ struct SidebarView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().opacity(0.45)
+            workspace
+            Divider().opacity(0.45)
             pageList
             Divider().opacity(0.45)
             quickTools
             Spacer(minLength: 0)
             Divider().opacity(0.45)
+            syncFooter
+            Divider().opacity(0.45)
             canvasActions
         }
+        .preferredColorScheme(theme.theme.colorScheme)
         .frame(width: 292, height: 560)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                .stroke(Color.primary.opacity(0.18), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
     }
@@ -51,6 +62,13 @@ struct SidebarView: View {
         }
         .padding(.horizontal, 14)
         .frame(height: 52)
+    }
+
+    private var workspace: some View {
+        VStack(spacing: 4) {
+            SidebarAction(title: "Dashboard", symbol: "gauge.with.dots.needle.67percent", action: onOpenDashboard)
+        }
+        .padding(10)
     }
 
     private var pageList: some View {
@@ -135,6 +153,61 @@ struct SidebarView: View {
         .padding(.vertical, 12)
     }
 
+    private var syncFooter: some View {
+        HStack(spacing: 8) {
+            Button(action: onToggleSync) {
+                SyncDot(state: sync.connection, online: sync.isOnline, phase: sync.phase)
+            }
+            .buttonStyle(.plain)
+            .help("Sync with React Roadmap")
+            VStack(alignment: .leading, spacing: 1) {
+                Text(syncLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.primary)
+                Text(syncSubLabel)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Button(action: onToggleTheme) {
+                Image(systemName: theme.theme == .dark ? "sun.max.fill" : "moon.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .background(Color.primary.opacity(0.08), in: Circle())
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(theme.theme == .dark ? "Switch to Light" : "Switch to Dark")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private var syncLabel: String {
+        switch sync.phase {
+        case .idle: return sync.isOnline ? "Sync ready" : "Sync offline"
+        case .signingIn: return "Signing in…"
+        case .ready:
+            switch sync.connection {
+            case .connected: return "Live sync"
+            case .connecting: return "Connecting…"
+            case .reconnecting: return "Reconnecting…"
+            case .offline, .closed: return "Sync paused"
+            }
+        case .error: return "Sync unavailable"
+        }
+    }
+
+    private var syncSubLabel: String {
+        switch sync.phase {
+        case .idle: return sync.isOnline ? "Shared with the web" : "Tap to go online"
+        case .signingIn: return sync.configuredAccount
+        case .ready: return sync.configuredAccount
+        case .error: return "Offline mode active"
+        }
+    }
+
     private var canvasActions: some View {
         VStack(spacing: 4) {
             SidebarAction(title: "Reset canvas view", symbol: "arrow.up.left.and.arrow.down.right", action: onResetView)
@@ -147,6 +220,32 @@ struct SidebarView: View {
         let id = pages.addPage(named: newPageName.trimmingCharacters(in: .whitespacesAndNewlines))
         newPageName = ""
         onSwitchPage(id)
+    }
+}
+
+struct SyncDot: View {
+    let state: SyncService.Connection
+    let online: Bool
+    let phase: SyncService.Phase
+
+    var body: some View {
+        let color: Color = colorForState
+        Circle()
+            .fill(color)
+            .frame(width: 8, height: 8)
+            .shadow(color: color.opacity(0.6), radius: 3)
+    }
+
+    private var colorForState: Color {
+        guard online else { return .gray.opacity(0.6) }
+        switch phase {
+        case .signingIn, .idle: return .yellow
+        case .ready:
+            if state == .connected { return .green }
+            if state == .connecting { return .yellow }
+            return .orange
+        case .error: return .red
+        }
     }
 }
 

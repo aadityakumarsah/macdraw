@@ -14,4 +14,10 @@ if CommandLine.arguments.contains("--selftest") {
     }
 }
 
+if CommandLine.arguments.contains("--synctest") {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        delegate.runSyncTest()
+    }
+}
+
 app.run()

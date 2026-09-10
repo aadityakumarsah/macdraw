@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 
 /// Borderless panel that sits above everything and hosts the drawing surface.
 final class OverlayWindow: NSPanel {
@@ -63,23 +64,39 @@ final class IslandManager {
     private var isShowing = false
     private var isAnimating = false
     private var logoPalette: LogoPaletteView?
+    private var cancellables = Set<AnyCancellable>()
 
-    private func switchPage(_ id: UUID) {
+    private func switchPage(_ id: String) {
         guard let canvas else { return }
         canvas.saveViewStateToPages()
         pages.switchPage(id: id)
         canvas.applyCurrentPage()
     }
 
-    private func toggleSidebar() {
+private func toggleSidebar() {
         guard let sidebar = sidebarHost else { return }
         state.sidebarVisible.toggle()
         var frame = sidebar.frame
         frame.origin.x = state.sidebarVisible ? 16 : -frame.width - 16
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.2
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
             sidebar.animator().frame = frame
+        }
+    }
+
+    /// The Dashboard sidebar action writes a fresh React page ("Hello World")
+    /// into Application Support and redirects to it in the default browser.
+    private func openDashboard() {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("macdraw", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("dashboard.html")
+        do {
+            try DashboardPage.html.write(to: file, atomically: true, encoding: .utf8)
+            NSWorkspace.shared.open(file)
+        } catch {
+            print("dashboard: could not write page: \(error)")
         }
     }
 
@@ -139,6 +156,16 @@ final class IslandManager {
 
     init(state: CanvasState) {
         self.state = state
+        // Re-theme the chrome panels live when the user switches Light/Dark.
+        // The drawing toolbar is intentionally pinned dark (HUD).
+        ThemeManager.shared.$theme
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] theme in
+                self?.sidebarHost?.appearance = theme.appearance
+                self?.aiHost?.appearance = theme.appearance
+            }
+            .store(in: &cancellables)
     }
 
     func toggle() {
@@ -263,6 +290,7 @@ final class IslandManager {
         canvas.frame = contentFrame
         container.addSubview(canvas)
         self.canvas = canvas
+        (NSApp.delegate as? AppDelegate)?.activeCanvas = canvas
 
         let sidebar = NSHostingView(
             rootView: SidebarView(
@@ -271,11 +299,15 @@ final class IslandManager {
                 onClose: { [weak self] in self?.toggleSidebar() },
                 onSwitchPage: { [weak self] id in self?.switchPage(id) },
                 onClear: { [weak canvas] in canvas?.clearAll() },
-                onResetView: { [weak canvas] in canvas?.resetView() }
+                onResetView: { [weak canvas] in canvas?.resetView() },
+                onOpenDashboard: { [weak self] in self?.openDashboard() },
+                onToggleTheme: { ThemeManager.shared.toggle() },
+                onToggleSync: { SyncService.shared.setOnline(!SyncService.shared.isOnline) }
             )
         )
         sidebar.frame = CGRect(x: -308, y: 106, width: 292, height: 560)
-        sidebar.appearance = NSAppearance(named: .darkAqua)
+        // Follows the user's chosen theme (light or dark).
+        sidebar.appearance = ThemeManager.shared.theme.appearance
         container.addSubview(sidebar)
         sidebarHost = sidebar
         container.sidebarHost = sidebar
@@ -292,7 +324,7 @@ final class IslandManager {
             }, onClose: { [weak self] in self?.toggleAIDrawer() })
         )
         aiDrawer.frame = CGRect(x: -406, y: 120, width: 390, height: 520)
-        aiDrawer.appearance = NSAppearance(named: .darkAqua)
+        aiDrawer.appearance = ThemeManager.shared.theme.appearance
         container.addSubview(aiDrawer)
         aiHost = aiDrawer
         container.aiHost = aiDrawer
@@ -438,6 +470,10 @@ final class IslandManager {
                 let p = sidebar.convert(event.locationInWindow, from: nil)
                 if sidebar.bounds.contains(p) { return event }
             }
+            if let ai = self.aiHost {
+                let p = ai.convert(event.locationInWindow, from: nil)
+                if ai.bounds.contains(p) { return event }
+            }
             return canvas.handleGesture(event) ? nil : event
         }
     }
@@ -455,6 +491,7 @@ final class IslandManager {
         toolbarHost = nil
         sidebarHost = nil
         aiHost = nil
+        (NSApp.delegate as? AppDelegate)?.activeCanvas = nil
         state.sidebarVisible = false
         window.contentView = nil
     }
@@ -1382,6 +1419,240 @@ final class IslandManager {
                                 }
                             }
                             log("data structure test: PASS")
+
+                            log("text corner scale test: shrinking a multi-line text scales its font like a vector image")
+                            self.state.codeBlockMode = false
+                            self.state.tool = .text
+                            self.state.lastNonTextTool = .selection
+                            let tapT = CGPoint(x: 900, y: 300)
+                            canvas.selftestBeginNewText(at: tapT)
+                            if !canvas.isEditingText {
+                                log("FAIL: corner-scale text field did not open")
+                                exit(1)
+                            }
+                            canvas.selftestSetText("Alpha beta gamma\nDelta epsilon zeta")
+                            canvas.selftestCommitEditing()
+                            guard let t0 = canvas.annotations.last, t0.kind == .text, t0.text == "Alpha beta gamma\nDelta epsilon zeta" else {
+                                log("FAIL: corner-scale text did not commit as expected (got \(String(describing: canvas.annotations.last?.text)))")
+                                exit(1)
+                            }
+                            let t0Rect = t0.rect
+                            let t0Font = t0.fontSize
+                            if t0.textAutoResize != true {
+                                log("FAIL: fresh text should be free (autoResize), got \(t0.textAutoResize)")
+                                exit(1)
+                            }
+                            self.state.tool = .selection
+                            canvas.selftestSelect([canvas.annotations.count - 1])
+                            if !canvas.selected.contains(canvas.annotations.count - 1) {
+                                log("FAIL: corner-scale text not selected")
+                                exit(1)
+                            }
+                            let cornerPt = CGPoint(x: t0Rect.maxX, y: t0Rect.maxY)
+                            // Drag the bottom-right handle inward by ~35% on each
+                            // axis; the opposite corner stays pinned.
+                            let shrink = CGPoint(x: t0Rect.maxX - t0Rect.width * 0.35, y: t0Rect.maxY - t0Rect.height * 0.35)
+                            canvas.mouseDown(with: self.mouseEvent(at: self.win(cornerPt), type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: self.win(shrink), type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: self.win(shrink), type: .leftMouseUp))
+                            guard let scaled = canvas.annotations.last, scaled.kind == .text else {
+                                log("FAIL: corner-text vanished after resize")
+                                exit(1)
+                            }
+                            let expectScale = (shrink.y - t0Rect.minY) / max(1, t0Rect.height)
+                            log("corner scale: font \(t0Font) -> \(scaled.fontSize), rect \(scaled.rect) (expected scale \(expectScale))")
+                            if abs((scaled.fontSize / max(1, t0Font)) - expectScale) > 0.08 {
+                                log("FAIL: font did not scale with the drag ratio: \(t0Font) -> \(scaled.fontSize), ratio \(scaled.fontSize / max(1, t0Font)) vs \(expectScale)")
+                                exit(1)
+                            }
+                            // The box re-measures to the scaled extent (never clips).
+                            if abs(scaled.rect.width - t0Rect.width * expectScale) > t0Rect.width * 0.2
+                                || abs(scaled.rect.height - t0Rect.height * expectScale) > t0Rect.height * 0.18 {
+                                log("FAIL: box did not shrink proportionally: \(t0Rect) -> \(scaled.rect)")
+                                exit(1)
+                            }
+                            // The opposite (top-left) corner of the drag stays put.
+                            if abs(scaled.rect.minX - t0Rect.minX) > 2 || abs(scaled.rect.minY - t0Rect.minY) > 2 {
+                                log("FAIL: resized text moved off its pinned corner: \(t0Rect.origin) -> \(scaled.rect.origin)")
+                                exit(1)
+                            }
+                            // Double-click re-opens editing at the new font size.
+                            let re = self.win(CGPoint(x: scaled.rect.midX, y: scaled.rect.midY))
+                            canvas.mouseDown(with: self.mouseEvent(at: re, type: .leftMouseDown, clickCount: 2))
+                            canvas.mouseUp(with: self.mouseEvent(at: re, type: .leftMouseUp, clickCount: 2))
+                            if !canvas.isEditingText {
+                                log("FAIL: double-click did not re-open the resized text")
+                                exit(1)
+                            }
+                            if let fs = canvas.selftestEditingFontSize(at: 0) {
+                                if abs(fs - scaled.fontSize) > 1.5 {
+                                    log("FAIL: re-edit font \(fs) differs from scaled font \(scaled.fontSize)")
+                                    exit(1)
+                                }
+                            } else {
+                                log("FAIL: no editable font in re-opened field")
+                                exit(1)
+                            }
+                            canvas.selftestCommitEditing()
+                            guard let finalT = canvas.annotations.last, finalT.kind == .text else {
+                                log("FAIL: re-edited text did not commit")
+                                exit(1)
+                            }
+                            if abs(finalT.rect.minX - scaled.rect.minX) > 2 || abs(finalT.rect.minY - scaled.rect.minY) > 2 {
+                                log("FAIL: re-edit moved the scaled text")
+                                exit(1)
+                            }
+                            log("text corner scale test: PASS (font \(t0Font) -> \(scaled.fontSize), rect \(t0Rect.size) -> \(scaled.rect.size))")
+
+                            log("text vertical scale test: shrinking the top edge scales the glyphs so text never hides behind the box")
+                            canvas.selftestSelect([canvas.annotations.count - 1])
+                            guard let v0 = canvas.annotations.last, v0.kind == .text else {
+                                log("FAIL: vertical-scale text missing")
+                                exit(1)
+                            }
+                            let vRect = v0.rect
+                            let vFont = v0.fontSize
+                            let dropV: CGFloat = 0.5
+                            let vHandle = self.win(CGPoint(x: vRect.midX, y: vRect.minY))
+                            let vTarget = self.win(CGPoint(x: vRect.midX, y: vRect.minY + vRect.height * dropV))
+                            canvas.mouseDown(with: self.mouseEvent(at: vHandle, type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: vTarget, type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: vTarget, type: .leftMouseUp))
+                            guard let vs = canvas.annotations.last, vs.kind == .text else {
+                                log("FAIL: vertical-resized text vanished")
+                                exit(1)
+                            }
+                            let expV = 1 - dropV
+                            log("vertical scale: font \(vFont) -> \(vs.fontSize), rect \(vRect) -> \(vs.rect) (expected scale \(expV))")
+                            if abs((vs.fontSize / max(1, vFont)) - expV) > 0.08 {
+                                log("FAIL: vertical drag did not scale the font: \(vFont) -> \(vs.fontSize)")
+                                exit(1)
+                            }
+                            if abs(vs.rect.height - vRect.height * expV) > vRect.height * 0.2 {
+                                log("FAIL: box height did not follow the vertical drag: \(vRect.height) -> \(vs.rect.height)")
+                                exit(1)
+                            }
+                            // The bottom edge stays pinned, and the box still
+                            // fits the glyphs — nothing is hidden behind it.
+                            if abs(vs.rect.maxY - vRect.maxY) > 2 {
+                                log("FAIL: vertical drag unpinned the bottom edge")
+                                exit(1)
+                            }
+                            if vs.rect.height < vs.fontSize * 1.3 {
+                                log("FAIL: box smaller than its glyphs (text would hide): height \(vs.rect.height) vs font \(vs.fontSize)")
+                                exit(1)
+                            }
+                            // Double-click re-opens at the newly scaled size.
+                            let vre = self.win(CGPoint(x: vs.rect.midX, y: vs.rect.midY))
+                            canvas.mouseDown(with: self.mouseEvent(at: vre, type: .leftMouseDown, clickCount: 2))
+                            canvas.mouseUp(with: self.mouseEvent(at: vre, type: .leftMouseUp, clickCount: 2))
+                            if !canvas.isEditingText {
+                                log("FAIL: double-click did not reopen the vertically-resized text")
+                                exit(1)
+                            }
+                            if let fs = canvas.selftestEditingFontSize(at: 0) {
+                                if abs(fs - vs.fontSize) > 1.5 {
+                                    log("FAIL: reopened font \(fs) differs from scaled font \(vs.fontSize)")
+                                    exit(1)
+                                }
+                            }
+                            canvas.selftestCommitEditing()
+                            log("text vertical scale test: PASS (font \(vFont) -> \(vs.fontSize), height \(vRect.height) -> \(vs.rect.height))")
+
+                            log("long text glue test: long text auto-grows wide (no tiny wrap column) and stays anchored through pan")
+                            self.state.codeBlockMode = false
+                            self.state.tool = .text
+                            self.state.lastNonTextTool = .selection
+                            // Open a brand-new standalone field directly (no hit-testing,
+                            // so the anchor is exactly where we assert).
+                            let tap = CGPoint(x: 600, y: 200)
+                            canvas.selftestBeginNewText(at: tap)
+                            if !canvas.isEditingText {
+                                log("FAIL: text editing did not start")
+                                exit(1)
+                            }
+                            // The field's anchor = the world point under the click.
+                            let anchor1 = canvas.selftestScreenToWorld(tap)
+                            let oneLine = String(repeating: "word ", count: 40)
+                            canvas.selftestSetText(oneLine)
+                            guard let lineFrame = canvas.selftestEditingFrame else {
+                                log("FAIL: no edit field after typing")
+                                exit(1)
+                            }
+                            // No automatic wrap: a 200-char unbroken line (no \n)
+                            // stays on ONE line — the field grows wide while the
+                            // height never balloons (Excalidraw auto-resize).
+                            if lineFrame.width < 200 {
+                                log("FAIL: long single line did not auto-grow in width: \(lineFrame.width)")
+                                exit(1)
+                            }
+                            if lineFrame.height > 100 {
+                                log("FAIL: long single line wrapped without an explicit newline (height ballooned to \(lineFrame.height))")
+                                exit(1)
+                            }
+                            // Explicit newlines (Enter) break lines: width keeps
+                            // the widest line, height grows downward.
+                            let longText = oneLine + "\n" + (1...40).map { "line \($0)" }.joined(separator: "\n")
+                            canvas.selftestSetText(longText)
+                            guard let grownFrame = canvas.selftestEditingFrame else {
+                                log("FAIL: no edit field after typing multi-line")
+                                exit(1)
+                            }
+                            if abs(grownFrame.width - lineFrame.width) > 4 {
+                                log("FAIL: width changed when only adding lines, \(lineFrame.width) -> \(grownFrame.width)")
+                                exit(1)
+                            }
+                            if grownFrame.height <= lineFrame.height {
+                                log("FAIL: explicit newlines should grow height, \(lineFrame.height) -> \(grownFrame.height)")
+                                exit(1)
+                            }
+                            // Pan the canvas mid-edit (like two-finger scroll). The field
+                            // must glide WITH the canvas so the committed note stays where
+                            // the user clicked — this was the "text vanishes" symptom.
+                            let pan = CGVector(dx: 140, dy: 90)
+                            canvas.selftestPanCanvas(dx: pan.dx, dy: pan.dy)
+                            if let movedFrame = canvas.selftestEditingFrame {
+                                if abs((movedFrame.origin.x - grownFrame.origin.x) - pan.dx) > 1.5
+                                    || abs((movedFrame.origin.y - grownFrame.origin.y) - pan.dy) > 1.5 {
+                                    log("FAIL: edit field did not glide with the canvas: before \(grownFrame.origin) after \(movedFrame.origin)")
+                                    exit(1)
+                                }
+                            } else {
+                                log("FAIL: edit field vanished after pan")
+                                exit(1)
+                            }
+                            canvas.selftestCommitEditing()
+                            guard let glueNote = canvas.annotations.last, glueNote.kind == .text else {
+                                log("FAIL: long text did not commit as a text annotation")
+                                exit(1)
+                            }
+                            if abs(glueNote.rect.minX - anchor1.x) > 2 || abs(glueNote.rect.minY - anchor1.y) > 2 {
+                                log("FAIL: committed text detached from its anchor after pan: anchor \(anchor1) -> \(glueNote.rect.origin)")
+                                exit(1)
+                            }
+                            log("long text glue test: PASS (anchor \(anchor1) preserved, grown width \(grownFrame.width))")
+
+                            log("long text zoom test: zooming + panning mid-edit keeps the field glued")
+                            canvas.selftestBeginNewText(at: tap)
+                            if !canvas.isEditingText {
+                                log("FAIL: text editing did not start on second open")
+                                exit(1)
+                            }
+                            let anchor2 = canvas.selftestScreenToWorld(tap)
+                            canvas.selftestSetText(longText)
+                            canvas.selftestZoom(1.5)
+                            canvas.selftestPanCanvas(dx: -60, dy: 40)
+                            canvas.selftestSetText(longText)
+                            canvas.selftestCommitEditing()
+                            guard let zoomNote = canvas.annotations.last, zoomNote.kind == .text else {
+                                log("FAIL: zoomed long text did not commit as a text annotation")
+                                exit(1)
+                            }
+                            if abs(zoomNote.rect.minX - anchor2.x) > 3 || abs(zoomNote.rect.minY - anchor2.y) > 3 {
+                                log("FAIL: text drifted after zoom+pan: anchor \(anchor2) -> \(zoomNote.rect.origin)")
+                                exit(1)
+                            }
+                            log("long text zoom test: PASS (anchor \(anchor2) preserved through zoom+pan)")
                             log("SELFTEST PASS")
                             exit(0)
                         }
@@ -1543,4 +1814,50 @@ extension IslandManager: LogoPaletteDelegate {
     func logoPaletteDidClose() {
         closeLogoPalette()
     }
+}
+
+/// A self-contained React 18 page that the Dashboard sidebar action generates.
+enum DashboardPage {
+    static let html = """
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Macdraw Dashboard</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+             background: #0f1115; color: #f5f5f7;
+             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      h1 { font-size: 4rem; letter-spacing: -0.02em; margin: 0 0 0.25em; }
+      p  { color: #8e8e93; margin: 0; }
+      .root { text-align: center; }
+    </style>
+    </head>
+    <body>
+    <div id="root" class="root"></div>
+    <script>
+      if (!window.React) {
+        document.getElementById("root").innerHTML =
+          "<h1>Hello World</h1><p>Macdraw Dashboard (React CDN unavailable)</p>";
+      } else {
+        function Headline() {
+          return React.createElement("h1", null, "Hello World");
+        }
+        function App() {
+          return React.createElement("div", null,
+            React.createElement(Headline),
+            React.createElement("p", null, "Macdraw Dashboard")
+          );
+        }
+        ReactDOM.createRoot(document.getElementById("root")).render(
+          React.createElement(App)
+        );
+      }
+    </script>
+    </body>
+    </html>
+    """
 }

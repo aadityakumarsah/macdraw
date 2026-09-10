@@ -44,6 +44,15 @@ struct DiagramNode: Codable, Identifiable {
     var y: CGFloat
     var width: CGFloat = 150
     var height: CGFloat = 64
+    /// Optional SF Symbol name (e.g. "server.rack", "person.crop.circle",
+    /// "brain", "doc.text") rendered as an icon above the label. Omit to draw
+    /// a plain shape. When an icon is given, the node renders it prominently.
+    var symbol: String? = nil
+    /// When true, this node renders as a syntax-highlighted code block
+    /// (monospaced text on a translucent background) instead of a shape.
+    /// `label` holds the code content. Best for showing a code snippet inside
+    /// an architecture or flow diagram.
+    var code: Bool = false
 }
 struct DiagramEdge: Codable, Identifiable {
     var id: String
@@ -51,11 +60,66 @@ struct DiagramEdge: Codable, Identifiable {
     var to: String
     var label: String? = nil
     var style: String = "curved"
+    /// Arrowhead on the start of the connector: "none" (default), "arrow",
+    /// "triangle", "bar".
+    var startArrow: String = "none"
+    /// Arrowhead on the end of the connector: "arrow" (default), "none",
+    /// "triangle", "bar".
+    var endArrow: String = "arrow"
 }
 struct DiagramSpec: Codable {
     var title: String? = nil
     var nodes: [DiagramNode]
     var edges: [DiagramEdge]
+}
+
+/// Catalog of SF Symbols the AI may attach to nodes as icons/logos. These are
+/// known-good on macOS 13+. Keeps the model from guessing invalid names.
+enum AIIconCatalog {
+    static let icons: [String] = [
+        "person.crop.circle", "person.2", "person.3", "server.rack", "cpu",
+        "memorychip", "internaldrive", "externaldrive", "network", "wifi",
+        "globe", "cloud", "icloud", "cylinder.split.1x2", "cylinder",
+        "bolt", "bolt.horizontal", "flame", "hammer", "wrench", "gearshape",
+        "lock.shield", "shield", "key", "ladybug", "shield.lefthalf.filled",
+        "checkmark.shield", "exclamationmark.triangle", "checkmark.circle",
+        "xmark.circle", "exclamationmark.octagon", "info.circle",
+        "lightbulb", "lightbulb.fill", "brain", "sparkles", "scope",
+        "chart.bar.xaxis", "chart.line.uptrend.xyaxis", "function",
+        "chevron.left.forwardslash.chevron.right", "curlybraces", "terminal",
+        "square.stack.3d.up", "cube", "layers", "doc.text", "doc.plaintext",
+        "doc.richtext", "folder", "folder.fill", "arrow.triangle.branch",
+        "arrow.triangle.merge", "arrow.triangle.pull", "arrow.up.right",
+        "arrow.down", "arrow.right", "envelope", "bubble.left",
+        "bubble.left.and.bubble.right", "message", "bell", "phone", "video",
+        "paperplane", "creditcard", "cart", "bag", "gift", "star", "heart",
+        "camera", "photo", "movieclapper", "music.note", "clock", "calendar",
+        "location", "map", "mappin", "car", "airplane", "bicycle", "tram",
+        "banknote", "percent", "dollarsign", "eurosign", "stethoscope",
+        "cross.case", "pill", "syringe", "fork.knife", "cup.and.saucer",
+        "tortoise", "hare", "leaf", "drop", "snowflake", "sun.max", "moon",
+        "exclamationmark.bubble", "questionmark.circle", "at", "app",
+        "square.stack", "rectangle.3.group", "rectangle.grid.2x2",
+        "square.grid.2x2", "arrow.triangle.2.circlepath", "repeat",
+        "shuffle", "arrow.clockwise", "arrow.counterclockwise", "arrow.up",
+        "arrow.up.circle", "play", "pause", "stop", "forward", "backward",
+    ]
+}
+
+/// A small, deterministic hint the agent loop uses on later passes to fix
+/// common structural mistakes the first generation tends to make.
+enum AICritiqueRules {
+    static let text = """
+    Improve the diagram for correctness and clarity:
+    - Every edge.from and edge.to must reference an actual node id.
+    - Keep labels short; use an icon symbol on key nodes when it helps.
+    - Use distinct `kind` values to show meaning (start/end, decision, input,
+      process, database, etc.) and pick `style` (curved/orthogonal/straight)
+      that reads clearly.
+    - Remove duplicate or unreachable nodes; make the flow obvious.
+    - Preserve the overall intent of the request. Do not invent unrelated steps.
+    - Do not change the JSON schema.
+    """
 }
 
 final class AISettings: ObservableObject {
@@ -312,15 +376,106 @@ enum KeychainStore {
 
 @MainActor enum DiagramAI {
     static let systemPrompt = """
-    Convert the request into an editable diagram. Return ONLY valid JSON: {"title":"", "nodes":[{"id":"n1","label":"short label","kind":"start|end|decision|input|process|database","x":0,"y":0,"width":150,"height":64}],"edges":[{"id":"e1","from":"n1","to":"n2","label":"optional","style":"curved|orthogonal|straight"}]}. Use a readable left-to-right or top-to-bottom layout. Every edge must refer to a node id. Keep labels concise.
+    You build precise, editable text-to-diagram JSON for a drawing canvas.
+
+    Return ONLY a valid JSON object with this exact schema (no markdown, no prose):
+    {"title":"short title","nodes":[{"id":"n1","label":"short label","kind":"...","x":0,"y":0,"width":150,"height":64,"symbol":"optional SF Symbol name","code":false}],"edges":[{"id":"e1","from":"n1","to":"n2","label":"optional","style":"curved|orthogonal|straight","startArrow":"none|arrow|triangle|bar","endArrow":"arrow|none|triangle|bar"}]}
+
+    Rules:
+    - Every edge.from and edge.to MUST reference an existing node id. Every node
+      should participate in the flow unless it is intentionally standalone.
+    - Use a clean left-to-right or top-to-bottom layout: meaningfully spaced x and
+      y positions (e.g. step by ~220 in x or ~140 in y) so nothing overlaps. Do
+      not return all zeros.
+    - Choose `kind` from: start, end, decision, input, process, database,
+      predefined, cloud, cube, storage (server stack), note, callout, shape,
+      data (linked list / sequence), page. Map them to the natural meaning:
+        - start/end/terminator -> start/end
+        - a yes/no or branch -> decision
+        - a user type/entry -> input
+        - an external service or system -> cloud
+        - database or a store -> database
+        - a highlighted remark/annotation -> note
+        - anything else that does work -> process
+    - `symbol`: OPTIONALLY pick ONE SF Symbol name (a small logo/icon) that best
+      matches a node, ONLY from this allowed list:
+      \(AIIconCatalog.icons.joined(separator: ", "))
+      Use "" (or omit) on most nodes; reserve icons for the 2-5 most important
+      ones so the diagram stays clean.
+    - `code`: set true ONLY when the "label" is an actual code snippet the user
+      asked to show (rendered as a highlighted code block). Keep code short.
+    - Edges: `style` curved is fine, but use orthogonal or straight for clean
+      right-angle flows. Set `label` only when a connection deserves a word
+      (e.g. "yes"/"no", a reason, a request/response).
+    - Prefer concrete, specific labels over vague ones. Keep labels concise.
+    - For long flows, prefer breadth over depth but never drop required steps.
     """
-    static func generate(prompt: String, settings: AISettings) async throws -> DiagramSpec {
+
+    /// Maximum number of refinement passes the agent loop runs. Each pass asks
+    /// the model to improve the previous draft. The best validated result wins.
+    static let maxAgentIterations = 3
+
+    /// Generates a diagram, then runs an agent loop that critiques and refines
+    /// the draft up to `maxAgentIterations - 1` more times, returning the best
+    /// structurally-valid result.
+    static func generate(prompt: String, settings: AISettings, progress: ((String) -> Void)? = nil) async throws -> DiagramSpec {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw NSError(domain: "MacdrawAI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Describe the diagram first."]) }
         if settings.provider == .local && settings.endpoint.isEmpty { throw NSError(domain: "MacdrawAI", code: 2, userInfo: [NSLocalizedDescriptionKey: "Set the local Ollama endpoint."]) }
         if settings.provider != .local && settings.apiKey.isEmpty { throw NSError(domain: "MacdrawAI", code: 3, userInfo: [NSLocalizedDescriptionKey: "Add an API key in Settings."]) }
         if settings.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { throw NSError(domain: "MacdrawAI", code: 4, userInfo: [NSLocalizedDescriptionKey: "Set a model name in Settings."]) }
-        let content = try await request(prompt: prompt, settings: settings)
-        return try decode(content)
+
+        // Pass 0: initial generation.
+        progress?("Drafting \(prompt)…")
+        let first = try await request(prompt: prompt, settings: settings)
+        var best = try decode(first)
+
+        // Agent loop: critique + refine repeatedly, keeping the best draft.
+        for pass in 1..<maxAgentIterations {
+            guard let currentJSON = specJSON(best) else { break }
+            progress?("Refining pass \(pass) of \(maxAgentIterations - 1)…")
+            let refinePrompt = """
+            Original request: \(prompt)
+
+            Current draft JSON:
+            \(currentJSON)
+
+            \(AICritiqueRules.text)
+
+            Return the improved JSON only.
+            """
+            let response = try await request(prompt: refinePrompt, settings: settings)
+            guard let candidate = try? decode(response) else { continue }
+            // Keep the candidate only if it is at least as complete and valid.
+            if isValid(candidate) && completeness(candidate) >= completeness(best) {
+                best = candidate
+            }
+        }
+        return best
+    }
+
+    /// Serializes a spec to a compact JSON string for iterative refinement.
+    private static func specJSON(_ spec: DiagramSpec) -> String? {
+        (try? JSONEncoder().encode(spec)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    /// Structural sanity check beyond Decodable: every edge references real
+    /// nodes, nodes are uniquely id'd, and the diagram isn't empty.
+    static func isValid(_ spec: DiagramSpec) -> Bool {
+        guard !spec.nodes.isEmpty else { return false }
+        var seen = Set<String>()
+        for n in spec.nodes {
+            if seen.contains(n.id) || n.id.isEmpty { return false }
+            seen.insert(n.id)
+        }
+        for e in spec.edges {
+            guard seen.contains(e.from), seen.contains(e.to) else { return false }
+        }
+        return true
+    }
+
+    /// A simple completeness score used to prefer denser, more faithful drafts.
+    static func completeness(_ spec: DiagramSpec) -> Int {
+        spec.nodes.count * 2 + spec.edges.count
     }
     static func test(settings: AISettings) async -> String {
         do {
@@ -351,7 +506,7 @@ enum KeychainStore {
             if settings.provider != .anthropic {
                 return await healthCheck(settings: settings)
             }
-            _ = try await request(prompt: "Return an empty diagram.", settings: settings, maxTokens: 40)
+            _ = try await request(prompt: "Reply with the single word OK.", settings: settings, maxTokens: 1024)
             return "Connected"
         } catch { return error.localizedDescription }
     }
@@ -396,7 +551,7 @@ enum KeychainStore {
             return "Connected (API key accepted)"
         } catch { return error.localizedDescription }
     }
-    private static func request(prompt: String, settings: AISettings, maxTokens: Int = 1400) async throws -> String {
+    private static func request(prompt: String, settings: AISettings, maxTokens: Int = 2600) async throws -> String {
         let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let urlString: String
         var body: [String: Any]
@@ -479,6 +634,7 @@ struct AIDiagramDrawer: View {
     @State private var prompt = ""
     @State private var diagram: DiagramSpec?
     @State private var isGenerating = false
+    @State private var generatingStatus = ""
     @State private var error = ""
     @State private var settingsOpen = false
     @State private var messages: [AIChatMessage] = []
@@ -492,6 +648,7 @@ struct AIDiagramDrawer: View {
                 ForEach(messages) { message in AIChatBubble(message: message) }
                 TextEditor(text: $prompt).font(.system(size: 13)).frame(height: 108).padding(7).background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
                 HStack { Button("Example") { prompt = "Create an onboarding flow: Start, create account, verify email, decision: verified?, dashboard or resend email." }.buttonStyle(.borderless); Spacer(); if !messages.isEmpty { Button("Clear chat") { messages.removeAll(); diagram = nil; error = "" }.buttonStyle(.borderless) }; Button { generate() } label: { Label(isGenerating ? "Generating…" : "Generate", systemImage: "arrow.up.circle.fill") }.disabled(isGenerating).buttonStyle(.borderedProminent) }
+                if isGenerating && !generatingStatus.isEmpty { Text(generatingStatus).font(.system(size: 11)).foregroundStyle(.secondary) }
                 if !error.isEmpty { Text(error).font(.system(size: 11)).foregroundStyle(.red) }
                 if let diagram { DiagramPreview(diagram: diagram).frame(height: 245).background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 10)); HStack { Text("\(diagram.nodes.count) objects · \(diagram.edges.count) editable connectors").font(.system(size: 11)).foregroundStyle(.secondary); Spacer(); Button("Insert into canvas") { onInsert(diagram) }.buttonStyle(.borderedProminent) } }
             }.padding(14) }
@@ -504,13 +661,15 @@ struct AIDiagramDrawer: View {
         let modelPrompt = previous.map { "Update this existing diagram according to the request. Preserve useful nodes and edges unless the request changes them. Existing JSON: \($0)\nRequest: \(request)" } ?? request
         messages.append(AIChatMessage(role: "user", text: request))
         prompt = ""
-        isGenerating = true; error = ""
+        isGenerating = true; generatingStatus = "Starting…"; error = ""
         Task {
             do {
-                let output = try await DiagramAI.generate(prompt: modelPrompt, settings: settings)
-                await MainActor.run { diagram = output; messages.append(AIChatMessage(role: "assistant", text: "Generated \(output.nodes.count) nodes and \(output.edges.count) connectors. Review the preview, then insert it into the canvas.")); isGenerating = false }
+                let output = try await DiagramAI.generate(prompt: modelPrompt, settings: settings) { status in
+                    Task { @MainActor in self.generatingStatus = status }
+                }
+                await MainActor.run { diagram = output; generatingStatus = ""; messages.append(AIChatMessage(role: "assistant", text: "Generated \(output.nodes.count) nodes and \(output.edges.count) connectors. Review the preview, then insert it into the canvas.")); isGenerating = false }
             } catch {
-                await MainActor.run { self.error = error.localizedDescription; isGenerating = false }
+                await MainActor.run { self.error = error.localizedDescription; generatingStatus = ""; isGenerating = false }
             }
         }
     }
@@ -639,13 +798,119 @@ private struct DiagramPreview: View {
 
 private struct DiagramPreviewEdge: View {
     let edge: DiagramEdge; let start: CGPoint; let end: CGPoint
-    var body: some View { Path { path in
-        path.move(to: start)
-        if edge.style == "curved" { path.addCurve(to: end, control1: CGPoint(x: start.x + (end.x-start.x)*0.45, y: start.y), control2: CGPoint(x: start.x + (end.x-start.x)*0.55, y: end.y)) } else { path.addLine(to: end) }
-    }.stroke(Color.accentColor, style: SwiftUI.StrokeStyle(lineWidth: 1.5, lineCap: .round)) }
+    var body: some View {
+        ZStack {
+            Path { path in
+                path.move(to: start)
+                if edge.style == "curved" { path.addCurve(to: end, control1: CGPoint(x: start.x + (end.x-start.x)*0.45, y: start.y), control2: CGPoint(x: start.x + (end.x-start.x)*0.55, y: end.y)) } else { path.addLine(to: end) }
+            }.stroke(Color.accentColor, style: SwiftUI.StrokeStyle(lineWidth: 1.5, lineCap: .round))
+            if edge.startArrow != "none" {
+                ArrowGlyph(at: start, toward: end)
+            }
+            if edge.endArrow != "none" {
+                ArrowGlyph(at: end, toward: start)
+            }
+        }
+    }
+}
+
+private struct ArrowGlyph: View {
+    let at: CGPoint
+    let toward: CGPoint
+    private var angle: CGFloat { atan2(toward.y - at.y, toward.x - at.x) }
+    var body: some View {
+        let len: CGFloat = 7
+        Path { p in
+            p.move(to: CGPoint(x: at.x + cos(angle) * len, y: at.y + sin(angle) * len))
+            p.addLine(to: CGPoint(x: at.x + cos(angle + 2.6) * len, y: at.y + sin(angle + 2.6) * len))
+            p.move(to: CGPoint(x: at.x + cos(angle) * len, y: at.y + sin(angle) * len))
+            p.addLine(to: CGPoint(x: at.x + cos(angle - 2.6) * len, y: at.y + sin(angle - 2.6) * len))
+        }.stroke(Color.accentColor, lineWidth: 1.5).frame(width: 0, height: 0)
+    }
 }
 
 private struct DiagramPreviewNode: View {
     let node: DiagramNode; let rect: CGRect
-    var body: some View { ZStack { RoundedRectangle(cornerRadius: 7).fill(Color(nsColor: .windowBackgroundColor)).overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.accentColor, lineWidth: 1)); Text(node.label).font(.system(size: max(8, min(12, rect.height * 0.24)))).lineLimit(2).multilineTextAlignment(.center).padding(4) }.frame(width: rect.width, height: rect.height).position(x: rect.midX, y: rect.midY) }
+    private var shapeFill: Color {
+        switch node.kind.lowercased() {
+        case "start", "end": return Color.green.opacity(0.9)
+        case "decision": return Color.yellow.opacity(0.55)
+        case "input": return Color.blue.opacity(0.35)
+        case "database": return Color.purple.opacity(0.35)
+        case "cloud": return Color.cyan.opacity(0.35)
+        case "note": return Color.orange.opacity(0.35)
+        default: return Color(nsColor: .windowBackgroundColor)
+        }
+    }
+    var body: some View {
+        if node.code {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.black.opacity(0.7))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.accentColor, lineWidth: 1))
+                .overlay(
+                    Text(node.label)
+                        .font(.system(size: max(7, min(10, rect.height * 0.16)), design: .monospaced))
+                        .foregroundStyle(Color.green)
+                        .lineLimit(4)
+                        .padding(3),
+                    alignment: .topLeading
+                )
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        } else {
+            ZStack {
+                shape(rect: rect)
+                    .fill(shapeFill)
+                    .overlay(shape(rect: rect).stroke(Color.accentColor, lineWidth: 1))
+                VStack(spacing: 2) {
+                    if let sym = node.symbol, !sym.isEmpty {
+                        Image(systemName: sym)
+                            .font(.system(size: max(8, rect.height * 0.26), weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    Text(node.label)
+                        .font(.system(size: max(8, min(12, rect.height * 0.24))))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 4)
+                }
+            }
+            .frame(width: rect.width, height: rect.height)
+            .position(x: rect.midX, y: rect.midY)
+        }
+    }
+    private func shape(rect: CGRect) -> some Shape {
+        switch node.kind.lowercased() {
+        case "start", "end", "terminator": AnyShape(Capsule())
+        case "decision": AnyShape(Rhombus())
+        case "input": AnyShape(ParallelogramShape())
+        case "cloud": AnyShape(Capsule())
+        default: AnyShape(RoundedRectangle(cornerRadius: 7))
+        }
+    }
+}
+
+private struct Rhombus: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+        p.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.midY))
+        p.closeSubpath()
+        return p
+    }
+}
+
+private struct ParallelogramShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let skew = rect.height * 0.3
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX + skew, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX - skew, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        p.closeSubpath()
+        return p
+    }
 }

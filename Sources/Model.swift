@@ -428,6 +428,19 @@ enum CanvasBackground: String {
     case clear
     case white
     case black
+
+    /// Whether the backdrop is dark enough that light text/strokes read
+    /// best (drives code-block palettes and auto-contrast).
+    var isDark: Bool { self == .black }
+
+    /// The solid color painted behind the drawing, or nil when transparent.
+    var environmentColor: NSColor? {
+        switch self {
+        case .clear: return nil
+        case .white: return NSColor.white
+        case .black: return NSColor.black
+        }
+    }
 }
 
 final class CanvasState: ObservableObject {

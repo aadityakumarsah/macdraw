@@ -1,0 +1,72 @@
+// GENERATOR
+generator client {
+  provider = "prisma-client-js"
+}
+
+// SUPABASE POSTGRES — reached through the driver adapter (@prisma/adapter-pg);
+// the connection URL lives in prisma.config.ts + src/db.js, not the schema.
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================
+// Shared synchronization model for the Mac app and React Roadmap.
+// Canonical state lives here (Supabase Postgres); clients cache locally.
+// ============================================================
+
+/// Mirror of Supabase auth.users (one row per authenticated user).
+model UserProfile {
+  id                 String    @id // = Supabase auth.users().id
+  email              String?
+  name               String?
+  theme              String    @default("dark") // "light" | "dark" | "system"
+  defaultWorkspaceId String?
+  memberOf           WorkspaceMember[]
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+}
+
+model Workspace {
+  id          String            @id
+  name        String
+  members     WorkspaceMember[]
+  pages       Page[]
+  createdBy   String
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        String   @default("member") // owner | admin | member
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user        UserProfile @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+
+  @@unique([workspaceId, userId])
+}
+
+/// A page is the shared entity between the Mac app and React Roadmap.
+/// id is stable and permanent in both clients (UUID string).
+model Page {
+  id           String    @id // stable global page id — never changes on rename
+  workspaceId  String
+  parentId     String? // future nested pages
+  name         String
+  description  String?
+  icon         String?
+  orderIndex   Int       @default(0)
+  contentJson  String    @default("{}") // serialized canvas/document for this page
+  createdBy    String
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+  version      Int       @default(1)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, deletedAt])
+  @@index([workspaceId, orderIndex])
+}
