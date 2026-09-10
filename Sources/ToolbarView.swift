@@ -142,7 +142,7 @@ struct ToolbarView: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(Tool.allCases.filter { !Tool.shapePalette.contains($0) }, id: \.self) { tool in
+                    ForEach(Tool.allCases.filter { !Tool.shapePalette.contains($0) && $0 != .bucketFill && $0 != .image }, id: \.self) { tool in
                         ToolButton(tool: tool, active: state.tool == tool) {
                             if tool != .text {
                                 state.lastNonTextTool = tool
