@@ -1,23 +1,55 @@
 import AppKit
 import Combine
 
-/// Lightweight haptic feedback wrapper. Uses the trackpad's Force-Touch
-/// "tick" so interactions like drawing, moving, resizing and snapping a line
-/// onto a shape give a subtle physical confirmation. On machines without a
-/// haptic-capable input device this is a silent no-op.
+/// Haptic feedback wrapper. Uses the trackpad's haptic engine ("Taptic")
+/// so interactions like drawing, moving, resizing and snapping a line onto a
+/// shape give a physical confirmation. On machines without a haptic-capable
+/// input device the engine is a silent no-op, so `impact()` also plays a very
+/// quiet click as a fallback that works on every device.
 enum Haptics {
     private static var lastTick: Date = .distantPast
+    private static var lastBump: Date = .distantPast
 
-    /// Fires a soft selection "tick". Successive calls within 60ms are
-    /// coalesced so fast drags don't buzz non-stop.
+    /// Light selection tick for continuous gesture-ends (move/resize/rotate).
+    /// Coalesced so fast drags don't buzz non-stop.
     static func tick() {
         let now = Date()
-        guard now.timeIntervalSince(lastTick) > 0.06 else { return }
+        guard now.timeIntervalSince(lastTick) > 0.05 else { return }
         lastTick = now
         NSHapticFeedbackManager.defaultPerformer.perform(
             .generic,
             performanceTime: .drawCompleted
         )
+    }
+
+    /// Strong "impact" pulse with no accompanying sound. Used where a forceful
+    /// tactile bump matters (finishing a move/resize) but a click would annoy.
+    static func bump() {
+        let now = Date()
+        guard now.timeIntervalSince(lastBump) > 0.05 else { return }
+        lastBump = now
+        if #available(macOS 13.0, *) {
+            NSHapticFeedbackManager.defaultPerformer.perform(
+                .levelChange,
+                performanceTime: .drawCompleted
+            )
+        } else {
+            NSHapticFeedbackManager.defaultPerformer.perform(
+                .levelChange,
+                performanceTime: .drawCompleted
+            )
+        }
+    }
+
+    /// Strongest discrete feedback: haptic bump plus a soft audible click.
+    /// Used for the moments users expect real confirmation — creating a shape,
+    /// gluing a connector onto a box, deleting, undoing.
+    static func impact() {
+        bump()
+        if let sound = NSSound(named: "Pop") {
+            sound.volume = 0.15
+            sound.play()
+        }
     }
 }
 
@@ -966,7 +998,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     current = c
                 }
             }
-            Haptics.tick()
+            Haptics.impact()
         }
     }
 
@@ -1044,7 +1076,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 if let (i, s) = connectionDot(at: adjustedP) {
                     c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
                     endP = connectionPoint(for: c.connectionEnd, fallback: adjustedP)
-                    Haptics.tick()
+                    Haptics.impact()
                 } else {
                     c.connectionEnd = nil
                     endP = snappedBoundaryPoint(adjustedP)
@@ -1072,8 +1104,6 @@ final class CanvasView: NSView, NSTextViewDelegate {
             minimapPanning = false
             return
         }
-        // Adjust point by canvas offset for consistency
-        let adjustedP = screenToWorld(p)
         switch state.tool {
         case .selection:
             if marqueeStart != nil {
@@ -1099,16 +1129,16 @@ final class CanvasView: NSView, NSTextViewDelegate {
             } else if rotateIndex != nil {
                 finishTransformInteraction()
                 rotateIndex = nil
-                Haptics.tick()
+                Haptics.bump()
             } else if resizeIndex != nil {
                 finishTransformInteraction()
                 resizeIndex = nil
                 resizeHandle = nil
                 resizeOriginal = nil
-                Haptics.tick()
+                Haptics.bump()
             } else if !movingOriginals.isEmpty {
                 finishTransformInteraction()
-                Haptics.tick()
+                Haptics.bump()
             }
             movingOriginals = [:]
             scheduleSave()
@@ -1256,7 +1286,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
              .cloud, .serverStack, .queue, .firewall, .cube,
              .callout, .note,
              .linkedList, .stack, .heap, .graph, .set:
-            guard c.rect.width > 2 || c.rect.height > 2 else { return }
+            // The minimum size is measured in screen space so tiny shapes stay
+            // creatable even while zoomed in (otherwise a 10px arrow drawn at
+            // 8x zoom collapses to ~1.25 world units and silently disappears).
+            guard c.rect.width * zoom > 2 || c.rect.height * zoom > 2 else { return }
         case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
             // Bounding box of every point (a bend can stick out past the
             // start/end line, and the rect drives selection + rotation).
@@ -1268,7 +1301,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             } else {
                 c.connectionEnd = nil
             }
-            guard distance(c.points.first ?? .zero, c.points.last ?? .zero) > 2 else { return }
+            guard distance(c.points.first ?? .zero, c.points.last ?? .zero) * zoom > 2 else { return }
         case .freedraw:
             // Trackpad signature support: smooth the points for better handwriting
             c.points = smooth(c.points)
@@ -1301,10 +1334,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
         pushUndo()
         annotations.append(c)
         Haptics.tick()
-        // Keep the drawn shape selected (so pressing V lets you move/resize it
+// Keep the drawn shape selected (so pressing V lets you move/resize it
         // right away) but stay on the current tool — no need to re-press D.
         selected = [annotations.count - 1]
         needsDisplay = true
+        Haptics.impact()
     }
 
     private func beginTextEditing(at p: CGPoint, editingIndex: Int? = nil) {
@@ -2442,6 +2476,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         selected = []
         movingOriginals = [:]
         needsDisplay = true
+        Haptics.impact()
     }
 
     func clearAll() {
@@ -2576,6 +2611,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         selected = []
         needsDisplay = true
+        Haptics.impact()
     }
 
     // MARK: - copy / paste (Canva-style ⌘C / ⌘V)
@@ -2884,7 +2920,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private func visibleAnnotations(in worldVisible: CGRect) -> [Int] {
         var indices: [Int] = []
         for (i, a) in annotations.enumerated() {
-            guard a.rect.width > 0, a.rect.height > 0 else { continue }
+            // Only fully degenerate (zero-area, zero-dimension) rects are
+            // skipped. A horizontal/vertical line's rect has one zero
+            // dimension and must still be drawn.
+            guard a.rect.width > 0 || a.rect.height > 0 else { continue }
             let pad = 32 + a.strokeWidth + rotationPad(for: a)
             let inflated = worldVisible.insetBy(dx: -pad, dy: -pad)
             if inflated.intersects(a.rect) { indices.append(i) }
