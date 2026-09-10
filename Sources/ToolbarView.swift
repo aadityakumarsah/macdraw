@@ -718,6 +718,16 @@ struct ToolbarView: View {
                     .fill(.black)
                     .overlay(Circle().stroke(Color.primary.opacity(0.35), lineWidth: 1))
             }
+            backgroundButton(.warmYellow) {
+                Circle()
+                    .fill(Color(NSColor(hexString: "#fff3bf")))
+                    .overlay(Circle().stroke(Color.primary.opacity(0.35), lineWidth: 1))
+            }
+            backgroundButton(.warmWhite) {
+                Circle()
+                    .fill(Color(NSColor(hexString: "#fdf6ec")))
+                    .overlay(Circle().stroke(Color.primary.opacity(0.35), lineWidth: 1))
+            }
         }
         .padding(2)
         .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -737,7 +747,7 @@ struct ToolbarView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(bg == .clear ? "Transparent background" : "\(bg.rawValue.capitalized) screen")
+        .help(bg == .clear ? "Transparent background" : "\(bg.displayName) screen")
     }
 
     private func swatch(_ color: NSColor?, size: CGFloat) -> some View {

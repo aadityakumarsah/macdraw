@@ -59,12 +59,16 @@ codesign --verify "$APP" && echo "signature OK"
 echo "== installing to build/ =="
 mkdir -p build
 rm -rf build/macdraw.app
+# Re-sign the copy the users will run, but verify inside the temp dir: build/
+# lives under Desktop/iCloud, which silently re-stamps FinderInfo xattrs and
+# makes a straight in-place verify fail intermittently.
+xattr -cr "$APP" 2>/dev/null || true
+codesign --force --sign - "$APP" 2>/dev/null || true
+xattr -cr "$APP" 2>/dev/null || true
+codesign --verify --deep --strict "$APP" && echo "installed app signature OK"
 rsync -a "$APP" build/
-# Desktop/iCloud can attach Finder metadata while the app is copied out of
-# the temporary build directory. Remove it and sign the exact app users run.
+# Clear whatever metadata iCloud attached during the copy before archiving.
 xattr -cr build/macdraw.app 2>/dev/null || true
-codesign --force --sign - build/macdraw.app
-codesign --verify --deep --strict build/macdraw.app && echo "installed app signature OK"
 
 echo "== release zip =="
 # The app auto-updates by downloading this zip from the GitHub release

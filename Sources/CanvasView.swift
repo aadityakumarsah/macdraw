@@ -640,6 +640,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             .sink { [weak self] _ in
                 self?.needsDisplay = true
                 self?.autoContrastStrokeColor()
+                self?.autoContrastTextColors()
             }
             .store(in: &cancellables)
         laserTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
@@ -1094,7 +1095,6 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
         if spacePanning {
             spacePanning = false
             NSCursor.openHand.set()
@@ -2647,26 +2647,33 @@ final class CanvasView: NSView, NSTextViewDelegate {
     @discardableResult
     func paste() -> Bool {
         if pasteInternalClipboard() { return true }
-        return pasteSystemImage()
+        if pasteExcalidrawFromSystem() { return true }
+        if pasteSystemImage() { return true }
+        return pasteSystemText()
     }
 
     private func pasteInternalClipboard() -> Bool {
         guard !clipboard.isEmpty else { return false }
+        return pasteAnnotationBatch(clipboard)
+    }
+
+    /// Drops a set of annotations onto the canvas, cloning them at the current
+    /// cursor (or center of the viewport when the cursor is elsewhere).
+    private func pasteAnnotationBatch(_ incoming: [Annotation]) -> Bool {
+        guard !incoming.isEmpty else { return false }
         pushUndo()
-        // Paste at the cursor when it's over the canvas, otherwise drop the
-        // copies right next to the originals.
         let cursor = convert(window?.convertPoint(fromScreen: NSEvent.mouseLocation) ?? .zero, from: nil)
         let viewport = screenToWorld(bounds)
         var pastePoint = CGPoint(x: viewport.midX, y: viewport.midY)
         if bounds.contains(cursor) {
             pastePoint = screenToWorld(cursor)
         }
-        let anchor = clipboard[0].rect
+        let anchor = incoming.map(\.rect).reduce(CGRect.zero) { $0.union($1) }
         let dx = pastePoint.x - anchor.midX
         let dy = pastePoint.y - anchor.midY
         let topZ = (annotations.map(\.zIndex).max() ?? 0) + 1
         var added: [Int] = []
-        for var c in clipboard {
+        for var c in incoming {
             c.rect = c.rect.offsetBy(dx: dx, dy: dy)
             c.points = c.points.map { $0 + CGPoint(x: dx, y: dy) }
             c.createdAt = Date()
@@ -2680,6 +2687,29 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
         scheduleSave()
         return true
+    }
+
+    /// Reconstructs an Excalidraw scene copied from excalidraw.com / similar
+    /// editors (their clipboard carries the scene JSON in text/plain) into
+    /// real, editable shapes.
+    private func pasteExcalidrawFromSystem() -> Bool {
+        let text = NSPasteboard.general.string(forType: .string)
+        guard let anns = ClipboardImport.annotationsFromExcalidrawJSON(text) else { return false }
+        return pasteAnnotationBatch(anns)
+    }
+
+    /// Pastes plain/rich text copied from any app as a new text annotation
+    /// (the last fallback, after images).
+    private func pasteSystemText() -> Bool {
+        let pb = NSPasteboard.general
+        guard let string = pb.string(forType: .string), !string.isEmpty else { return false }
+        let style = PasteStyle(
+            strokeColor: state.strokeColor,
+            fontFamily: state.fontFamily,
+            fontSize: state.fontSize
+        )
+        let rtf = pb.data(forType: .rtf)
+        return pasteAnnotationBatch([ClipboardImport.textAnnotation(from: string, rtfData: rtf, style: style)])
     }
 
     /// Pastes an NSImage found on the system pasteboard as a new image
@@ -5808,10 +5838,32 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if colorLuminance(state.strokeColor) < 0.4 {
                 state.strokeColor = Palette.white
             }
-        case .white, .clear:
+        case .white, .clear, .warmYellow, .warmWhite:
             if colorLuminance(state.strokeColor) > 0.9 {
                 state.strokeColor = Palette.black
             }
+        }
+    }
+
+    /// Flips existing text annotations when the writing surface changes: dark
+    /// text becomes white on the black screen, white text becomes black on
+    /// every light (white / warm) screen. Locked annotations are left alone.
+    private func autoContrastTextColors() {
+        let dark = state.canvasBackground.isDark
+        var changed = false
+        for i in annotations.indices where annotations[i].kind == .text && !annotations[i].locked {
+            let lum = colorLuminance(annotations[i].strokeColor)
+            if dark && lum < 0.4 {
+                annotations[i].strokeColor = Palette.white
+                changed = true
+            } else if !dark && lum > 0.9 {
+                annotations[i].strokeColor = Palette.black
+                changed = true
+            }
+        }
+        if changed {
+            needsDisplay = true
+            scheduleSave()
         }
     }
 

@@ -428,6 +428,8 @@ enum CanvasBackground: String {
     case clear
     case white
     case black
+    case warmYellow
+    case warmWhite
 
     /// Whether the backdrop is dark enough that light text/strokes read
     /// best (drives code-block palettes and auto-contrast).
@@ -439,6 +441,19 @@ enum CanvasBackground: String {
         case .clear: return nil
         case .white: return NSColor.white
         case .black: return NSColor.black
+        case .warmYellow: return NSColor(hexString: "#fff3bf")
+        case .warmWhite: return NSColor(hexString: "#fdf6ec")
+        }
+    }
+
+    /// Human-friendly label for the toolbar's tooltip.
+    var displayName: String {
+        switch self {
+        case .clear: return "Transparent"
+        case .white: return "White"
+        case .black: return "Black"
+        case .warmYellow: return "Warm Yellow"
+        case .warmWhite: return "Warm White"
         }
     }
 }
