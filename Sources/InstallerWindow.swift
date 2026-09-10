@@ -15,6 +15,7 @@ final class InstallerWindowController: NSWindowController, NSWindowDelegate {
     private let arrowView = NSTextField(labelWithString: "→")
 
     private var state: InstallerState = .ready
+    private var installedAppPath = "/Applications/MacDraw.app"
 
     enum InstallerState {
         case ready, installing, done
@@ -239,8 +240,7 @@ final class InstallerWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func launchClicked() {
         // Open the freshly installed copy.
-        let appsPath = "/Applications/MacDraw.app"
-        if let url = URL(string: "file://\(appsPath)") {
+        if let url = URL(string: "file://\(installedAppPath)") {
             NSWorkspace.shared.open(url)
         }
         NSApp.terminate(nil)
@@ -254,58 +254,76 @@ final class InstallerWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        let dest = "/Applications/MacDraw.app"
-
-        // If an existing copy is running, we can't overwrite — ask user to quit first.
-        if NSRunningApplication.runningApplications(
-            withBundleIdentifier: "com.aadityakumarsah.macdraw"
-        ).count > 0 {
+        // If a previously installed copy of MacDraw is already running we
+        // can't overwrite — ask the user to quit it first. The installer's
+        // own process is excluded so the temporary copy we're running from
+        // never triggers this.
+        let existing = NSRunningApplication.runningApplications(
+            withBundleIdentifier: "com.local.macdraw"
+        ).filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if !existing.isEmpty {
             DispatchQueue.main.async { [weak self] in
                 self?.showError("MacDraw is already running. Quit it first, then try again.")
             }
             return
         }
 
-        // Remove old copy if present (best-effort, requires no special privileges
-        // for /Applications in most user setups on macOS Sonoma+).
         let fm = FileManager.default
-        if fm.fileExists(atPath: dest) {
-            do {
-                try fm.removeItem(atPath: dest)
-            } catch {
-                DispatchQueue.main.async { [weak self] in
-                    self?.showError("Could not remove the old copy at /Applications. You may need to drag it out manually first.")
-                }
-                return
+
+        // Simulated phased progress so the user sees movement before the
+        // (fast) copy completes.
+        DispatchQueue.main.async { [weak self] in
+            self?.progressIndicator.isIndeterminate = false
+        }
+        for pct in stride(from: 0.0, through: 0.85, by: 0.05) {
+            Thread.sleep(forTimeInterval: 0.04)
+            DispatchQueue.main.async { [weak self] in
+                self?.progressIndicator.doubleValue = pct
             }
         }
 
-        // Copy with progress via a file coordinator (simple progress — copies
-        // the whole bundle then updates the UI).  For a 3-4 MB app this is
-        // effectively instant, but we show the bar for polish.
-        do {
-            // Simulated phased progress so the user sees movement.
-            for pct in stride(from: 0.0, through: 0.85, by: 0.05) {
-                Thread.sleep(forTimeInterval: 0.04)
-                DispatchQueue.main.async { [weak self] in
-                    self?.progressIndicator.isIndeterminate = false
-                    self?.progressIndicator.doubleValue = pct
+        // Primary destination /Applications, with a fallback to ~/Applications
+        // for machines where /Applications isn't user-writable.
+        let candidates = ["/Applications/MacDraw.app", NSHomeDirectory() + "/Applications/MacDraw.app"]
+        var installedTo: String?
+        var lastError: Error?
+        for dest in candidates {
+            let parent = (dest as NSString).deletingLastPathComponent
+            if !fm.fileExists(atPath: parent) {
+                try? fm.createDirectory(atPath: parent, withIntermediateDirectories: true)
+            }
+            if fm.fileExists(atPath: dest) {
+                if !fm.isDeletableFile(atPath: dest) {
+                    lastError = NSError(domain: "MacDraw", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "\(dest) isn't removable"])
+                    continue
                 }
+                do { try fm.removeItem(atPath: dest) } catch { lastError = error; continue }
             }
-
-            try fm.copyItem(atPath: bundlePath, toPath: dest)
-
-            // Finish the bar
-            DispatchQueue.main.async { [weak self] in
-                self?.progressIndicator.doubleValue = 1.0
+            do {
+                try fm.copyItem(atPath: bundlePath, toPath: dest)
+                installedTo = dest
+                break
+            } catch {
+                lastError = error
             }
-            Thread.sleep(forTimeInterval: 0.3)
+        }
 
-            DispatchQueue.main.async { [weak self] in
-                self?.showDone()
-            }
-        } catch {
-            showError("Copy failed — \(error.localizedDescription)")
+        DispatchQueue.main.async { [weak self] in
+            self?.progressIndicator.doubleValue = 1.0
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+
+        guard let finalDest = installedTo else {
+            let msg = lastError?.localizedDescription ?? "unknown error"
+            showError("Could not copy MacDraw — \(msg).")
+            return
+        }
+
+        // Remember where we installed so "Launch" opens the right copy.
+        installedAppPath = finalDest
+        DispatchQueue.main.async { [weak self] in
+            self?.showDone()
         }
     }
 
