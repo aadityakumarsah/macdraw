@@ -3,21 +3,38 @@ import AppKit
 setbuf(stdout, nil)
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
 
-let delegate = AppDelegate()
-app.delegate = delegate
+// --install mode: show the sleek installer window and nothing else.
+if CommandLine.arguments.contains("--install") {
+    app.setActivationPolicy(.accessory)
+    let delegate = InstallModeDelegate()
+    app.delegate = delegate
+    app.run()
+} else {
+    app.setActivationPolicy(.accessory)
+    let delegate = AppDelegate()
+    app.delegate = delegate
 
-if CommandLine.arguments.contains("--selftest") {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        delegate.runSelfTest()
+    if CommandLine.arguments.contains("--selftest") {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            delegate.runSelfTest()
+        }
     }
+
+    if CommandLine.arguments.contains("--synctest") {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            delegate.runSyncTest()
+        }
+    }
+
+    app.run()
 }
 
-if CommandLine.arguments.contains("--synctest") {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        delegate.runSyncTest()
+/// Minimal delegate used in --install mode — does nothing except keep the
+/// run loop alive so the InstallerWindow can display.
+final class InstallModeDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.main.async { _ = InstallerWindowController() }
     }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
-
-app.run()
