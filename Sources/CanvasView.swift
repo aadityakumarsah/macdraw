@@ -2699,7 +2699,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     /// Pastes plain/rich text copied from any app as a new text annotation
-    /// (the last fallback, after images).
+    /// (the last fallback, after images). ASCII architecture diagrams are
+    /// detected and dropped in as perfectly-aligned monospaced code blocks.
     private func pasteSystemText() -> Bool {
         let pb = NSPasteboard.general
         guard let string = pb.string(forType: .string), !string.isEmpty else { return false }
@@ -2708,8 +2709,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
             fontFamily: state.fontFamily,
             fontSize: state.fontSize
         )
-        let rtf = pb.data(forType: .rtf)
-        return pasteAnnotationBatch([ClipboardImport.textAnnotation(from: string, rtfData: rtf, style: style)])
+        let annotation: Annotation
+        if ClipboardImport.isAsciiDiagram(string) {
+            annotation = ClipboardImport.diagramAnnotation(from: string, style: style)
+        } else {
+            let rtf = pb.data(forType: .rtf)
+            annotation = ClipboardImport.textAnnotation(from: string, rtfData: rtf, style: style)
+        }
+        return pasteAnnotationBatch([annotation])
     }
 
     /// Pastes an NSImage found on the system pasteboard as a new image

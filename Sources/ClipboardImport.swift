@@ -58,6 +58,69 @@ enum ClipboardImport {
         return a
     }
 
+    /// True when a pasted string looks like an ASCII architecture/data-flow
+    /// diagram: multi-line text containing box-drawing or geometric/arrow
+    /// glyphs (the kind ChatGPT and similar tools render). Such text must be
+    /// shown in a monospaced code block so the characters stay aligned instead
+    /// of breaking.
+    static func isAsciiDiagram(_ string: String) -> Bool {
+        var boxCount = 0
+        for scalar in string.unicodeScalars {
+            switch scalar.value {
+            case 0x2500...0x257F,   // box drawing ─ │ ┌ ┐ └ ┘ ├ ┤ ► …
+                0x2580...0x259F,   // block elements ▀ ▄ █
+                0x25A0...0x25FF,   // geometric shapes ▲ ▼ ◆ ●
+                0x2190...0x21FF,   // arrows ← → ↑ ↓
+                0x2B05...0x2B07:   // ⬅ ⬆ ➡ ⬇
+                boxCount += 1
+            default:
+                break
+            }
+        }
+        if boxCount == 0 { return false }
+        return string.contains("\n")
+    }
+
+    /// An ASCII diagram pasted as a code block: monospaced Cascadia Code,
+    /// non-wrapping (the rect spans the longest line) and a solid backdrop so
+    /// box-drawing characters line up exactly as they did on the clipboard.
+    static func diagramAnnotation(from string: String, style: PasteStyle) -> Annotation {
+        var a = Annotation(kind: .text)
+        a.text = strippedDiagramFences(string)
+        a.isCode = true
+        a.fontFamily = "Cascadia Code"
+        a.fontSize = 14
+        a.strokeColor = style.strokeColor
+        a.textAutoResize = true
+        let font = Fonts.nsFont(for: a.fontFamily, size: a.fontSize)
+        let lines = a.text.components(separatedBy: "\n")
+        var maxWidth: CGFloat = 40
+        for line in lines {
+            let width = (line as NSString).size(withAttributes: [.font: font]).width
+            maxWidth = max(maxWidth, width)
+        }
+        let lineHeight = max(font.ascender - font.descender + font.leading, font.pointSize * 1.25)
+        a.rect = CGRect(
+            x: 0, y: 0,
+            width: ceil(maxWidth) + 4,
+            height: ceil(lineHeight * CGFloat(lines.count)) + 4
+        )
+        return a
+    }
+
+    /// Removes an optional triple-backtick code fence around the copied
+    /// diagram (e.g. when the source was exported with its Markdown fences).
+    private static func strippedDiagramFences(_ string: String) -> String {
+        var lines = string.components(separatedBy: "\n")
+        if lines.count >= 3, lines.first?.hasPrefix("```") == true {
+            lines.removeFirst()
+            if lines.last?.hasPrefix("```") == true {
+                lines.removeLast()
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: - Excalidraw element mapping
 
     private static func map(_ e: ExcalidrawElement) -> Annotation? {
