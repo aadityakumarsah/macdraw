@@ -790,6 +790,7 @@ struct ToolbarView: View {
         Menu {
             ForEach(Fonts.available, id: \.name) { f in
                 Button(f.name) { state.fontFamily = f.name }
+                    .font(Fonts.font(for: f.name, size: 14))
             }
         } label: {
             Text(state.fontFamily)

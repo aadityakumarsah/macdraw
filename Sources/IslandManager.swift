@@ -63,6 +63,8 @@ final class IslandManager {
     private var gestureMonitor: Any?
     private var isShowing = false
     private var isAnimating = false
+    /// A show/hide intent queued while a transition animation was running.
+    private var pendingToggle: Bool?
     private var logoPalette: LogoPaletteView?
     private var cancellables = Set<AnyCancellable>()
 
@@ -180,14 +182,27 @@ private func toggleSidebar() {
     }
 
     func toggle() {
-        if isShowing && isAnimating {
-            // Opening animation still running — hide once it's done.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
-                self?.hide()
-            }
+        if isAnimating {
+            // A toggle arrived mid-transition: remember what the user wanted
+            // and apply it as soon as the current open/close finishes. The
+            // old "hide after 1.6s" hack could fire after a completed open
+            // and silently close the overlay the user just asked to see.
+            pendingToggle = !isShowing
             return
         }
         isShowing ? hide() : show()
+    }
+
+    /// Resolves a toggle queued while a show/hide animation was running.
+    /// Runs exactly once, after the transition and never from a monitor.
+    private func applyPendingToggle() {
+        guard let next = pendingToggle else { return }
+        pendingToggle = nil
+        if next {
+            show()
+        } else {
+            hide()
+        }
     }
 
     /// Test hook.
@@ -246,6 +261,7 @@ private func toggleSidebar() {
         guard isAnimating else { return }
         installContent(on: screen)
         isAnimating = false
+        applyPendingToggle()
     }
 
     func hide() {
@@ -280,11 +296,23 @@ private func toggleSidebar() {
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             window.animator().setFrame(pill, display: true)
         } completionHandler: { [weak self] in
-            guard let self else { return }
-            self.window.orderOut(nil)
-            self.window.alphaValue = 1
-            self.isAnimating = false
+            self?.finishCollapse()
         }
+        // Watchdog: if the collapse animation never completes for any reason,
+        // drop the window anyway so a stuck transition can't dead-lock the
+        // Control+Option shortcut forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.isAnimating else { return }
+            self.finishCollapse()
+        }
+    }
+
+    private func finishCollapse() {
+        guard isAnimating else { return }
+        window.orderOut(nil)
+        window.alphaValue = 1
+        isAnimating = false
+        applyPendingToggle()
     }
 
     // MARK: - content
@@ -474,7 +502,14 @@ private func toggleSidebar() {
             guard let self, let canvas = self.canvas else { return event }
             guard event.window === self.window else { return event }
             guard self.state.drawingMode else { return event }
-            // Cursor over the toolbar? Let its own scroll views keep working.
+            // Pinch zoom always belongs to the canvas, no matter where the
+            // cursor is. The toolbar/sidebar scrollers have no use for it, and
+            // swallowing it there is why two-finger zoom only "sometimes" works.
+            if event.type == .magnify {
+                return canvas.handleGesture(event) ? nil : event
+            }
+            // Two-finger pan: let the toolbar's / sidebar's / AI drawer's own
+            // scroll views win when the cursor is over them.
             if let toolbar = self.toolbarHost {
                 let p = toolbar.convert(event.locationInWindow, from: nil)
                 if toolbar.bounds.contains(p) { return event }

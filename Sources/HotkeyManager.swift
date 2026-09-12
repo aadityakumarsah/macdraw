@@ -9,6 +9,12 @@ import AppKit
 final class HotkeyManager {
     var onTrigger: (() -> Void)?
     private var monitors: [Any] = []
+    /// Timestamp of the last accepted trigger. Activating the app from a
+    /// global flag monitor can make macOS re-deliver the same key event to
+    /// the freshly-activated app, which otherwise toggles the overlay open
+    /// and closed instantly (the shortcut "sometimes doesn't work").
+    private var lastTrigger: Date = .distantPast
+    private let debounce: TimeInterval = 0.35
 
     func start() {
         // App inactive: overlay closed, or open without the app being active.
@@ -34,6 +40,9 @@ final class HotkeyManager {
         let combo = flags.contains(.control) && flags.contains(.option)
             && !flags.contains(.command) && !flags.contains(.shift)
         if combo {
+            let now = Date()
+            guard now.timeIntervalSince(lastTrigger) > debounce else { return }
+            lastTrigger = now
             // Dispatch async so toggling (which may remove monitors) never
             // happens from inside a monitor handler.
             DispatchQueue.main.async {
