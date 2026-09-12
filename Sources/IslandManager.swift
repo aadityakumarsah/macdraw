@@ -208,6 +208,19 @@ private func toggleSidebar() {
     /// Test hook.
     var isOverlayVisible: Bool { isShowing }
 
+    /// Hides the overlay and releases input monitors immediately, so no
+    /// invisible full-screen panel is left capturing clicks while the app
+    /// bundle is replaced underneath during a self-update. Called from
+    /// AppUpdater.onInstallStarting *on the main thread* before the swap.
+    func prepareForInstall() {
+        pendingToggle = nil
+        isAnimating = false
+        isShowing = false
+        teardownContent()
+        window.orderOut(nil)
+        state.drawingMode = false
+    }
+
     /// Called when the user turns drawing mode on — the app needs to be
     /// active + the window key for keyboard shortcuts and text input.
     func activate() {

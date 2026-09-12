@@ -3,7 +3,7 @@ import Combine
 
 /// The version this build reports. The GitHub release must be tagged
 /// `v<appVersion>` (e.g. `v1.9.0`) for the update check to work.
-let appVersion = "1.19.0"
+let appVersion = "1.20.0"
 
 /// The GitHub repository the update check talks to. Releases should attach a
 /// `macdraw-v<version>.zip` (produced by build.sh) containing macdraw.app.
@@ -67,6 +67,11 @@ final class AppUpdater: NSObject, ObservableObject {
     /// `addObserver` is still on it crashes the app).
     private var progressObservations: [NSKeyValueObservation] = []
 
+    /// Called on the main thread just before the running bundle is swapped
+    /// out for the update, so the app can hide its full-screen overlay and
+    /// release its input monitors first.
+    var onInstallStarting: (() -> Void)?
+
     /// True when a strictly newer version has been found.
     var isUpdateAvailable: Bool {
         guard let latest = latestVersion else { return false }
@@ -121,15 +126,21 @@ final class AppUpdater: NSObject, ObservableObject {
         downloadTask = session.downloadTask(with: url) { [weak self] tmpURL, _, error in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.downloading = false
                 if let error {
+                    self.downloading = false
                     self.errorMessage = "Download failed: \(error.localizedDescription)"
                     return
                 }
                 guard let tmpURL else {
+                    self.downloading = false
                     self.errorMessage = "Download failed."
                     return
                 }
+                // Keep `downloading` set during install so the UI shows
+                // "Updating…" until the app relaunches. Install runs OFF the
+                // main thread (see install) — the overlay is a full-screen
+                // panel that swallows every click, so blocking the main thread
+                // here froze the entire Mac.
                 self.install(zip: tmpURL)
             }
         }
@@ -157,36 +168,96 @@ final class AppUpdater: NSObject, ObservableObject {
     }
 
     private func install(zip: URL) {
-        let fm = FileManager.default
-        let work = fm.temporaryDirectory.appendingPathComponent("macdraw-update-\(UUID().uuidString)")
-        try? fm.createDirectory(at: work, withIntermediateDirectories: true)
-        let unzip = Process()
-        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        unzip.arguments = ["-x", "-k", zip.path, work.path]
-        unzip.standardOutput = FileHandle.nullDevice
-        unzip.standardError = FileHandle.nullDevice
-        do {
-            try unzip.run()
-            unzip.waitUntilExit()
-        } catch {
-            errorMessage = "Could not unzip the update: \(error.localizedDescription)"
-            return
+        // Everything below is file/process heavy and MUST NOT run on the main
+        // thread: the overlay is a full-screen borderless panel that eats every
+        // click, so blocking the main thread while this works froze the whole
+        // Mac. Do it on a utility queue and hop back to main only to relaunch.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let fm = FileManager.default
+            let work = fm.temporaryDirectory.appendingPathComponent("macdraw-update-\(UUID().uuidString)")
+            try? fm.createDirectory(at: work, withIntermediateDirectories: true)
+
+            let unzip = Process()
+            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            unzip.arguments = ["-x", "-k", zip.path, work.path]
+            unzip.standardOutput = FileHandle.nullDevice
+            unzip.standardError = FileHandle.nullDevice
+            do {
+                try unzip.run()
+            } catch {
+                DispatchQueue.main.async {
+                    self.downloading = false
+                    self.errorMessage = "Could not unzip the update: \(error.localizedDescription)"
+                }
+                return
+            }
+            // Watchdog: never block forever on a corrupt/hung ditto. Wait up to
+            // 120s (generous for any real release zip), then kill it.
+            let deadline = Date().addingTimeInterval(120)
+            while unzip.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            if unzip.isRunning {
+                unzip.terminate()
+                DispatchQueue.main.async {
+                    self.downloading = false
+                    self.errorMessage = "Unzipping the update timed out."
+                }
+                return
+            }
+            guard unzip.terminationStatus == 0,
+                  let newApp = findApp(in: work) else {
+                DispatchQueue.main.async {
+                    self.downloading = false
+                    self.errorMessage = "The downloaded package does not contain macdraw.app."
+                }
+                return
+            }
+            let current = Bundle.main.bundleURL
+
+            // Hide the overlay + release input monitors before the swap, so no
+            // invisible full-screen panel is left capturing input while the
+            // bundle is replaced underneath a running process.
+            DispatchQueue.main.sync {
+                self.onInstallStarting?()
+            }
+
+            do {
+                try replaceBundle(current: current, with: newApp)
+            } catch {
+                DispatchQueue.main.async {
+                    self.downloading = false
+                    self.errorMessage = "Could not install the update: \(error.localizedDescription)"
+                }
+                return
+            }
+            try? fm.removeItem(at: work)
+
+            // Hand over to the new build. The helper below sleeps first so this
+            // process has fully exited before `open` runs — otherwise Launch
+            // Services sees a live instance with the same bundle id and the
+            // update silently never relaunches.
+            DispatchQueue.main.async {
+                self.relaunchAfterExit(at: current)
+            }
         }
-        guard unzip.terminationStatus == 0,
-              let newApp = findApp(in: work) else {
-            errorMessage = "The downloaded package does not contain macdraw.app."
-            return
-        }
-        let current = Bundle.main.bundleURL
-        do {
-            try replaceBundle(current: current, with: newApp)
-        } catch {
-            errorMessage = "Could not install the update: \(error.localizedDescription)"
-            return
-        }
-        try? fm.removeItem(at: work)
-        // Hand over to the new build.
-        Process.launchedProcess(launchPath: "/usr/bin/open", arguments: [current.path])
+    }
+
+    /// Spawns a detached helper that waits for this process to die, then opens
+    /// the freshly installed app, and terminates ourselves.
+    private func relaunchAfterExit(at appURL: URL) {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let helper = """
+        while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done; \
+        /usr/bin/open "\(appURL.path)"
+        """
+        let sh = Process()
+        sh.executableURL = URL(fileURLWithPath: "/bin/bash")
+        sh.arguments = ["-c", helper]
+        sh.standardOutput = FileHandle.nullDevice
+        sh.standardError = FileHandle.nullDevice
+        try? sh.run()
         NSApp.terminate(nil)
     }
 

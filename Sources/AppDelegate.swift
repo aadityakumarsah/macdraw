@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state = CanvasState()
         island = IslandManager(state: state)
         updater = island.updater
+        updater.onInstallStarting = { [weak self] in
+            self?.island.prepareForInstall()
+        }
 
         // Live sync with React Roadmap (Supabase + Prisma). Sign-in with the
         // shared test account happens in the background; offline mode keeps
