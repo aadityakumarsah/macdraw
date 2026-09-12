@@ -57,4 +57,12 @@ final class HotkeyManager {
         }
         monitors = []
     }
+
+    /// macOS can silently drop global event monitors after sleep/wake on Apple
+    /// Silicon, making the hotkey stop working until a restart. Re-arms both
+    /// monitors (the debounce dedupes any overlapping events).
+    func restart() {
+        stop()
+        start()
+    }
 }
