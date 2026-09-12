@@ -3,7 +3,7 @@ import Combine
 
 /// The version this build reports. The GitHub release must be tagged
 /// `v<appVersion>` (e.g. `v1.9.0`) for the update check to work.
-let appVersion = "1.16.2"
+let appVersion = "1.17.0"
 
 /// The GitHub repository the update check talks to. Releases should attach a
 /// `macdraw-v<version>.zip` (produced by build.sh) containing macdraw.app.
@@ -61,6 +61,11 @@ final class AppUpdater: NSObject, ObservableObject {
     @Published private(set) var downloadProgress: Double = 0
     private var assetURL: URL?
     private var downloadTask: URLSessionDownloadTask?
+    /// Block-based KVO observations on the active download task. Replacing the
+    /// task invalidates these automatically, so no observer is ever left
+    /// registered on a deallocated object (deallocating a task while a legacy
+    /// `addObserver` is still on it crashes the app).
+    private var progressObservations: [NSKeyValueObservation] = []
 
     /// True when a strictly newer version has been found.
     var isUpdateAvailable: Bool {
@@ -128,24 +133,27 @@ final class AppUpdater: NSObject, ObservableObject {
                 self.install(zip: tmpURL)
             }
         }
-        // Observe the download so the popover can show a progress bar.
-        downloadTask?.addObserver(self, forKeyPath: "countOfBytesReceived", options: .new, context: nil)
-        downloadTask?.addObserver(self, forKeyPath: "countOfBytesExpectedToReceive", options: .new, context: nil)
-        downloadTask?.resume()
-    }
-
-    override func observeValue(
-        forKeyPath keyPath: String?,
-        of object: Any?,
-        change: [NSKeyValueChangeKey: Any]?,
-        context: UnsafeMutableRawPointer?
-    ) {
         guard let task = downloadTask else { return }
-        let expected = task.countOfBytesExpectedToReceive
-        guard expected > 0 else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.downloadProgress = min(1, Double(task.countOfBytesReceived) / Double(expected))
-        }
+        // Observe the download so the popover can show a progress bar.
+        // Block-based KVO cleans itself up; never leave AddObserver KVO on a
+        // task that gets released.
+        progressObservations = [
+            task.observe(\.countOfBytesReceived) { [weak self] task, _ in
+                let expected = task.countOfBytesExpectedToReceive
+                guard expected > 0 else { return }
+                DispatchQueue.main.async {
+                    self?.downloadProgress = min(1, Double(task.countOfBytesReceived) / Double(expected))
+                }
+            },
+            task.observe(\.countOfBytesExpectedToReceive) { [weak self] task, _ in
+                let received = task.countOfBytesReceived
+                guard received > 0 else { return }
+                DispatchQueue.main.async {
+                    self?.downloadProgress = min(1, Double(received) / Double(task.countOfBytesExpectedToReceive))
+                }
+            },
+        ]
+        task.resume()
     }
 
     private func install(zip: URL) {

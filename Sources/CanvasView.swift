@@ -585,8 +585,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
             }
         }.store(in: &cancellables)
         Publishers.CombineLatest3(state.$fillColor, state.$fillOpacity, state.$fillEnabled).dropFirst().sink { [weak self] color, opacity, enabled in
+            guard enabled else { return }
             self?.applyToSelection(where: { self?.isClosed($0.kind) == true }) {
-                $0.fillColor = enabled ? color : nil
+                $0.fillColor = color
                 $0.fillOpacity = opacity
             }
         }.store(in: &cancellables)
@@ -932,14 +933,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .bucketFill:
             // Adjust for canvas offset in bucket fill tool
             let adjustedP = screenToWorld(p)
-            if let i = hitIndex(adjustedP) {
+            if let i = bucketHitIndex(adjustedP) {
                 pushUndo()
-                if state.fillEnabled {
-                    annotations[i].fillColor = state.fillColor
-                    annotations[i].fillOpacity = state.fillOpacity
-                } else {
-                    annotations[i].fillColor = nil
-                }
+                annotations[i].fillColor = state.fillColor
+                annotations[i].fillOpacity = state.fillOpacity
                 needsDisplay = true
                 scheduleSave()
             }
@@ -2585,6 +2582,31 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Swaps the canvas over to the current page: its annotations and its own
     /// pan/zoom. Called at startup and on every page switch.
     func applyCurrentPage() {
+        // Drop any in-flight gesture before swapping the array: interaction
+        // state (rotate/resize/move/marquee/erase/lasso/current) holds indices
+        // into the old annotations. A live-sync page swap landing mid-drag
+        // used to leave those stale, and the next index dereference trapped
+        // and silently killed the app.
+        commitPendingText()
+        current = nil
+        dragStart = .zero
+        movingOriginals = [:]
+        resizeIndex = nil
+        resizeHandle = nil
+        resizeOriginal = nil
+        rotateIndex = nil
+        rotateStartPoint = .zero
+        rotateBaseRotation = 0
+        interactionUndoSnapshot = nil
+        interactionChanged = false
+        marqueeStart = nil
+        marqueeRect = .zero
+        eraseStroke = []
+        lassoPoly = []
+        hoverShapeIndex = nil
+        hoverSide = nil
+        spaceHeld = false
+        spacePanning = false
         annotations = pages.currentAnnotations().map { .restored(from: $0) }
         selected = []
         undoStack = []
@@ -2593,7 +2615,6 @@ final class CanvasView: NSView, NSTextViewDelegate {
         canvasOffset = pan
         zoom = min(8, max(0.15, z))
         state.zoomPercent = Int((zoom * 100).rounded())
-        commitPendingText()
         needsDisplay = true
     }
 
@@ -5726,6 +5747,24 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 let threshold = max(10, a.strokeWidth / 2 + 6)
                 if distanceToPath(localP, path) < threshold { return i }
             }
+        }
+        return nil
+    }
+
+    /// Hit test used by the Fill (bucket) tool: only fillable shapes count, so
+    /// an overlapping text label, image, or line never swallows the click meant
+    /// for the box underneath it.
+    private func bucketHitIndex(_ p: CGPoint) -> Int? {
+        for (i, a) in annotations.enumerated().reversed() {
+            if a.kind == .laser { continue }
+            if !isClosed(a.kind), a.kind != .freedraw { continue }
+            let localP = rotatedPoint(p, around: CGPoint(x: a.rect.midX, y: a.rect.midY), by: -a.rotation)
+            if a.kind == .freedraw {
+                if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points) { return i }
+                continue
+            }
+            let path = cachedPath(for: a, index: i)
+            if path.contains(localP) { return i }
         }
         return nil
     }

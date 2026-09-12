@@ -16,6 +16,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// sync updates can refresh the visible page immediately.
     weak var activeCanvas: CanvasView?
 
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        // macdraw is a menu-bar background agent (LSUIElement); the overlay is
+        // never "closed", only hidden, but some system teardown paths close it
+        // and roll the default back to `true` — which silently quits the app.
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         Fonts.register()
 
