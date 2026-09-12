@@ -73,6 +73,17 @@ final class IslandManager {
         canvas.applyCurrentPage()
     }
 
+    /// Deletes a page and reloads the canvas when the visible page changed,
+    /// so the overlay never keeps showing a deleted page's shapes.
+    private func deletePage(_ id: String) {
+        guard let canvas else { return }
+        canvas.saveViewStateToPages()
+        let next = pages.deletePage(id: id)
+        if let next, next != id {
+            canvas.applyCurrentPage()
+        }
+    }
+
 private func toggleSidebar() {
         guard let sidebar = sidebarHost else { return }
         state.sidebarVisible.toggle()
@@ -298,6 +309,7 @@ private func toggleSidebar() {
                 pages: pages,
                 onClose: { [weak self] in self?.toggleSidebar() },
                 onSwitchPage: { [weak self] id in self?.switchPage(id) },
+                onDeletePage: { [weak self] id in self?.deletePage(id) },
                 onClear: { [weak canvas] in canvas?.clearAll() },
                 onResetView: { [weak canvas] in canvas?.resetView() },
                 onOpenDashboard: { [weak self] in self?.openDashboard() },
@@ -351,6 +363,7 @@ private func toggleSidebar() {
                 onSwitchPage: { [weak self] id in
                     self?.switchPage(id)
                 },
+                onDeletePage: { [weak self] id in self?.deletePage(id) },
                 onToggleSidebar: { [weak self] in self?.toggleSidebar() },
                 onToggleAI: { [weak self] in self?.toggleAIDrawer() }
             )
@@ -573,6 +586,96 @@ private func toggleSidebar() {
                     }
                 }
             }
+        }
+    }
+
+    /// Simulates the full copy/paste pipeline: draws two shapes, selects them,
+    /// copies with ⌘C, verifies the system pasteboard carries both the macdraw
+    /// JSON and a PNG, then ⌘V's after clearing the in-memory clipboard to force
+    /// a restore from the system pasteboard — checking the paste lands under the
+    /// last canvas cursor.
+    private func clipboardTest(log: @escaping (String) -> Void) {
+        guard self.canvas != nil else {
+            log("FAIL: no canvas for clipboard test")
+            exit(1)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self, let canvas = self.canvas else { return }
+            let startCount = canvas.annotations.count
+            let uti = canvas.macdrawPasteboardType
+
+            log("drawing a rect + a scribble for the clipboard test")
+            self.state.tool = .rectangle
+            let d1 = self.win(CGPoint(x: 250, y: 520))
+            let d2 = self.win(CGPoint(x: 360, y: 640))
+            canvas.mouseDown(with: self.mouseEvent(at: d1, type: .leftMouseDown))
+            canvas.mouseDragged(with: self.mouseEvent(at: d2, type: .leftMouseDragged))
+            canvas.mouseUp(with: self.mouseEvent(at: d2, type: .leftMouseUp))
+            self.state.tool = .freedraw
+            let f1 = self.win(CGPoint(x: 380, y: 400))
+            let f2 = self.win(CGPoint(x: 430, y: 470))
+            canvas.mouseDown(with: self.mouseEvent(at: f1, type: .leftMouseDown))
+            canvas.mouseDragged(with: self.mouseEvent(at: f2, type: .leftMouseDragged))
+            canvas.mouseUp(with: self.mouseEvent(at: f2, type: .leftMouseUp))
+            guard canvas.annotations.count == startCount + 2 else {
+                log("FAIL: expected 2 new annotations, got \(canvas.annotations.count - startCount)")
+                exit(1)
+            }
+            canvas.selftestSelect([startCount, startCount + 1])
+            guard canvas.selected == [startCount, startCount + 1] else {
+                log("FAIL: could not select the drawn shapes")
+                exit(1)
+            }
+
+            log("⌘C: copying the selection (key event path)")
+            self.window.makeFirstResponder(canvas)
+            self.sendKeyToWindow(keyCode: 8, characters: "c", flags: [.command])
+            let pb = NSPasteboard.general
+            let hasUti = pb.data(forType: uti) != nil
+            let hasImage = NSImage(pasteboard: pb) != nil
+            log("system pasteboard after ⌘C: macdraw JSON=\(hasUti) image=\(hasImage)")
+            guard hasUti, hasImage else {
+                log("FAIL: ⌘C must write both the macdraw JSON and a PNG to the system pasteboard")
+                exit(1)
+            }
+
+            log("clearing internal clipboard, setting cursor, then ⌘V")
+            canvas.selftestClearClipboard()
+            let pasteViewPoint = CGPoint(x: 620, y: 280)
+            canvas.selftestSetCanvasCursor(pasteViewPoint)
+            let expectedWorld = canvas.selftestScreenToWorld(pasteViewPoint)
+            log("pre-V diagnostics: cursor=\(canvas.selftestLastCanvasCursor ?? .zero) zoom=\(canvas.selftestCurrentZoom) offset=\(canvas.selftestCanvasOffset) bounds=\(canvas.bounds)")
+            self.window.makeFirstResponder(canvas)
+            self.sendKeyToWindow(keyCode: 9, characters: "v", flags: [.command])
+            log("post-V diagnostics: cursor=\(canvas.selftestLastCanvasCursor ?? .zero) zoom=\(canvas.selftestCurrentZoom) offset=\(canvas.selftestCanvasOffset)")
+            if let ctx = canvas.selftestLastPasteContext {
+                log("paste context: cursor=\(ctx.cursor ?? .zero) point=\(ctx.point) zoom=\(ctx.zoom) offset=\(ctx.offset) bounds=\(ctx.bounds) anchor=\(ctx.anchor)")
+                log("paste incoming: kinds=\(ctx.incomingKinds) rects=\(ctx.incomingRects)")
+            }
+            guard canvas.annotations.count == startCount + 4 else {
+                log("FAIL: ⌘V should restore 2 annotations from the system pasteboard, got \(canvas.annotations.count - startCount)")
+                exit(1)
+            }
+            let pastedA = canvas.annotations[startCount + 2]
+            let pastedB = canvas.annotations[startCount + 3]
+            log("pastedA: kind=\(pastedA.kind.rawValue) rect=\(pastedA.rect)")
+            log("pastedB: kind=\(pastedB.kind.rawValue) rect=\(pastedB.rect)")
+            let anchor = pastedA.rect.union(pastedB.rect)
+            let center = CGPoint(x: anchor.midX, y: anchor.midY)
+            let dist = hypot(center.x - expectedWorld.x, center.y - expectedWorld.y)
+            log("paste cluster center=\(center) expected=\(expectedWorld) dist=\(dist)")
+            guard dist < 3 else {
+                log("FAIL: pasted cluster should center on the last canvas cursor")
+                exit(1)
+            }
+            guard canvas.selected == [startCount + 2, startCount + 3] else {
+                log("FAIL: pasted annotations should become the selection")
+                exit(1)
+            }
+
+            log("clipboard test: PASS (⌘C ↦ macdraw JSON + PNG, ⌘V restores under the cursor)")
+            log("SELFTEST PASS")
+            exit(0)
         }
     }
 
@@ -1653,8 +1756,7 @@ private func toggleSidebar() {
                                 exit(1)
                             }
                             log("long text zoom test: PASS (anchor \(anchor2) preserved through zoom+pan)")
-                            log("SELFTEST PASS")
-                            exit(0)
+                            self.clipboardTest(log: log)
                         }
                         }
                     }

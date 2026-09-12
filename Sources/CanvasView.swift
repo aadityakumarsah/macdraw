@@ -503,6 +503,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// Resets zoom to 100% and centers the canvas back at the screen origin.
     func resetView() {
+        guard !state.zoomLocked else { return }
         canvasOffset = .zero
         zoom = 1
         state.zoomPercent = 100
@@ -511,7 +512,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     func zoomIn() {
-        zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY), ignoreLock: true)
+        zoomCanvas(by: 1.25, around: CGPoint(x: bounds.midX, y: bounds.midY))
     }
 
     func zoomOut() {
@@ -717,6 +718,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return
         }
         let p = convert(event.locationInWindow, from: nil)
+        lastCanvasCursor = p
         // Adjust for canvas offset in hit testing
         let adjustedP = screenToWorld(p)
         switch state.tool {
@@ -821,6 +823,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             editingView?.resignFirstResponder()
         }
         let p = convert(event.locationInWindow, from: nil)
+        lastCanvasCursor = p
         // Holding space turns any tool into a temporary pan (Figma-style).
         if spaceHeld, !isEditingText {
             NSCursor.closedHand.set()
@@ -1002,6 +1005,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     override func mouseDragged(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
+        lastCanvasCursor = p
         if spacePanning {
             canvasOffset = dragOriginOffset + (p - dragStart)
             syncEditingView()
@@ -1991,6 +1995,29 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
+    /// Self-test hook: sets the tracked canvas cursor (as a mouse move would),
+    /// so paste-position tests are deterministic regardless of the real cursor.
+    func selftestSetCanvasCursor(_ p: CGPoint) {
+        lastCanvasCursor = p
+        needsDisplay = true
+    }
+
+    /// Self-test hook: empties the in-memory clipboard so ⌘V falls back to the
+    /// system pasteboard.
+    func selftestClearClipboard() {
+        clipboard = []
+    }
+
+    /// Self-test diagnostics: expose internal transform so the clipboard test
+    /// can confirm the tracked cursor lands where expected.
+    var selftestLastCanvasCursor: CGPoint? { lastCanvasCursor }
+    var selftestCurrentZoom: CGFloat { zoom }
+    var selftestCanvasOffset: CGPoint { canvasOffset }
+
+    /// Snapshot of the state observed at the start of the last paste batch
+    /// (self-test hook, so a failing paste is diagnosable without rebuilding).
+    var selftestLastPasteContext: (cursor: CGPoint?, point: CGPoint, zoom: CGFloat, offset: CGPoint, bounds: CGRect, anchor: CGRect, incomingKinds: [String], incomingRects: [CGRect])?
+
     /// Self-test hook: the drawable path for an annotation (as rendered).
     func selftestPath(for a: Annotation) -> NSBezierPath? {
         bezierPath(for: a)
@@ -2637,9 +2664,19 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     // MARK: - copy / paste (Canva-style ⌘C / ⌘V)
 
+    /// Custom pasteboard type carrying a serialized macdraw scene, so copies
+    /// survive relaunches and can round-trip between macdraw windows/sessions.
+    /// Written alongside the PNG so other apps still see a plain image.
+    let macdrawPasteboardType = NSPasteboard.PasteboardType("com.local.macdraw.annotations")
+
+    /// Last cursor position inside the canvas in view (flipped) coordinates.
+    /// Tracks where the user last pointed so paste lands under the cursor
+    /// instead of wherever the OS cursor happens to be.
+    private var lastCanvasCursor: CGPoint?
+
     /// Copies the selected annotations into the internal clipboard and mirrors
-    /// them to the system pasteboard as a PNG (so they can be pasted into any
-    /// other app). Laser strokes are never copied.
+    /// them to the system pasteboard as macdraw JSON + a PNG (so they can be
+    /// pasted into any other app). Laser strokes are never copied.
     func copySelection() {
         let items = selected
             .filter { annotations.indices.contains($0) }
@@ -2647,9 +2684,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             .filter { $0.kind != .laser }
         guard !items.isEmpty else { return }
         clipboard = items.map { $0.copied() }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if let data = try? JSONEncoder().encode(items.map { $0.persisted() }) {
+            pb.setData(data, forType: macdrawPasteboardType)
+        }
         if let img = renderSelectionToImage() {
-            let pb = NSPasteboard.general
-            pb.clearContents()
             pb.writeObjects([img])
         }
         needsDisplay = true
@@ -2668,6 +2708,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     @discardableResult
     func paste() -> Bool {
         if pasteInternalClipboard() { return true }
+        if pasteMacdrawFromSystem() { return true }
         if pasteExcalidrawFromSystem() { return true }
         if pasteSystemImage() { return true }
         return pasteSystemText()
@@ -2678,20 +2719,42 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return pasteAnnotationBatch(clipboard)
     }
 
+    /// Restores a macdraw copy persisted on the system pasteboard (made by a
+    /// previous session, or after the internal clipboard was overwritten).
+    /// Decoding is strict Codable + geometry sanity checks — the JSON is never
+    /// evaluated.
+    private func pasteMacdrawFromSystem() -> Bool {
+        guard let data = NSPasteboard.general.data(forType: macdrawPasteboardType) else { return false }
+        guard let decoded = try? JSONDecoder().decode([PersistedAnnotation].self, from: data) else { return false }
+        guard !decoded.isEmpty, decoded.count <= 1000 else { return false }
+        let anns = decoded
+            .map { Annotation.restored(from: $0) }
+            .filter { $0.kind != .laser }
+        guard !anns.isEmpty else { return false }
+        for a in anns {
+            let r = a.rect
+            if !r.width.isFinite || !r.height.isFinite
+                || abs(r.width) > 100_000 || abs(r.height) > 100_000 {
+                return false
+            }
+        }
+        return pasteAnnotationBatch(anns)
+    }
+
     /// Drops a set of annotations onto the canvas, cloning them at the current
     /// cursor (or center of the viewport when the cursor is elsewhere).
     private func pasteAnnotationBatch(_ incoming: [Annotation]) -> Bool {
         guard !incoming.isEmpty else { return false }
         pushUndo()
-        let cursor = convert(window?.convertPoint(fromScreen: NSEvent.mouseLocation) ?? .zero, from: nil)
-        let viewport = screenToWorld(bounds)
-        var pastePoint = CGPoint(x: viewport.midX, y: viewport.midY)
-        if bounds.contains(cursor) {
-            pastePoint = screenToWorld(cursor)
+        var pastePoint = CGPoint(x: bounds.midX, y: bounds.midY)
+        if let cursor = lastCanvasCursor, bounds.contains(cursor) {
+            pastePoint = cursor
         }
-        let anchor = incoming.map(\.rect).reduce(CGRect.zero) { $0.union($1) }
-        let dx = pastePoint.x - anchor.midX
-        let dy = pastePoint.y - anchor.midY
+        let worldPaste = screenToWorld(pastePoint)
+        let anchor = incoming.map(\.rect).reduce(CGRect.null) { $0.union($1) }
+        selftestLastPasteContext = (cursor: lastCanvasCursor, point: pastePoint, zoom: zoom, offset: canvasOffset, bounds: bounds, anchor: anchor, incomingKinds: incoming.map(\.kind.rawValue), incomingRects: incoming.map(\.rect))
+        let dx = worldPaste.x - anchor.midX
+        let dy = worldPaste.y - anchor.midY
         let topZ = (annotations.map(\.zIndex).max() ?? 0) + 1
         var added: [Int] = []
         for var c in incoming {
@@ -2745,7 +2808,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private func pasteSystemImage() -> Bool {
         guard let img = NSImage(pasteboard: NSPasteboard.general) else { return false }
         pushUndo()
-        var p = convert(window?.convertPoint(fromScreen: NSEvent.mouseLocation) ?? .zero, from: nil)
+        var p = lastCanvasCursor ?? CGPoint(x: bounds.midX, y: bounds.midY)
         if !bounds.contains(p) {
             p = CGPoint(x: bounds.midX, y: bounds.midY)
         }

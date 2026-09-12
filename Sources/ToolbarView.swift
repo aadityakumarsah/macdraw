@@ -28,6 +28,7 @@ struct ToolbarView: View {
     let onToggleCodeBlock: () -> Void
     let onInsertSymbol: (String) -> Void
     let onSwitchPage: (String) -> Void
+    let onDeletePage: (String) -> Void
     let onToggleSidebar: () -> Void
     let onToggleAI: () -> Void
 
@@ -116,7 +117,7 @@ struct ToolbarView: View {
     private var topRow: some View {
         HStack(spacing: 6) {
             Button(action: onToggleSidebar) {
-                Image(systemName: state.sidebarVisible ? "sidebar.left" : "sidebar.left")
+                Image(systemName: state.sidebarVisible ? "sidebar.left" : "rectangle.lefthalf.inset.filled")
                     .frame(width: 30, height: 30)
                     .background(
                         state.sidebarVisible ? Color.white.opacity(0.14) : Color.clear,
@@ -274,6 +275,10 @@ struct ToolbarView: View {
                 onSwitch: { id in
                     showPages = false
                     onSwitchPage(id)
+                },
+                onDeletePage: { id in
+                    showPages = false
+                    onDeletePage(id)
                 }
             )
         }
@@ -1105,6 +1110,7 @@ struct WaveIcon: View {
 struct PagesView: View {
     @ObservedObject var pages: PagesManager
     let onSwitch: (String) -> Void
+    let onDeletePage: (String) -> Void
     @State private var newPageName = ""
     @State private var newPageNote = ""
 
@@ -1124,7 +1130,7 @@ struct PagesView: View {
                             onSwitch: { onSwitch(page.id) },
                             onRename: { pages.renamePage(id: page.id, to: $0) },
                             onSetNote: { pages.setNote(id: page.id, to: $0) },
-                            onDelete: { pages.deletePage(id: page.id) }
+                            onDelete: { onDeletePage(page.id) }
                         )
                     }
                 }
@@ -1141,6 +1147,7 @@ struct PagesView: View {
                         .padding(.horizontal, 6)
                         .padding(.vertical, 4)
                         .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                        .onSubmit(addPage)
 
                     Button {
                         addPage()

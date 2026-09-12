@@ -8,6 +8,7 @@ struct SidebarView: View {
     @ObservedObject var pages: PagesManager
     let onClose: () -> Void
     let onSwitchPage: (String) -> Void
+    let onDeletePage: (String) -> Void
     let onClear: () -> Void
     let onResetView: () -> Void
     let onOpenDashboard: () -> Void
@@ -92,7 +93,7 @@ struct SidebarView: View {
                             canDelete: pages.pages.count > 1,
                             onOpen: { onSwitchPage(page.id) },
                             onRename: { pages.renamePage(id: page.id, to: $0) },
-                            onDelete: { pages.deletePage(id: page.id) }
+                            onDelete: { onDeletePage(page.id) }
                         )
                     }
                 }
