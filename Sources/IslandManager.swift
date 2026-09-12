@@ -63,6 +63,15 @@ final class IslandManager {
     private var gestureMonitor: Any?
     private var isShowing = false
     private var isAnimating = false
+    /// When the current show/hide transition started, for stuck-transition
+    /// detection. A transition can leave `isAnimating` set forever if the Mac
+    /// sleeps mid-animation and AppKit drops both the completion handler and
+    /// the 1.5s watchdog — `toggle()` then only ever queues a pending action
+    /// that never runs, so the overlay refuses to open until a restart.
+    private var animatingSince: Date?
+    /// If a transition has been in flight longer than this, force a clean reset
+    /// instead of queueing another pending toggle.
+    private let transitionTimeout: TimeInterval = 4.0
     /// A show/hide intent queued while a transition animation was running.
     private var pendingToggle: Bool?
     private var logoPalette: LogoPaletteView?
@@ -179,9 +188,38 @@ private func toggleSidebar() {
                 self?.aiHost?.appearance = theme.appearance
             }
             .store(in: &cancellables)
+
+        // A transition interrupted by sleep/wake or a Space/display change can
+        // leave `isAnimating` stuck true (nothing pending ever runs and the
+        // overlay stops opening). Detect it after the system event and reset.
+        let nc = NSWorkspace.shared.notificationCenter
+        let systemEvents: [NSNotification.Name] = [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.activeSpaceDidChangeNotification,
+        ]
+        for name in systemEvents {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.recoverAfterSystemEvent()
+            }
+        }
+    }
+
+    private func recoverAfterSystemEvent() {
+        guard let since = animatingSince else { return }
+        if Date().timeIntervalSince(since) > transitionTimeout {
+            recoverStuckTransition()
+        }
     }
 
     func toggle() {
+        // Hard self-heal: if a transition somehow never completed (the Mac
+        // slept mid-animation, AppKit dropped the completion and the watchdog
+        // was suspended), reset to a clean hidden state so the hotspot /
+        // menu-bar action always has an effect.
+        if let since = animatingSince, Date().timeIntervalSince(since) > transitionTimeout {
+            recoverStuckTransition()
+        }
         if isAnimating {
             // A toggle arrived mid-transition: remember what the user wanted
             // and apply it as soon as the current open/close finishes. The
@@ -191,6 +229,19 @@ private func toggleSidebar() {
             return
         }
         isShowing ? hide() : show()
+    }
+
+    /// Drops the overlay to a clean, fully-hidden state (no animation, no
+    /// monitors, nothing queued). Safe to call at any time and from any state.
+    func recoverStuckTransition() {
+        teardownContent()
+        window.orderOut(nil)
+        window.alphaValue = 1
+        isShowing = false
+        isAnimating = false
+        pendingToggle = nil
+        animatingSince = nil
+        state.drawingMode = false
     }
 
     /// Resolves a toggle queued while a show/hide animation was running.
@@ -237,6 +288,7 @@ private func toggleSidebar() {
         guard !isShowing, !isAnimating else { return }
         isShowing = true
         isAnimating = true
+        animatingSince = Date()
 
         let screen = screenForMouse() ?? NSScreen.main ?? NSScreen.screens[0]
         let pill = pillRect(on: screen)
@@ -274,6 +326,7 @@ private func toggleSidebar() {
         guard isAnimating else { return }
         installContent(on: screen)
         isAnimating = false
+        animatingSince = nil
         applyPendingToggle()
     }
 
@@ -281,6 +334,7 @@ private func toggleSidebar() {
         guard isShowing, !isAnimating else { return }
         isShowing = false
         isAnimating = true
+        animatingSince = Date()
 
         let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
 
@@ -325,6 +379,7 @@ private func toggleSidebar() {
         window.orderOut(nil)
         window.alphaValue = 1
         isAnimating = false
+        animatingSince = nil
         applyPendingToggle()
     }
 
@@ -426,6 +481,9 @@ private func toggleSidebar() {
 
         window.contentView = container
         window.setFrame(screen.frame, display: true)
+        // Re-assert ordering: after a Space/display change the panel can end
+        // up behind other windows even though its level is screenSaver.
+        window.orderFrontRegardless()
         window.makeFirstResponder(canvas)
 
         NSAnimationContext.runAnimationGroup { ctx in

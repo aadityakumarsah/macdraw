@@ -46,6 +46,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         hotkey.start()
 
+        // Global event monitors are silently dropped by macOS after sleep/wake
+        // on Apple Silicon — re-arm the hotkey so Control+Option keeps working.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.hotkey.restart()
+        }
+
         setupStatusItem()
 
         // Check for updates shortly after launch so users always know
