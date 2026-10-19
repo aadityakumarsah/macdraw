@@ -81,6 +81,14 @@ func runAITest() async {
     print("[aitest] test connection: \(status)")
     guard status.hasPrefix("Connected") else { exit(1) }
 
+    // MACDRAW_AI_MODE=scene|diagram runs one generator only. Both together
+    // can exceed a free tier's per-minute token budget, so verifying one path
+    // in isolation needs to be possible.
+    let mode = env["MACDRAW_AI_MODE"]?.lowercased()
+    let runScene = mode != "diagram"
+    let runDiagram = mode != "scene"
+
+    if runScene {
     print("[aitest] generating a scene for: \(prompt)")
     do {
         let scene = try await SceneAI.generate(prompt: prompt, settings: settings) { step in
@@ -94,6 +102,12 @@ func runAITest() async {
     } catch {
         print("[aitest] FAIL generating a scene: \(error.localizedDescription)")
         exit(1)
+    }
+    }
+
+    guard runDiagram else {
+        print("[aitest] AITEST PASS")
+        exit(0)
     }
 
     // Diagram mode goes through a different generator and a different

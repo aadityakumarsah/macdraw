@@ -1726,6 +1726,58 @@ private func toggleSidebar() {
                         canvas.deleteSelected()
                         log("scene harness test: PASS")
 
+                        log("diagram decode test: a sparse model response still loads")
+                        // Exactly the shape that failed in the field: a model
+                        // that omits every field carrying a Swift default.
+                        // The synthesized decoder treats those as required and
+                        // threw "The data couldn't be read because it is
+                        // missing" for the whole diagram.
+                        let sparseDiagram = """
+                        {"nodes":[
+                          {"id":"n1","label":"Apply","x":10,"y":20},
+                          {"id":"n2","label":"Screen","x":200,"y":20}
+                        ],
+                         "edges":[{"id":"e1","from":"n1","to":"n2"}]}
+                        """
+                        guard let sparse = try? DiagramAI.decode(sparseDiagram) else {
+                            log("FAIL: a diagram omitting defaulted fields should still decode")
+                            exit(1)
+                        }
+                        log("sparse diagram: \(sparse.nodes.count) nodes, \(sparse.edges.count) edges, kind=\(sparse.nodes[0].kind) size=\(Int(sparse.nodes[0].width))x\(Int(sparse.nodes[0].height)) style=\(sparse.edges[0].style) end=\(sparse.edges[0].endArrow)")
+                        if sparse.nodes.count != 2 || sparse.edges.count != 1 {
+                            log("FAIL: sparse diagram lost content")
+                            exit(1)
+                        }
+                        if sparse.nodes[0].kind != "process" || sparse.nodes[0].width != 150 || sparse.nodes[0].height != 64 {
+                            log("FAIL: omitted node fields should fall back to their documented defaults")
+                            exit(1)
+                        }
+                        if sparse.edges[0].style != "curved" || sparse.edges[0].endArrow != "arrow" || sparse.edges[0].startArrow != "none" {
+                            log("FAIL: omitted edge fields should fall back to their documented defaults")
+                            exit(1)
+                        }
+                        if !DiagramAI.isValid(sparse) {
+                            log("FAIL: a sparse diagram should still validate")
+                            exit(1)
+                        }
+                        // A missing "edges" key is a diagram of loose nodes,
+                        // not a failure.
+                        guard let noEdges = try? DiagramAI.decode(#"{"nodes":[{"id":"a","label":"Solo","x":0,"y":0}]}"#),
+                              noEdges.edges.isEmpty, noEdges.nodes.count == 1 else {
+                            log("FAIL: a diagram with no edges key should decode as unconnected nodes")
+                            exit(1)
+                        }
+                        // An edge pointing at a node that does not exist is
+                        // dropped rather than invalidating everything.
+                        guard let danglingPruned = try? DiagramAI.decode("""
+                        {"nodes":[{"id":"a","label":"A","x":0,"y":0}],
+                         "edges":[{"id":"e","from":"a","to":"ghost"}]}
+                        """), danglingPruned.edges.isEmpty, DiagramAI.isValid(danglingPruned) else {
+                            log("FAIL: an edge to a missing node should be pruned, keeping the diagram")
+                            exit(1)
+                        }
+                        log("diagram decode test: PASS")
+
                         log("key detection test: a pasted key picks its own provider")
                         // Prefixes only — no real credentials in the test.
                         let keySamples: [(String, AIProvider?)] = [

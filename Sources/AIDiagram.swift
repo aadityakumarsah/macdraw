@@ -125,6 +125,39 @@ struct DiagramNode: Codable, Identifiable {
     /// `label` holds the code content. Best for showing a code snippet inside
     /// an architecture or flow diagram.
     var code: Bool = false
+
+    // Decoding is tolerant because the producer is a language model.
+    //
+    // Swift's synthesized decoder ignores property defaults, so `kind`,
+    // `width`, `height` and `code` — every field with a default above — were
+    // *required on the wire*. A model that left any of them out failed the
+    // whole diagram with "The data couldn't be read because it is missing",
+    // which is `DecodingError.keyNotFound` surfacing to the user.
+    private enum CodingKeys: String, CodingKey {
+        case id, label, kind, x, y, width, height, symbol, code
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Only id and label are genuinely needed to place a node.
+        id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+        label = (try? c.decode(String.self, forKey: .label)) ?? ""
+        kind = (try? c.decode(String.self, forKey: .kind)) ?? "process"
+        x = (try? c.decode(CGFloat.self, forKey: .x)) ?? 0
+        y = (try? c.decode(CGFloat.self, forKey: .y)) ?? 0
+        width = (try? c.decode(CGFloat.self, forKey: .width)) ?? 150
+        height = (try? c.decode(CGFloat.self, forKey: .height)) ?? 64
+        symbol = try? c.decode(String.self, forKey: .symbol)
+        code = (try? c.decode(Bool.self, forKey: .code)) ?? false
+    }
+
+    init(id: String, label: String, kind: String = "process",
+         x: CGFloat, y: CGFloat, width: CGFloat = 150, height: CGFloat = 64,
+         symbol: String? = nil, code: Bool = false) {
+        self.id = id; self.label = label; self.kind = kind
+        self.x = x; self.y = y; self.width = width; self.height = height
+        self.symbol = symbol; self.code = code
+    }
 }
 struct DiagramEdge: Codable, Identifiable {
     var id: String
@@ -138,11 +171,50 @@ struct DiagramEdge: Codable, Identifiable {
     /// Arrowhead on the end of the connector: "arrow" (default), "none",
     /// "triangle", "bar".
     var endArrow: String = "arrow"
+
+    // Tolerant for the same reason as `DiagramNode`: `style`, `startArrow`
+    // and `endArrow` all have defaults the synthesized decoder ignores.
+    private enum CodingKeys: String, CodingKey {
+        case id, from, to, label, style, startArrow, endArrow
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+        // An edge with no endpoints is meaningless; the validator drops it.
+        from = (try? c.decode(String.self, forKey: .from)) ?? ""
+        to = (try? c.decode(String.self, forKey: .to)) ?? ""
+        label = try? c.decode(String.self, forKey: .label)
+        style = (try? c.decode(String.self, forKey: .style)) ?? "curved"
+        startArrow = (try? c.decode(String.self, forKey: .startArrow)) ?? "none"
+        endArrow = (try? c.decode(String.self, forKey: .endArrow)) ?? "arrow"
+    }
+
+    init(id: String, from: String, to: String, label: String? = nil,
+         style: String = "curved", startArrow: String = "none", endArrow: String = "arrow") {
+        self.id = id; self.from = from; self.to = to; self.label = label
+        self.style = style; self.startArrow = startArrow; self.endArrow = endArrow
+    }
 }
 struct DiagramSpec: Codable {
     var title: String? = nil
     var nodes: [DiagramNode]
     var edges: [DiagramEdge]
+
+    private enum CodingKeys: String, CodingKey { case title, nodes, edges }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try? c.decode(String.self, forKey: .title)
+        nodes = (try? c.decode([DiagramNode].self, forKey: .nodes)) ?? []
+        // A diagram of unconnected nodes is still a diagram; a missing
+        // `edges` key should not throw the whole response away.
+        edges = (try? c.decode([DiagramEdge].self, forKey: .edges)) ?? []
+    }
+
+    init(title: String? = nil, nodes: [DiagramNode], edges: [DiagramEdge]) {
+        self.title = title; self.nodes = nodes; self.edges = edges
+    }
 }
 
 /// Catalog of SF Symbols the AI may attach to nodes as icons/logos. These are
@@ -1078,8 +1150,13 @@ enum KeychainStore {
         let cleaned = text.replacingOccurrences(of: "```json", with: "").replacingOccurrences(of: "```", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard let start = cleaned.firstIndex(of: "{"), let end = cleaned.lastIndex(of: "}") else { throw NSError(domain: "MacdrawAI", code: 7, userInfo: [NSLocalizedDescriptionKey: "The model did not return a diagram JSON object."]) }
         let json = String(cleaned[start...end])
-        let spec = try JSONDecoder().decode(DiagramSpec.self, from: Data(json.utf8))
+        var spec = try JSONDecoder().decode(DiagramSpec.self, from: Data(json.utf8))
         guard !spec.nodes.isEmpty else { throw NSError(domain: "MacdrawAI", code: 8, userInfo: [NSLocalizedDescriptionKey: "The generated diagram has no nodes."]) }
+        // Drop edges that reference nothing instead of letting one bad edge
+        // fail `isValid` and discard an otherwise good diagram. The canvas
+        // converter skips unresolvable edges anyway.
+        let ids = Set(spec.nodes.map(\.id))
+        spec.edges = spec.edges.filter { ids.contains($0.from) && ids.contains($0.to) }
         return spec
     }
 }
