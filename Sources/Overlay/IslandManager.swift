@@ -748,7 +748,10 @@ private func toggleSidebar() {
         log("showing overlay")
         pages.selftestReset()
         show()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+        pollUntil("the overlay to finish opening", log: log, condition: { [weak self] in
+            guard let self else { return false }
+            return self.isOverlayVisible && !self.isAnimating && self.canvas != nil
+        }) { [weak self] in
             guard let self else {
                 log("FAIL: overlay not installed")
                 exit(1)
@@ -791,7 +794,9 @@ private func toggleSidebar() {
             log("FAIL: no canvas for clipboard test")
             exit(1)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        pollUntil("a canvas for the clipboard test", log: log, condition: { [weak self] in
+            self?.canvas != nil
+        }) { [weak self] in
             guard let self, let canvas = self.canvas else { return }
             let startCount = canvas.annotations.count
             let uti = canvas.macdrawPasteboardType
@@ -958,7 +963,13 @@ private func toggleSidebar() {
         self.state.lastNonTextTool = .rectangle
         self.activate()
         log("activating + clicking canvas")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+        // Only the canvas is required: the click is injected into it
+        // directly and the edit field becomes first responder within the
+        // window, so neither key-window status nor app activation gates this
+        // — and waiting on them hangs when the display is asleep.
+        pollUntil("a canvas for the text test", log: log, condition: { [weak self] in
+            self?.canvas != nil
+        }) { [weak self] in
             guard let self, let canvas = self.canvas else { return }
             let w = self.window.windowNumber
             let ev = NSEvent.mouseEvent(
@@ -982,7 +993,9 @@ private func toggleSidebar() {
             log("before esc: editing=\(canvas.selftestEditingString().debugDescription)")
             self.postKeyDown(keyCode: 53)
             log("after post: editing=\(canvas.isEditingText) string=\(canvas.selftestEditingString().debugDescription)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self.pollUntil("the text to commit", log: log, condition: { [weak self] in
+                self?.canvas?.isEditingText == false
+            }) { [weak self] in
                 guard let self, let canvas = self.canvas else { return }
                 log("after Esc: editing=\(canvas.isEditingText) annotations=\(canvas.annotations.count) tool=\(self.state.tool.rawValue)")
                 if canvas.isEditingText {
@@ -1004,7 +1017,11 @@ private func toggleSidebar() {
                 }
                 log("pressing Esc again (not editing)")
                 self.postKeyDown(keyCode: 53)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                // Nothing to wait *for* here — the assertion is that a
+                // second Esc with nothing open does not take the app down.
+                self.pollUntil("the app to settle after a second Esc", log: log, condition: { [weak self] in
+                    self?.canvas != nil
+                }) { [weak self] in
                     guard let self, let canvas = self.canvas else { return }
                     log("still alive after 2nd Esc")
 
@@ -1095,7 +1112,9 @@ private func toggleSidebar() {
                     }
                     canvas.selftestSetText("edited text")
                     self.postKeyDown(keyCode: 53)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    self.pollUntil("the re-edited text to commit", log: log, condition: { [weak self] in
+                        self?.canvas?.isEditingText == false
+                    }) { [weak self] in
                         guard let self, let canvas = self.canvas else { return }
                         log("re-edit after esc: annotations=\(canvas.annotations.count) text=\(canvas.annotations[0].text)")
                         if canvas.annotations.count != 2 {
@@ -1169,7 +1188,9 @@ private func toggleSidebar() {
                         }
                         canvas.selftestSetText("inside shape")
                         self.postKeyDown(keyCode: 53)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        self.pollUntil("the shape's text to commit", log: log, condition: { [weak self] in
+                            self?.canvas?.isEditingText == false
+                        }) { [weak self] in
                             guard let self, let canvas = self.canvas else { return }
                             log("shape text after esc: count=\(canvas.annotations.count) text=\(canvas.annotations[1].text) inside=\(canvas.annotations[1].textInside) fontSize=\(canvas.annotations[1].fontSize)")
                             if canvas.annotations.count != 3 {
@@ -2905,6 +2926,32 @@ private func toggleSidebar() {
     }
 
     /// Polls the overlay visibility until it matches `expectVisible`.
+    /// Waits for a condition instead of guessing how long it takes.
+    ///
+    /// The overlay assertions already polled; the text and clipboard ones
+    /// slept for a fixed 0.3-1.6s and then asserted, which is why the suite
+    /// failed intermittently on a loaded machine or a cold binary — the
+    /// commit, the activation or the install simply had not happened yet.
+    /// Failures now say what was being waited for.
+    private func pollUntil(
+        _ what: String,
+        log: @escaping (String) -> Void,
+        timeout: TimeInterval = 6.0,
+        condition: @escaping @MainActor () -> Bool,
+        then: @escaping @MainActor () -> Void
+    ) {
+        let deadline = DispatchTime.now() + timeout
+        @MainActor func tick() {
+            if condition() { then(); return }
+            if DispatchTime.now() >= deadline {
+                log("FAIL: timed out waiting for \(what)")
+                exit(1)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { MainActor.assumeIsolated { tick() } }
+        }
+        MainActor.assumeIsolated { tick() }
+    }
+
     private func pollVisibility(
         log: @escaping (String) -> Void,
         expectVisible: Bool,
