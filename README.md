@@ -20,12 +20,29 @@ macdraw is a full-screen transparent overlay that captures your clicks so you ca
 - **17 drawing tools** — rectangle, diamond, ellipse, arrow, line, freehand sketch, magic shape, frame, text, image, eraser, lasso, laser, fill and more
 - **Glowing laser pointer** — neon glow that fades tail-first, leaves no marks
 - **White / black screen** — flip the whole display to a clean writing surface
-- **Full color palette** — stroke & fill colors, stroke width, dashed strokes
-- **Real text** — type anywhere, pick a font family and size, re-edit anytime
+- **The full Excalidraw palette** — the 5x3 colour grid with five shades each, quick picks and a hex field, for both stroke and background
+- **Hand-drawn fills and strokes** — hachure, cross-hatch, zigzag or solid fill; solid / dashed / dotted strokes; Architect, Artist or Cartoonist sloppiness; sharp or round edges
+- **Real text** — type anywhere, pick a font family and size, re-edit anytime. The font list is set in the fonts themselves, so you can see what you are choosing
 - **Images & emoji** — drop pictures, or press `/` for a quick emoji palette
 - **Selection editing** — move, resize, rotate, lasso-select, delete, undo
-- **Autosave** — your drawing persists across quits and relaunches
+- **Autosave that keeps up** — pages are written one file at a time, off the main thread, and images are stored once on disk instead of being re-encoded into the page on every save
 - **Keyboard-first** — every tool has a one-key shortcut
+
+## Where your drawings live
+
+Everything is kept in `~/Library/Application Support/MacDraw`, outside the app
+bundle:
+
+```
+index.json          page names, notes and per-page pan/zoom
+pages/<id>.json     one file per page — only the pages you open are loaded
+files/<sha256>.png  images, stored once under the hash of their bytes
+```
+
+Deleting macdraw.app — or replacing it with a new download — leaves all of it
+in place, so reinstalling brings every page back. Drawings go away only when
+you delete them in the app. Set `MACDRAW_DATA_DIR` to point the whole store
+somewhere else (the self-test uses this so a test run can't touch real work).
 
 ## AI text-to-diagram
 

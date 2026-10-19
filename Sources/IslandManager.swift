@@ -760,6 +760,28 @@ private func toggleSidebar() {
         }
     }
 
+    /// Dev hook (`--sample`): sketches a long wavy stroke through the real
+    /// mouse path, so a screenshot shows whether the incremental repaints
+    /// used while drawing keep the whole stroke on screen.
+    func selftestDrawSampleStroke() {
+        guard let canvas = self.canvas else { return }
+        state.tool = .freedraw
+        state.lastNonTextTool = .freedraw
+        state.strokeColor = Palette.violet[4]
+        state.strokeWidth = 3
+        var points: [CGPoint] = []
+        for i in 0...180 {
+            let t = CGFloat(i)
+            points.append(CGPoint(x: 160 + t * 6, y: 700 + sin(t / 9) * 60))
+        }
+        canvas.mouseDown(with: mouseEvent(at: win(points[0]), type: .leftMouseDown))
+        for p in points.dropFirst() {
+            canvas.mouseDragged(with: mouseEvent(at: win(p), type: .leftMouseDragged))
+        }
+        canvas.mouseUp(with: mouseEvent(at: win(points[points.count - 1]), type: .leftMouseUp))
+        state.tool = .selection
+    }
+
     private func textEditingTest(log: @escaping (String) -> Void) {
         guard self.canvas != nil else { return }
         self.state.tool = .text
@@ -1315,6 +1337,101 @@ private func toggleSidebar() {
                             exit(1)
                         }
                         log("mid-box dodge: connector cleared the box (maxY=\(pathPts.map(\.y).max() ?? 0))")
+
+                        log("connector identity test: deleting an earlier element must not re-point a glued connector")
+                        if let before = canvas.selftestPathStart(link2), canvas.annotations.count > 3 {
+                            // Element 0 belongs to an earlier test and nothing
+                            // is glued to it. Removing it shifts every index
+                            // after it, which is what used to drag glued
+                            // connectors onto the wrong box.
+                            canvas.selftestSelect([0])
+                            canvas.deleteSelected()
+                            guard let moved = canvas.annotations.last,
+                                  let after = canvas.selftestPathStart(moved) else {
+                                log("FAIL: connector disappeared after deleting an unrelated element")
+                                exit(1)
+                            }
+                            let drift = hypot(after.x - before.x, after.y - before.y)
+                            log("connector identity: start \(before) -> \(after) drift=\(drift)")
+                            if drift > 1 {
+                                log("FAIL: glued connector moved when an unrelated element was deleted")
+                                exit(1)
+                            }
+                        }
+
+                        log("eraser precision test: erasing inside an unfilled box must not delete it")
+                        self.state.tool = .rectangle
+                        self.state.lastNonTextTool = .rectangle
+                        self.state.fillEnabled = false
+                        let eraseBoxTL = self.win(CGPoint(x: 1500, y: 520))
+                        let eraseBoxBR = self.win(CGPoint(x: 1800, y: 720))
+                        canvas.mouseDown(with: self.mouseEvent(at: eraseBoxTL, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: eraseBoxBR, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: eraseBoxBR, type: .leftMouseUp))
+                        let afterBox = canvas.annotations.count
+                        guard canvas.annotations.last?.kind == .rect else {
+                            log("FAIL: eraser test could not create its box")
+                            exit(1)
+                        }
+                        self.state.tool = .eraser
+                        let boxMiddle = self.win(CGPoint(x: 1650, y: 620))
+                        canvas.mouseDown(with: self.mouseEvent(at: boxMiddle, type: .leftMouseDown))
+                        canvas.mouseUp(with: self.mouseEvent(at: boxMiddle, type: .leftMouseUp))
+                        log("eraser in the middle: \(afterBox) -> \(canvas.annotations.count) annotations")
+                        if canvas.annotations.count != afterBox {
+                            log("FAIL: erasing the empty middle of an unfilled box deleted it")
+                            exit(1)
+                        }
+                        let boxEdge = self.win(CGPoint(x: 1650, y: 520))
+                        canvas.mouseDown(with: self.mouseEvent(at: boxEdge, type: .leftMouseDown))
+                        canvas.mouseUp(with: self.mouseEvent(at: boxEdge, type: .leftMouseUp))
+                        log("eraser on the edge: \(afterBox) -> \(canvas.annotations.count) annotations")
+                        if canvas.annotations.count >= afterBox {
+                            log("FAIL: erasing the box's own outline should delete it")
+                            exit(1)
+                        }
+                        self.state.tool = .selection
+
+                        log("style persistence test: fill style and sloppiness survive a save + reload")
+                        self.state.fillEnabled = true
+                        self.state.fillStyle = .crossHatch
+                        self.state.sloppiness = .cartoonist
+                        self.state.tool = .ellipse
+                        self.state.lastNonTextTool = .ellipse
+                        let styleTL = self.win(CGPoint(x: 1500, y: 780))
+                        let styleBR = self.win(CGPoint(x: 1700, y: 900))
+                        canvas.mouseDown(with: self.mouseEvent(at: styleTL, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: styleBR, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: styleBR, type: .leftMouseUp))
+                        guard let styled = canvas.annotations.last, styled.kind == .ellipse else {
+                            log("FAIL: style test could not create its ellipse")
+                            exit(1)
+                        }
+                        log("styled element: fill=\(styled.fillStyle.rawValue) sloppiness=\(styled.sloppiness) id=\(styled.id)")
+                        if styled.fillStyle != .crossHatch || styled.sloppiness != Sloppiness.cartoonist.roughness {
+                            log("FAIL: new shapes should adopt the fill style and sloppiness settings")
+                            exit(1)
+                        }
+                        canvas.flushPendingSave()
+                        canvas.applyCurrentPage()
+                        guard let reloaded = canvas.annotations.last(where: { $0.id == styled.id }) else {
+                            log("FAIL: the styled ellipse did not survive the reload")
+                            exit(1)
+                        }
+                        log("reloaded element: fill=\(reloaded.fillStyle.rawValue) sloppiness=\(reloaded.sloppiness)")
+                        if reloaded.fillStyle != .crossHatch || reloaded.sloppiness != Sloppiness.cartoonist.roughness {
+                            log("FAIL: fill style / sloppiness lost on reload")
+                            exit(1)
+                        }
+                        if reloaded.id != styled.id {
+                            log("FAIL: element ids must be stable across a save + reload")
+                            exit(1)
+                        }
+                        self.state.fillStyle = .hachure
+                        self.state.sloppiness = .artist
+                        self.state.fillEnabled = false
+                        self.state.tool = .selection
+
                         log("shape library test: palette contents are all drawable tools")
                         if Tool.shapePalette.count < 25 {
                             log("FAIL: shape palette should contain at least 25 shapes, got \(Tool.shapePalette.count)")

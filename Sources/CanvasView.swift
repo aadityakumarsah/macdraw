@@ -2852,7 +2852,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         for i in annotations.indices where annotations[i].kind != .laser {
             // Cheap reject first; the precise test builds a path.
             guard annotations[i].rect.insetBy(dx: -radius - 12, dy: -radius - 12).contains(p) else { continue }
-            if hitTest(p, index: i, tolerance: radius) { toRemove.append(i) }
+            if hitTest(p, index: i, tolerance: radius, hollowInterior: true) { toRemove.append(i) }
         }
         guard !toRemove.isEmpty else { return }
         var erasedBounds: CGRect?
@@ -6461,7 +6461,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
     ///
     /// `tolerance` widens the catch area beyond the element's own stroke —
     /// the eraser passes its radius so sweeping near a line erases it.
-    private func hitTest(_ p: CGPoint, index i: Int, tolerance: CGFloat) -> Bool {
+    ///
+    /// `hollowInterior` decides what the empty middle of an unfilled closed
+    /// shape means. Clicking there selects the shape (forgiving, and what
+    /// this app has always done), but the *eraser* must not: rubbing out
+    /// something in the middle of a big empty box should not take the box
+    /// with it.
+    private func hitTest(
+        _ p: CGPoint, index i: Int, tolerance: CGFloat, hollowInterior: Bool = false
+    ) -> Bool {
         guard annotations.indices.contains(i) else { return false }
         let a = annotations[i]
         let localP = rotatedPoint(p, around: CGPoint(x: a.rect.midX, y: a.rect.midY), by: -a.rotation)
@@ -6471,18 +6479,23 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .freedraw:
             // Closed freehand loops are clickable inside the loop (bucket
             // fill, selection), not just on the stroke.
-            if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points) { return true }
-            return touchesOutline(localP, index: i, annotation: a, tolerance: tolerance)
+            if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points),
+               !(hollowInterior && !shouldFill(a)) {
+                return true
+            }
+            return touchesOutline(localP, index: i, annotation: a, tolerance: tolerance, hollowInterior: hollowInterior)
         default:
-            return touchesOutline(localP, index: i, annotation: a, tolerance: tolerance)
+            return touchesOutline(localP, index: i, annotation: a, tolerance: tolerance, hollowInterior: hollowInterior)
         }
     }
 
     private func touchesOutline(
-        _ localP: CGPoint, index i: Int, annotation a: Annotation, tolerance: CGFloat
+        _ localP: CGPoint, index i: Int, annotation a: Annotation,
+        tolerance: CGFloat, hollowInterior: Bool
     ) -> Bool {
         let path = cachedPath(for: a, index: i)
-        if path.contains(localP) { return true }
+        let interiorCounts = !hollowInterior || shouldFill(a)
+        if interiorCounts, path.contains(localP) { return true }
         let threshold = max(10, a.strokeWidth / 2 + 6) + tolerance
         return distanceToPath(localP, path) < threshold
     }

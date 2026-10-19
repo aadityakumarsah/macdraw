@@ -79,6 +79,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if CommandLine.arguments.contains("--sample") {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
                         self?.activeCanvas?.selftestInsertSampleScene()
+                        // Then draw a long freehand stroke the way a hand
+                        // would, one sample at a time. Each step repaints only
+                        // the few pixels that changed, so this is the check
+                        // that incremental repaints leave the rest of the
+                        // canvas intact.
+                        self?.island.selftestDrawSampleStroke()
                     }
                 }
             }
