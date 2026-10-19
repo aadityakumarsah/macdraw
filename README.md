@@ -29,6 +29,21 @@ macdraw is a full-screen transparent overlay that captures your clicks so you ca
 - **Hold ⇧ to use the app underneath** — the overlay stops capturing input, so you can scroll a doc, click buttons and use trackpad gestures without closing it. Let go and you are drawing again.
 - **Keyboard-first** — every tool has a one-key shortcut
 
+## Source layout
+
+```
+Sources/App/        launch, menu bar, updater, installer window
+Sources/Overlay/    the overlay window, its show/hide transitions, hotkey, theme
+Sources/Canvas/     the canvas view, the element model, the palette
+Sources/UI/         toolbar, inspector popovers, sidebar, "/" palette
+Sources/AI/         providers, the scene harness, clipboard table parsing
+Sources/Storage/    on-disk store, pages, sync, clipboard and markdown import
+Sources/Platform/   fonts, bundled resources, SVG icon rasterizing
+```
+
+`Sources/Canvas/CanvasView.swift` is still the one genuinely large file; it
+holds input handling, rendering and the render caches together.
+
 ## Where your drawings live
 
 Everything is kept in `~/Library/Application Support/MacDraw`, outside the app

@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 # com.apple.provenance xattrs from iCloud sync, which break codesign.
 # The final DMG/zip are copied to dist/ when done.
 
-VERSION=$(grep '^let appVersion' Sources/UpdateChecker.swift | sed -E 's/.*"([^"]+)".*/\1/')
+VERSION=$(grep '^let appVersion' Sources/App/UpdateChecker.swift | sed -E 's/.*"([^"]+)".*/\1/')
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -16,7 +16,7 @@ APP="$WORK/macdraw.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "== building app =="
-swiftc -O Sources/*.swift -o "$APP/Contents/MacOS/macdraw" \
+swiftc -O $(find Sources -name "*.swift") -o "$APP/Contents/MacOS/macdraw" \
   -framework AppKit -framework Carbon -framework SwiftUI
 
 echo "== copying resources =="

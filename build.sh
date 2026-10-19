@@ -9,12 +9,12 @@ trap 'rm -rf "$WORK"' EXIT
 APP="$WORK/macdraw.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# Single source of truth for the version: Sources/UpdateChecker.swift.
-VERSION=$(grep '^let appVersion' Sources/UpdateChecker.swift | sed -E 's/.*"([^"]+)".*/\1/')
+# Single source of truth for the version: Sources/App/UpdateChecker.swift.
+VERSION=$(grep '^let appVersion' Sources/App/UpdateChecker.swift | sed -E 's/.*"([^"]+)".*/\1/')
 echo "== version: $VERSION =="
 
 echo "== compiling =="
-swiftc -O -module-cache-path "$WORK/module-cache" Sources/*.swift -o "$APP/Contents/MacOS/macdraw" \
+swiftc -O -module-cache-path "$WORK/module-cache" $(find Sources -name "*.swift") -o "$APP/Contents/MacOS/macdraw" \
   -framework AppKit -framework Carbon -framework SwiftUI
 
 echo "== copying resources =="
