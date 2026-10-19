@@ -32,16 +32,14 @@ struct ToolbarView: View {
     let onToggleSidebar: () -> Void
     let onToggleAI: () -> Void
 
-    enum ColorTarget {
-        case stroke
-        case fill
-    }
-
     @State private var showShortcuts = false
     @State private var showShapes = false
     @State private var showPages = false
     @State private var showUpdate = false
-    @State private var colorTarget: ColorTarget = .stroke
+    @State private var showStrokeColors = false
+    @State private var showFillColors = false
+    @State private var showShapeProperties = false
+    @State private var showFonts = false
 
     var body: some View {
         VStack(spacing: 6) {
@@ -464,56 +462,157 @@ struct ToolbarView: View {
             : shapesBackground
     }
 
-    // MARK: - row 2: colors, fill, width, palette, font
+    // MARK: - row 2: the shape inspector
 
+    /// Row 2 — the shape inspector.
+    ///
+    /// Everything that used to be laid out side by side here (two sliders,
+    /// four menus, a twelve-family color strip and the font menu) ran wider
+    /// than the bar itself. The controls are the same, plus the ones
+    /// Excalidraw has that this app was missing, but each now opens from one
+    /// compact button that shows its current value.
     private var bottomRow: some View {
         HStack(spacing: 8) {
-            targetPicker
+            strokeColorButton
+            fillColorButton
+            Divider().frame(height: 24)
+            shapePropertiesButton
+            Divider().frame(height: 24)
             arrowModePicker
-            quickPicks
             Divider().frame(height: 24)
-            fillToggle
-            if state.fillEnabled {
-                Slider(value: $state.fillOpacity, in: 0.1...1.0, step: 0.1)
-                    .frame(width: 60)
-                    .help("Fill opacity")
-            }
-            Slider(value: $state.strokeWidth, in: 1...16, step: 1)
-                .frame(width: 70)
-                .help("Stroke width")
-            strokeStyleMenu
-            arrowheadMenu(title: "Start", selection: $state.arrowStart)
-            arrowheadMenu(title: "End", selection: $state.arrowEnd)
-            opacityControl
-            Divider().frame(height: 24)
-            fullPalette
-            Divider().frame(height: 24)
+            fontButton
+            Spacer(minLength: 0)
             backgroundPicker
-            Divider().frame(height: 24)
-            fontMenu
-            Slider(value: $state.fontSize, in: 10...72, step: 1)
-                .frame(width: 70)
-                .help("Font size")
-            Text("\(Int(state.fontSize))")
-                .font(.system(size: 10, weight: .semibold))
-                .monospacedDigit()
-                .frame(width: 22)
-                .foregroundStyle(.secondary)
         }
     }
 
-    private var strokeStyleMenu: some View {
-        Menu {
-            ForEach(StrokeStyle.allCases, id: \.self) { style in
-                Button { state.strokeStyle = style } label: { Label(style.label, systemImage: style.iconName) }
+    /// Stroke color — the swatch is the current color.
+    private var strokeColorButton: some View {
+        Button { showStrokeColors.toggle() } label: {
+            HStack(spacing: 5) {
+                ColorSwatch(color: state.strokeColor, size: 18)
+                Text("Stroke")
+                    .font(.system(size: 10, weight: .semibold))
             }
-        } label: {
-            Image(systemName: state.strokeStyle.iconName)
-                .frame(width: 24, height: 22)
-                .contentShape(Rectangle())
+            .padding(.horizontal, 7)
+            .frame(height: 26)
+            .background(
+                showStrokeColors ? Color.white.opacity(0.12) : Color.primary.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .help("Stroke style: \(state.strokeStyle.label)")
+        .buttonStyle(.plain)
+        .help("Stroke color — \(state.strokeColor.hexDescription)")
+        .popover(isPresented: $showStrokeColors, arrowEdge: .bottom) {
+            ColorPickerPopover(
+                title: "Stroke",
+                shadeIndex: Palette.strokeShadeIndex,
+                topPicks: Palette.strokePicks.map { Optional($0) },
+                allowsTransparent: false,
+                selection: state.strokeColor,
+                onPick: { c in
+                    if let c { state.strokeColor = c }
+                }
+            )
+        }
+    }
+
+    /// Background (fill) color. Picking transparent turns the fill off, which
+    /// is how Excalidraw's transparent background behaves.
+    private var fillColorButton: some View {
+        Button { showFillColors.toggle() } label: {
+            HStack(spacing: 5) {
+                ColorSwatch(color: state.fillEnabled ? state.fillColor : nil, size: 18)
+                Text("Fill")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .padding(.horizontal, 7)
+            .frame(height: 26)
+            .background(
+                showFillColors ? Color.white.opacity(0.12) : Color.primary.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(state.fillEnabled ? "Fill color — \(state.fillColor.hexDescription)" : "No fill")
+        .popover(isPresented: $showFillColors, arrowEdge: .bottom) {
+            ColorPickerPopover(
+                title: "Background",
+                shadeIndex: Palette.backgroundShadeIndex,
+                topPicks: Palette.backgroundPicks.prefix(5).map { $0 },
+                allowsTransparent: true,
+                selection: state.fillEnabled ? state.fillColor : nil,
+                onPick: { c in
+                    if let c {
+                        state.fillColor = c
+                        state.fillEnabled = true
+                    } else {
+                        state.fillEnabled = false
+                    }
+                }
+            )
+        }
+    }
+
+    /// Stroke width / style, fill style, sloppiness, edges, arrowheads and
+    /// opacity.
+    private var shapePropertiesButton: some View {
+        Button { showShapeProperties.toggle() } label: {
+            HStack(spacing: 5) {
+                StrokeStylePreview(style: state.strokeStyle)
+                Text("Style")
+                    .font(.system(size: 10, weight: .semibold))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 7)
+            .frame(height: 26)
+            .background(
+                showShapeProperties ? Color.white.opacity(0.12) : Color.primary.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Stroke width, style, fill, sloppiness, edges, arrowheads, opacity")
+        .popover(isPresented: $showShapeProperties, arrowEdge: .bottom) {
+            ShapePropertiesPopover(state: state)
+        }
+    }
+
+    /// Font family and size. The label is set in the chosen font, and so is
+    /// every row of the list it opens.
+    private var fontButton: some View {
+        Button { showFonts.toggle() } label: {
+            HStack(spacing: 5) {
+                Text(state.fontFamily)
+                    .font(Fonts.font(for: state.fontFamily, size: 13))
+                    .lineLimit(1)
+                Text("\(Int(state.fontSize))")
+                    .font(.system(size: 9, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 7)
+            .frame(height: 26)
+            .frame(minWidth: 96)
+            .background(
+                showFonts ? Color.white.opacity(0.12) : Color.primary.opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Text font — each name is shown in its own typeface")
+        .popover(isPresented: $showFonts, arrowEdge: .bottom) {
+            FontPickerPopover(state: state, onPick: { showFonts = false })
+        }
     }
 
     /// Always-visible arrow mode selector. This supplements the compact
@@ -584,122 +683,6 @@ struct ToolbarView: View {
         }
     }
 
-    private func arrowheadMenu(title: String, selection: Binding<ArrowheadStyle>) -> some View {
-        Menu {
-            ForEach(ArrowheadStyle.allCases, id: \.self) { style in
-                Button {
-                    selection.wrappedValue = style
-                } label: {
-                    Text(style.label)
-                }
-            }
-        } label: {
-            HStack(spacing: 2) {
-                Image(systemName: selection.wrappedValue.iconName)
-                Text(title)
-                    .font(.system(size: 9, weight: .medium))
-            }
-            .frame(height: 22)
-            .contentShape(Rectangle())
-        }
-        .menuStyle(.borderlessButton)
-        .help("\(title) arrowhead: \(selection.wrappedValue.label)")
-    }
-
-    private var opacityControl: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "circle.lefthalf.filled")
-                .font(.system(size: 11))
-            Slider(value: $state.elementOpacity, in: 0.1...1, step: 0.1)
-                .frame(width: 46)
-        }
-        .help("Element opacity")
-    }
-
-    private var targetPicker: some View {
-        HStack(spacing: 2) {
-            targetButton(.stroke) {
-                Circle().fill(Color(nsColor: state.strokeColor))
-            }
-            targetButton(.fill) {
-                Circle()
-                    .fill(state.fillEnabled ? Color(nsColor: state.fillColor) : Color.clear)
-                    .overlay(Circle().stroke(Color.primary.opacity(0.5), lineWidth: 1.5))
-            }
-        }
-        .padding(2)
-        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private func targetButton(_ target: ColorTarget, @ViewBuilder icon: () -> some View) -> some View {
-        Button {
-            colorTarget = target
-        } label: {
-            icon()
-                .frame(width: 14, height: 14)
-                .frame(width: 24, height: 22)
-                .background(
-                    colorTarget == target ? Color.primary.opacity(0.15) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(target == .stroke ? "Stroke color" : "Fill color")
-    }
-
-    private var quickPicks: some View {
-        HStack(spacing: 4) {
-            if colorTarget == .fill {
-                swatch(nil, size: 20)
-            }
-            ForEach(
-                colorTarget == .stroke
-                    ? Palette.strokePicks
-                    : Palette.backgroundPicks.compactMap { $0 },
-                id: \.self
-            ) { c in
-                swatch(c, size: 20)
-            }
-        }
-    }
-
-    private var fillToggle: some View {
-        Button {
-            state.fillEnabled.toggle()
-        } label: {
-            Image(systemName: state.fillEnabled ? "bucket.fill" : "bucket")
-                .frame(width: 24, height: 22)
-                .background(
-                    state.fillEnabled ? Color.primary.opacity(0.15) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("Fill shapes (toggle on/off)")
-    }
-
-    private var fullPalette: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(Palette.families, id: \.0) { name, shades in
-                    VStack(spacing: 3) {
-                        Text(name)
-                            .font(.system(size: 8))
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 3) {
-                            ForEach(shades, id: \.self) { c in
-                                swatch(c, size: 16)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .frame(height: 32)
-    }
-
     /// Background mode — transparent, white, or black writing surface.
     private var backgroundPicker: some View {
         HStack(spacing: 2) {
@@ -755,51 +738,6 @@ struct ToolbarView: View {
         .help(bg == .clear ? "Transparent background" : "\(bg.displayName) screen")
     }
 
-    private func swatch(_ color: NSColor?, size: CGFloat) -> some View {
-        Button {
-            if let c = color {
-                if colorTarget == .stroke {
-                    state.strokeColor = c
-                } else {
-                    state.fillColor = c
-                    state.fillEnabled = true
-                }
-            } else {
-                state.fillEnabled = false
-            }
-        } label: {
-            ZStack {
-                Rectangle()
-                    .fill(color.map { Color(nsColor: $0) } ?? Color.clear)
-                Rectangle()
-                    .stroke(Color.primary.opacity(0.35), lineWidth: 1)
-                if color == nil {
-                    Image(systemName: "slash")
-                        .font(.system(size: size * 0.55))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .frame(width: size, height: size)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(color == nil ? "No fill" : color?.hexDescription ?? "")
-    }
-
-    private var fontMenu: some View {
-        Menu {
-            ForEach(Fonts.available, id: \.name) { f in
-                Button(f.name) { state.fontFamily = f.name }
-                    .font(Fonts.font(for: f.name, size: 14))
-            }
-        } label: {
-            Text(state.fontFamily)
-                .font(.caption)
-                .frame(minWidth: 80)
-        }
-        .fixedSize()
-        .help("Text font")
-    }
 }
 
 struct ToolButton: View {

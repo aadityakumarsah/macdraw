@@ -513,6 +513,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
             let pad = 32 + a.strokeWidth + rotationPad(for: a)
             return a.rect.insetBy(dx: -pad, dy: -pad)
         }
+        // A connector glued to a box is re-routed from that box's *current*
+        // position every time it's drawn, so its stored rect goes stale the
+        // moment the box moves. Culling against the stale rect made glued
+        // connectors disappear as soon as it scrolled off screen, even though
+        // the line itself was still in view. Cover the boxes it is pinned to
+        // as well.
+        for (i, a) in annotations.enumerated() {
+            guard a.connectionStart != nil || a.connectionEnd != nil else { continue }
+            var bounds = renderBounds[i]
+            for end in [a.connectionStart, a.connectionEnd] {
+                guard let j = connectedIndex(end), annotations.indices.contains(j) else { continue }
+                bounds = bounds.union(annotations[j].rect)
+            }
+            renderBounds[i] = bounds.insetBy(dx: -64, dy: -64)
+        }
         // Elements are appended with an increasing zIndex, so the array is
         // almost always already in draw order — check for that in O(n) and
         // skip the sort entirely.
@@ -557,6 +572,71 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let glow: CGFloat = c.kind == .laser ? 8 : 3
         let pad = max(12, c.strokeWidth * glow)
         return r.insetBy(dx: -pad, dy: -pad)
+    }
+
+    /// Re-anchors every glued connector to where its boxes are now, and
+    /// re-derives its bounding rect from the result.
+    ///
+    /// The rect drives selection, hit-testing and culling, so leaving it at
+    /// wherever the connector was first drawn made a connector that had
+    /// followed its box around impossible to click and liable to be culled.
+    private func refreshConnectorGeometry() {
+        for i in annotations.indices {
+            let a = annotations[i]
+            guard a.connectionStart != nil || a.connectionEnd != nil,
+                  a.points.count >= 2 else { continue }
+            var points = a.points
+            if a.connectionStart != nil {
+                points[0] = connectionPoint(for: a.connectionStart, fallback: points[0])
+            }
+            if a.connectionEnd != nil {
+                points[points.count - 1] = connectionPoint(
+                    for: a.connectionEnd, fallback: points[points.count - 1]
+                )
+            }
+            guard points != a.points || a.rect != boundingRect(of: points) else { continue }
+            annotations[i].points = points
+            annotations[i].rect = boundingRect(of: points)
+        }
+    }
+
+    /// World area the current selection interaction affects: the elements
+    /// being moved / resized / rotated, the marquee, and anything glued to
+    /// them (a connector re-routes when the box it is pinned to moves, and
+    /// can run well outside that box).
+    private func interactionWorldBounds() -> CGRect? {
+        var out: CGRect?
+        func add(_ r: CGRect, pad: CGFloat) {
+            let padded = r.insetBy(dx: -pad, dy: -pad)
+            out = out.map { $0.union(padded) } ?? padded
+        }
+        var touched = Set<String>()
+        for i in movingOriginals.keys where annotations.indices.contains(i) {
+            add(annotations[i].rect, pad: 48 + annotations[i].strokeWidth)
+            touched.insert(annotations[i].id)
+        }
+        if let i = resizeIndex, annotations.indices.contains(i) {
+            add(annotations[i].rect, pad: 48 + annotations[i].strokeWidth)
+            touched.insert(annotations[i].id)
+        }
+        if let i = rotateIndex, annotations.indices.contains(i) {
+            let a = annotations[i]
+            add(a.rect, pad: 48 + rotationPad(for: a) + a.strokeWidth)
+            touched.insert(a.id)
+        }
+        if marqueeRect.width > 0 || marqueeRect.height > 0 {
+            add(marqueeRect, pad: 8)
+        }
+        if !touched.isEmpty {
+            for a in annotations where a.connectionStart != nil || a.connectionEnd != nil {
+                let startID = a.connectionStart?.elementID ?? ""
+                let endID = a.connectionEnd?.elementID ?? ""
+                if touched.contains(startID) || touched.contains(endID) {
+                    add(a.rect, pad: 64 + a.strokeWidth)
+                }
+            }
+        }
+        return out
     }
 
     /// Union of every live laser stroke, in world points.
@@ -673,6 +753,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     private func finishTransformInteraction() {
         defer { interactionUndoSnapshot = nil; interactionChanged = false }
+        if interactionChanged { refreshConnectorGeometry() }
         guard interactionChanged, let snapshot = interactionUndoSnapshot else { return }
         undoStack.append(snapshot)
         if undoStack.count > 50 { undoStack.removeFirst() }
@@ -745,6 +826,25 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }.store(in: &cancellables)
         state.$strokeStyle.dropFirst().sink { [weak self] style in
             self?.applyToSelection(where: { $0.kind != .text && $0.kind != .image && $0.kind != .laser }) { $0.strokeStyle = style }
+        }.store(in: &cancellables)
+        state.$fillStyle.dropFirst().sink { [weak self] style in
+            self?.applyToSelection(where: { self?.isClosed($0.kind) == true }) { $0.fillStyle = style }
+        }.store(in: &cancellables)
+        // Sloppiness drives both the line wobble and how far corners overshoot.
+        state.$sloppiness.dropFirst().sink { [weak self] sloppiness in
+            self?.applyToSelection(where: { $0.kind != .text && $0.kind != .image && $0.kind != .laser }) {
+                $0.sloppiness = sloppiness.roughness
+                $0.edgeRoughness = sloppiness.edgeRoughness
+            }
+        }.store(in: &cancellables)
+        state.$edgeStyle.dropFirst().sink { [weak self] edges in
+            guard let self else { return }
+            let radius = edges == .round ? max(self.state.cornerRadius, 1) : 0
+            let radiusY = edges == .round ? max(self.state.cornerRadiusY, 1) : 0
+            self.applyToSelection(where: { $0.kind == .rect || $0.kind == .frame }) {
+                $0.rx = radius
+                $0.ry = radiusY
+            }
         }.store(in: &cancellables)
         state.$elementOpacity.dropFirst().sink { [weak self] opacity in
             self?.applyToSelection { $0.opacity = opacity }
@@ -1210,6 +1310,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
         case .selection:
             // Adjust for canvas offset in selection tool
             let adjustedP = screenToWorld(p)
+            // What the interaction covered before this move, so the previous
+            // frame's pixels get repainted along with the new ones.
+            let previousBounds = interactionWorldBounds()
             if let ms = marqueeStart {
                 marqueeRect = normalizedRect(from: ms, to: adjustedP)
             } else if let i = rotateIndex {
@@ -1226,10 +1329,20 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 let delta = adjustedP - dragStart
                 for (i, orig) in movingOriginals {
                     annotations[i].rect.origin = orig.rect.origin + delta
-                    annotations[i].points = orig.points.map { $0 + delta }
+                    // Only point-based elements carry points; rewriting an
+                    // empty array is free, so no branch is needed.
+                    if !orig.points.isEmpty {
+                        annotations[i].points = orig.points.map { $0 + delta }
+                    }
                 }
                 interactionChanged = true
             }
+            if let now = interactionWorldBounds() {
+                invalidate(worldRect: previousBounds.map { $0.union(now) } ?? now)
+            } else {
+                needsDisplay = true
+            }
+            return
         case .hand:
             canvasOffset = dragOriginOffset + (p - dragStart)
             syncEditingView()
@@ -2132,6 +2245,70 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     /// Self-test hook: node frames of a data-structure shape at `index`.
+    /// Dev hook (`--sample`): lays out one row per fill style and one per
+    /// sloppiness level so the rendering can be eyeballed in a screenshot.
+    func selftestInsertSampleScene() {
+        annotations.removeAll()
+        let fills: [FillStyle] = [.hachure, .crossHatch, .zigzag, .solid]
+        for (i, fill) in fills.enumerated() {
+            var a = Annotation(
+                kind: .rect,
+                rect: CGRect(x: 160 + CGFloat(i) * 220, y: 260, width: 180, height: 130),
+                strokeColor: Palette.blue[4],
+                fillColor: Palette.blue[1],
+                fillOpacity: 1,
+                strokeWidth: 2,
+                points: [],
+                rounded: false,
+                dashed: false,
+                rotation: 0,
+                createdAt: Date(timeIntervalSince1970: Double(1000 + i)),
+                locked: false,
+                zIndex: nextZIndex(),
+                sloppiness: Sloppiness.artist.roughness,
+                edgeRoughness: Sloppiness.artist.edgeRoughness,
+                rx: 12, ry: 12
+            )
+            a.fillStyle = fill
+            annotations.append(a)
+        }
+        for (i, sloppiness) in Sloppiness.allCases.enumerated() {
+            var a = Annotation(
+                kind: .ellipse,
+                rect: CGRect(x: 160 + CGFloat(i) * 220, y: 470, width: 180, height: 130),
+                strokeColor: Palette.red[4],
+                fillColor: Palette.yellow[1],
+                fillOpacity: 1,
+                strokeWidth: 3,
+                points: [],
+                createdAt: Date(timeIntervalSince1970: Double(2000 + i)),
+                zIndex: nextZIndex(),
+                sloppiness: sloppiness.roughness,
+                edgeRoughness: sloppiness.edgeRoughness
+            )
+            a.fillStyle = .hachure
+            annotations.append(a)
+        }
+        for (i, style) in StrokeStyle.allCases.enumerated() {
+            var a = Annotation(
+                kind: .rect,
+                rect: CGRect(x: 820, y: 470 + CGFloat(i) * 46, width: 320, height: 34),
+                strokeColor: Palette.black,
+                fillColor: nil,
+                strokeWidth: 2,
+                points: [],
+                createdAt: Date(timeIntervalSince1970: Double(3000 + i)),
+                zIndex: nextZIndex(),
+                strokeStyle: style,
+                sloppiness: Sloppiness.architect.roughness
+            )
+            a.fillStyle = .solid
+            annotations.append(a)
+        }
+        selected = []
+        needsDisplay = true
+    }
+
     func selftestNodeRects(_ index: Int) -> [CGRect] {
         guard annotations.indices.contains(index) else { return [] }
         return dataStructureNodes(for: annotations[index])
@@ -2662,21 +2839,30 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
     }
 
+    /// Erases whatever the eraser is actually touching.
+    ///
+    /// This used to delete anything whose *bounding box* (grown by 16pt)
+    /// contained the cursor, so rubbing out a small label inside a big frame
+    /// took the frame with it, and erasing anywhere in the empty middle of a
+    /// rectangle deleted the rectangle. Now it hit-tests the element's real
+    /// outline, with the eraser's radius as tolerance.
     private func erase(at p: CGPoint) {
+        let radius = max(8, state.strokeWidth * 2)
         var toRemove: [Int] = []
-        for (i, a) in annotations.enumerated() where a.kind != .laser {
-            let r = a.rect.insetBy(dx: -16, dy: -16)
-            if r.contains(p) {
-                toRemove.append(i)
-            }
+        for i in annotations.indices where annotations[i].kind != .laser {
+            // Cheap reject first; the precise test builds a path.
+            guard annotations[i].rect.insetBy(dx: -radius - 12, dy: -radius - 12).contains(p) else { continue }
+            if hitTest(p, index: i, tolerance: radius) { toRemove.append(i) }
         }
-        if !toRemove.isEmpty {
-            for i in toRemove.sorted(by: >) {
-                annotations.remove(at: i)
-            }
-            selected = []
-            needsDisplay = true
+        guard !toRemove.isEmpty else { return }
+        var erasedBounds: CGRect?
+        for i in toRemove.sorted(by: >) {
+            let r = annotations[i].rect.insetBy(dx: -annotations[i].strokeWidth, dy: -annotations[i].strokeWidth)
+            erasedBounds = erasedBounds.map { $0.union(r) } ?? r
+            annotations.remove(at: i)
         }
+        selected = []
+        invalidate(worldRect: erasedBounds)
     }
 
     private func finishLasso() {
@@ -2702,10 +2888,18 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     // MARK: - undo
 
+    /// Snapshots the scene for undo.
+    ///
+    /// Depth is bounded by *content*, not just by step count: 50 snapshots of
+    /// a 100k-element drawing is gigabytes of history for a feature nobody
+    /// scrolls back that far in. Swift arrays are copy-on-write, so a
+    /// snapshot costs nothing until the next edit touches an element.
     private func pushUndo() {
         undoStack.append(annotations)
-        if undoStack.count > 50 {
-            undoStack.removeFirst()
+        while undoStack.count > 50 { undoStack.removeFirst() }
+        var retained = undoStack.reduce(0) { $0 + $1.count }
+        while undoStack.count > 1, retained > 400_000 {
+            retained -= undoStack.removeFirst().count
         }
     }
 
@@ -2886,6 +3080,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         annotations = pages.currentAnnotations().map { .restored(from: $0) }
         selected = []
         undoStack = []
+        refreshConnectorGeometry()
         lastSavedHash = persistHash()
         hasLaserStrokes = false
         invalidateElementCaches()
@@ -3715,20 +3910,31 @@ final class CanvasView: NSView, NSTextViewDelegate {
         default:
             let path = cachedPath(for: a, index: index)
             if let fill = a.fillColor, shouldFill(a), a.kind != .set {
-                // Apply fill opacity
-                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a_comp: CGFloat = 1
-                fill.getRed(&r, green: &g, blue: &b, alpha: &a_comp)
-                let colorWithOpacity = NSColor(calibratedRed: r, green: g, blue: b, alpha: a_comp * a.fillOpacity)
-                colorWithOpacity.setFill()
+                // `getRed` raises on a color that isn't in an RGB space (a
+                // catalog or pattern color), which took the whole app down
+                // with it — convert first, and fall back to the color as-is.
+                let rgb = fill.usingColorSpace(.sRGB) ?? fill
+                let colorWithOpacity = rgb.withAlphaComponent(
+                    rgb.alphaComponent * max(0, min(1, a.fillOpacity))
+                )
+                let target: NSBezierPath
                 if a.kind == .freedraw {
                     // Freehand loops close explicitly so the seam of the
                     // start/end gap never shows in the filled area.
                     let closedPath = path.copy() as! NSBezierPath
                     closedPath.close()
-                    closedPath.fill()
+                    target = closedPath
                 } else {
-                    path.fill()
+                    target = path
                 }
+                fillShape(
+                    target,
+                    color: colorWithOpacity,
+                    style: a.fillStyle,
+                    strokeWidth: a.strokeWidth,
+                    roughness: a.sloppiness,
+                    seed: roughSeed(for: a)
+                )
             }
             a.strokeColor.setStroke()
             path.lineWidth = a.strokeWidth
@@ -3742,7 +3948,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 case .solid:
                     path.stroke()
                 case .dashed:
-                    path.setLineDash([12, 8], count: 2, phase: 0)
+                    // getDashArrayDashed() in packages/element/src/shape.ts
+                    path.setLineDash([8, 8 + a.strokeWidth], count: 2, phase: 0)
                     path.stroke()
                 case .dotted:
                     strokeDotted(path: path, color: a.strokeColor, width: a.strokeWidth)
@@ -4746,6 +4953,139 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
     }
 
+    // MARK: - fills
+
+    /// Paints the inside of a shape in one of Excalidraw's fill styles.
+    ///
+    /// Hachure and cross-hatch are drawn the way a pen would: parallel
+    /// strokes clipped to the shape, at Rough.js' default -41° with a gap of
+    /// `strokeWidth * 4` and a pen weight of `strokeWidth / 2` (the same
+    /// numbers `generateRoughOptions` passes in
+    /// packages/element/src/shape.ts). Clipping to the path rather than
+    /// intersecting it analytically means the hatch follows curved and
+    /// hand-drawn outlines exactly.
+    private func fillShape(
+        _ path: NSBezierPath,
+        color: NSColor,
+        style: FillStyle,
+        strokeWidth: CGFloat,
+        roughness: CGFloat,
+        seed: UInt64
+    ) {
+        color.setFill()
+        guard style != .solid else {
+            path.fill()
+            return
+        }
+        let bounds = path.bounds
+        guard bounds.width > 0.5, bounds.height > 0.5 else {
+            path.fill()
+            return
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        path.addClip()
+
+        let gap = max(2.5, strokeWidth * 4)
+        let weight = max(0.6, strokeWidth / 2)
+        color.setStroke()
+
+        switch style {
+        case .solid:
+            break
+        case .hachure:
+            strokeHatch(in: bounds, angle: -41, gap: gap, weight: weight, roughness: roughness, seed: seed)
+        case .crossHatch:
+            strokeHatch(in: bounds, angle: -41, gap: gap, weight: weight, roughness: roughness, seed: seed)
+            strokeHatch(in: bounds, angle: 49, gap: gap, weight: weight, roughness: roughness, seed: seed &+ 7919)
+        case .zigzag:
+            strokeZigzag(in: bounds, angle: -41, gap: gap, weight: weight, roughness: roughness, seed: seed)
+        }
+    }
+
+    /// Parallel pen strokes across `bounds` at `angle` degrees.
+    private func strokeHatch(
+        in bounds: CGRect, angle: CGFloat, gap: CGFloat,
+        weight: CGFloat, roughness: CGFloat, seed: UInt64
+    ) {
+        let lines = hatchLines(in: bounds, angle: angle, gap: gap, roughness: roughness, seed: seed)
+        guard !lines.isEmpty else { return }
+        let path = NSBezierPath()
+        for (from, to) in lines {
+            path.move(to: from)
+            path.line(to: to)
+        }
+        path.lineWidth = weight
+        path.lineCapStyle = .round
+        path.stroke()
+    }
+
+    /// One continuous stroke that walks up and down the hatch lines.
+    private func strokeZigzag(
+        in bounds: CGRect, angle: CGFloat, gap: CGFloat,
+        weight: CGFloat, roughness: CGFloat, seed: UInt64
+    ) {
+        let lines = hatchLines(in: bounds, angle: angle, gap: gap * 1.2, roughness: roughness, seed: seed)
+        guard let first = lines.first else { return }
+        let path = NSBezierPath()
+        path.move(to: first.0)
+        for (i, line) in lines.enumerated() {
+            if i.isMultiple(of: 2) {
+                path.line(to: line.0)
+                path.line(to: line.1)
+            } else {
+                path.line(to: line.1)
+                path.line(to: line.0)
+            }
+        }
+        path.lineWidth = weight
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        path.stroke()
+    }
+
+    /// Endpoints of the parallel lines that cover `bounds` at `angle`.
+    /// Generated in a rotated frame and mapped back, so any angle works; the
+    /// span is the bounding circle's diameter so no corner is ever missed.
+    private func hatchLines(
+        in bounds: CGRect, angle: CGFloat, gap: CGFloat,
+        roughness: CGFloat, seed: UInt64
+    ) -> [(CGPoint, CGPoint)] {
+        let radians = angle * .pi / 180
+        let cosA = cos(radians), sinA = sin(radians)
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let span = sqrt(bounds.width * bounds.width + bounds.height * bounds.height) / 2 + gap
+        // Cap the line count: a hairline gap over a huge shape would
+        // otherwise generate tens of thousands of segments per frame.
+        let steps = min(Int((span * 2 / gap).rounded(.up)), 2000)
+        guard steps > 0 else { return [] }
+
+        var rng = SeededRandom(seed: seed)
+        let jitter = min(roughness, 2) * min(gap * 0.35, 2.5)
+        var out: [(CGPoint, CGPoint)] = []
+        out.reserveCapacity(steps + 1)
+        for i in 0...steps {
+            let offset = -span + CGFloat(i) * gap
+            let wobbleA = jitter > 0 ? (rng.next() - 0.5) * jitter : 0
+            let wobbleB = jitter > 0 ? (rng.next() - 0.5) * jitter : 0
+            // Line through (offset) perpendicular to the hatch direction,
+            // extended to +/- span along it.
+            let nx = -sinA, ny = cosA
+            let base = CGPoint(x: center.x + nx * offset, y: center.y + ny * offset)
+            let from = CGPoint(
+                x: base.x - cosA * span + nx * wobbleA,
+                y: base.y - sinA * span + ny * wobbleA
+            )
+            let to = CGPoint(
+                x: base.x + cosA * span + nx * wobbleB,
+                y: base.y + sinA * span + ny * wobbleB
+            )
+            out.append((from, to))
+        }
+        return out
+    }
+
     private func bezierPath(for a: Annotation) -> NSBezierPath {
         let r = a.rect
         let slop = a.sloppiness
@@ -5364,10 +5704,24 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     // MARK: - rough (hand-drawn) path generators
 
+    /// How far a hand-drawn line strays from its ideal path.
+    ///
+    /// Rough.js uses a *fixed* `maxRandomnessOffset` (2pt) scaled by
+    /// roughness, with a small gain on long spans — not an offset
+    /// proportional to the shape, which is what this used to do. At
+    /// `0.14 * min(width, height)` a 180x130 box wobbled by ±18pt, so every
+    /// rectangle above thumbnail size came out as a scribble instead of the
+    /// slightly-wavy line Excalidraw draws.
+    private func roughOffset(_ slop: CGFloat, span: CGFloat) -> CGFloat {
+        guard slop > 0 else { return 0 }
+        let gain = span > 200 ? 1.0 + min((span - 200) / 600, 0.6) : 1.0
+        return min(slop, 2) * 2 * gain
+    }
+
     private func roughRect(_ r: CGRect, slop: CGFloat, edge: CGFloat, seed: UInt64) -> NSBezierPath {
         var rnd = SeededRandom(seed: seed)
-        let jit = slop * max(3, min(r.width, r.height) * 0.14)
-        let over = edge * 5 + 1
+        let jit = roughOffset(slop, span: max(r.width, r.height))
+        let over = edge * 5
         let corners = [
             CGPoint(x: r.minX, y: r.minY),
             CGPoint(x: r.maxX, y: r.minY),
@@ -5411,7 +5765,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return roughRect(r, slop: slop, edge: edge, seed: seed)
         }
         var rnd = SeededRandom(seed: seed)
-        let jit = slop * max(3, min(r.width, r.height) * 0.14)
+        let jit = roughOffset(slop, span: max(r.width, r.height))
         let x0 = r.minX, x1 = r.maxX, y0 = r.minY, y1 = r.maxY
         // 8 anchor points tracing the rounded-rect outline clockwise.
         let pts = [
@@ -5469,34 +5823,66 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return path
     }
 
+    /// A hand-drawn ellipse.
+    ///
+    /// Built by jittering points sampled around the true ellipse and running
+    /// a closed Catmull-Rom spline through them, the way Rough.js does. The
+    /// previous version joined `left → right` with a single quadratic curve
+    /// per half, which cannot hold a vertical tangent at the endpoints — so
+    /// every rough ellipse came out as a pointed lens rather than an oval.
     private func roughEllipse(_ r: CGRect, slop: CGFloat, edge: CGFloat, seed: UInt64) -> NSBezierPath {
         var rnd = SeededRandom(seed: seed)
-        let jit = slop * max(3, min(r.width, r.height) * 0.12)
-        let left = CGPoint(x: r.minX, y: r.midY)
-        let right = CGPoint(x: r.maxX, y: r.midY)
-        let top = CGPoint(x: r.midX, y: r.minY)
-        let bottom = CGPoint(x: r.midX, y: r.maxY)
+        let jit = roughOffset(slop, span: max(r.width, r.height))
+        let rx = r.width / 2, ry = r.height / 2
+        let center = CGPoint(x: r.midX, y: r.midY)
+        guard rx > 0.5, ry > 0.5 else { return NSBezierPath(ovalIn: r) }
+
+        // Enough samples that the spline reads as a smooth curve at any size.
+        let steps = max(12, min(48, Int((rx + ry) / 6)))
+        var pts: [CGPoint] = []
+        pts.reserveCapacity(steps)
+        for i in 0..<steps {
+            let t = CGFloat(i) / CGFloat(steps) * 2 * .pi
+            let jx = jit > 0 ? (rnd.next() * 2 - 1) * jit : 0
+            let jy = jit > 0 ? (rnd.next() * 2 - 1) * jit : 0
+            pts.append(CGPoint(
+                x: center.x + cos(t) * rx + jx,
+                y: center.y + sin(t) * ry + jy
+            ))
+        }
+        return closedSpline(through: pts)
+    }
+
+    /// A closed Catmull-Rom spline through `pts`, emitted as cubic Béziers.
+    private func closedSpline(through pts: [CGPoint]) -> NSBezierPath {
         let path = NSBezierPath()
-        path.move(to: left)
-        // Top arc (left → right via top), bottom arc (right → left via bottom).
-        let ctrlTop = CGPoint(
-            x: top.x + (rnd.next() * 2 - 1) * jit,
-            y: top.y + (rnd.next() * 2 - 1) * jit
-        )
-        path.quadCurve(to: right, controlPoint: ctrlTop)
-        let ctrlBottom = CGPoint(
-            x: bottom.x + (rnd.next() * 2 - 1) * jit,
-            y: bottom.y + (rnd.next() * 2 - 1) * jit
-        )
-        path.quadCurve(to: left, controlPoint: ctrlBottom)
+        guard pts.count > 2 else {
+            guard let first = pts.first else { return path }
+            path.move(to: first)
+            for p in pts.dropFirst() { path.line(to: p) }
+            path.close()
+            return path
+        }
+        let n = pts.count
+        path.move(to: pts[0])
+        for i in 0..<n {
+            let p0 = pts[(i - 1 + n) % n]
+            let p1 = pts[i]
+            let p2 = pts[(i + 1) % n]
+            let p3 = pts[(i + 2) % n]
+            // Catmull-Rom to Bézier control points (tension 1/6).
+            let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6)
+            let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6)
+            path.curve(to: p2, controlPoint1: c1, controlPoint2: c2)
+        }
         path.close()
         return path
     }
 
     private func roughDiamond(_ r: CGRect, slop: CGFloat, edge: CGFloat, seed: UInt64) -> NSBezierPath {
         var rnd = SeededRandom(seed: seed)
-        let jit = slop * max(3, min(r.width, r.height) * 0.14)
-        let over = edge * 5 + 1
+        let jit = roughOffset(slop, span: max(r.width, r.height))
+        let over = edge * 5
         let corners = [
             CGPoint(x: r.midX, y: r.maxY),
             CGPoint(x: r.maxX, y: r.midY),
@@ -5540,7 +5926,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let over = edge * 6 * (0.5 + rnd.next())
         let start = CGPoint(x: p0.x - ux * over, y: p0.y - uy * over)
         let end = CGPoint(x: p1.x + ux * over, y: p1.y + uy * over)
-        let jit = slop * max(2, len * 0.12)
+        let jit = roughOffset(slop, span: len)
         let mid = CGPoint(
             x: (start.x + end.x) / 2 - uy * (rnd.next() * 2 - 1) * jit,
             y: (start.y + end.y) / 2 + ux * (rnd.next() * 2 - 1) * jit
@@ -5561,8 +5947,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private func strokeDotted(path: NSBezierPath, color: NSColor, width: CGFloat) {
         let pts = flattenedPoints(path, step: max(1, width * 1.2))
         guard !pts.isEmpty else { return }
-        let spacing = max(3, width * 2.4)
-        let dotR = max(1.5, width * 0.55)
+        // Matches getDashArrayDotted() in packages/element/src/shape.ts:
+        // a 1.5pt dot every (6 + strokeWidth) points.
+        let spacing = max(3, 7.5 + width)
+        let dotR = max(0.9, width * 0.5)
         color.setFill()
         var last: CGPoint?
         for p in pts {
@@ -6059,32 +6447,53 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     private func hitIndex(_ p: CGPoint) -> Int? {
-        for (i, a) in annotations.enumerated().reversed() {
-            if a.kind == .laser { continue }
-            let localP = rotatedPoint(p, around: CGPoint(x: a.rect.midX, y: a.rect.midY), by: -a.rotation)
-            switch a.kind {
-            case .text, .image:
-                if a.rect.insetBy(dx: -8, dy: -8).contains(localP) { return i }
-            case .freedraw:
-                // Closed freehand loops are clickable inside the loop (bucket
-                // fill, selection), not just on the stroke.
-                if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points) { return i }
-                fallthrough
-            default:
-                let path = cachedPath(for: a, index: i)
-                if path.contains(localP) { return i }
-                let threshold = max(10, a.strokeWidth / 2 + 6)
-                if distanceToPath(localP, path) < threshold { return i }
-            }
+        rebuildDerivedOrderIfNeeded()
+        // Topmost first — in *draw* order, not array order. Using the array
+        // backwards meant that after Bring to Front / Send to Back a click in
+        // an overlap still picked whatever happened to be stored last.
+        for i in zOrder.reversed() where annotations[i].kind != .laser {
+            if hitTest(p, index: i, tolerance: 0) { return i }
         }
         return nil
+    }
+
+    /// Whether `p` touches the element at `index`.
+    ///
+    /// `tolerance` widens the catch area beyond the element's own stroke —
+    /// the eraser passes its radius so sweeping near a line erases it.
+    private func hitTest(_ p: CGPoint, index i: Int, tolerance: CGFloat) -> Bool {
+        guard annotations.indices.contains(i) else { return false }
+        let a = annotations[i]
+        let localP = rotatedPoint(p, around: CGPoint(x: a.rect.midX, y: a.rect.midY), by: -a.rotation)
+        switch a.kind {
+        case .text, .image:
+            return a.rect.insetBy(dx: -8 - tolerance, dy: -8 - tolerance).contains(localP)
+        case .freedraw:
+            // Closed freehand loops are clickable inside the loop (bucket
+            // fill, selection), not just on the stroke.
+            if a.points.count > 2, isClosedShape(a.points), pointInPolygon(localP, a.points) { return true }
+            return touchesOutline(localP, index: i, annotation: a, tolerance: tolerance)
+        default:
+            return touchesOutline(localP, index: i, annotation: a, tolerance: tolerance)
+        }
+    }
+
+    private func touchesOutline(
+        _ localP: CGPoint, index i: Int, annotation a: Annotation, tolerance: CGFloat
+    ) -> Bool {
+        let path = cachedPath(for: a, index: i)
+        if path.contains(localP) { return true }
+        let threshold = max(10, a.strokeWidth / 2 + 6) + tolerance
+        return distanceToPath(localP, path) < threshold
     }
 
     /// Hit test used by the Fill (bucket) tool: only fillable shapes count, so
     /// an overlapping text label, image, or line never swallows the click meant
     /// for the box underneath it.
     private func bucketHitIndex(_ p: CGPoint) -> Int? {
-        for (i, a) in annotations.enumerated().reversed() {
+        rebuildDerivedOrderIfNeeded()
+        for i in zOrder.reversed() {
+            let a = annotations[i]
             if a.kind == .laser { continue }
             if !isClosed(a.kind), a.kind != .freedraw { continue }
             let localP = rotatedPoint(p, around: CGPoint(x: a.rect.midX, y: a.rect.midY), by: -a.rotation)

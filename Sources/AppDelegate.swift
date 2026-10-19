@@ -70,6 +70,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
 
+        // Dev aid: open the overlay straight away instead of waiting for the
+        // Control+Option hotkey (which can't be synthesized without
+        // Accessibility trust). Used to screenshot and check the UI.
+        if CommandLine.arguments.contains("--show") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.island.toggle()
+                if CommandLine.arguments.contains("--sample") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                        self?.activeCanvas?.selftestInsertSampleScene()
+                    }
+                }
+            }
+        }
+
         // Check for updates shortly after launch so users always know
         // whether they're running the latest build.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in

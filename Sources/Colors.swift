@@ -71,4 +71,76 @@ enum Palette {
         yellow[1], yellow[3], violet[1], teal[1], orange[1],
     ]
     static let canvasPicks = [white, NSColor(hexString: "#f8f9fa"), NSColor(hexString: "#f5faff"), NSColor(hexString: "#fffce8"), NSColor(hexString: "#fdf8f6")]
+
+    // MARK: - picker grid
+
+    /// One entry of the picker grid: a named color with its five shades.
+    /// `shades` is empty for the single-value entries (transparent / white /
+    /// black), which have no shade row.
+    struct Entry {
+        let name: String
+        let shades: [NSColor]
+        /// nil = transparent (no fill / no stroke).
+        let single: NSColor?
+
+        init(_ name: String, _ shades: [NSColor]) {
+            self.name = name
+            self.shades = shades
+            self.single = nil
+        }
+
+        init(single name: String, _ color: NSColor?) {
+            self.name = name
+            self.shades = []
+            self.single = color
+        }
+
+        /// The swatch shown in the grid: `index` of the shade ramp, or the
+        /// single value.
+        func swatch(at index: Int) -> NSColor? {
+            if shades.isEmpty { return single }
+            return shades[min(max(index, 0), shades.count - 1)]
+        }
+    }
+
+    /// Excalidraw's 5x3 element palette, in its exact order
+    /// (DEFAULT_ELEMENT_STROKE_COLOR_PALETTE in packages/common/src/colors.ts).
+    static let pickerGrid: [Entry] = [
+        // 1st row
+        Entry(single: "transparent", nil),
+        Entry(single: "white", white),
+        Entry("gray", gray),
+        Entry(single: "black", black),
+        Entry("bronze", bronze),
+        // 2nd row
+        Entry("cyan", cyan),
+        Entry("blue", blue),
+        Entry("violet", violet),
+        Entry("grape", grape),
+        Entry("pink", pink),
+        // 3rd row
+        Entry("green", green),
+        Entry("teal", teal),
+        Entry("yellow", yellow),
+        Entry("orange", orange),
+        Entry("red", red),
+    ]
+
+    /// Default shade for strokes (DEFAULT_ELEMENT_STROKE_COLOR_INDEX) and for
+    /// backgrounds (DEFAULT_ELEMENT_BACKGROUND_COLOR_INDEX).
+    static let strokeShadeIndex = 4
+    static let backgroundShadeIndex = 1
+
+    /// The grid entry a color belongs to, and which of its shades it is.
+    static func locate(_ color: NSColor?) -> (entry: Int, shade: Int)? {
+        guard let color else { return (0, 0) }
+        let hex = color.hexDescription
+        for (i, entry) in pickerGrid.enumerated() {
+            if let single = entry.single, single.hexDescription == hex { return (i, 0) }
+            for (j, shade) in entry.shades.enumerated() where shade.hexDescription == hex {
+                return (i, j)
+            }
+        }
+        return nil
+    }
 }
