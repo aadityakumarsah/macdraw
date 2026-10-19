@@ -198,12 +198,33 @@ final class AISettings: ObservableObject {
     @Published var provider: AIProvider { didSet { saveNonSecret(); loadAPIKeyForCurrentProvider() } }
     @Published var endpoint: String { didSet { saveNonSecret(); invalidateTest() } }
     @Published var model: String { didSet { saveNonSecret(); invalidateTest() } }
-    @Published var apiKey: String { didSet { KeychainStore.set(apiKey, account: Self.keychainAccount(for: provider)); invalidateTest() } }
+    @Published var apiKey: String {
+        didSet {
+            if !ephemeral { KeychainStore.set(apiKey, account: Self.keychainAccount(for: provider)) }
+            invalidateTest()
+        }
+    }
     @Published var testStatus = "Not tested"
+
+    /// When true nothing is written to the Keychain or UserDefaults. Used by
+    /// `--aitest`, so running a live provider check never leaves a test key
+    /// or a changed provider behind in the real settings.
+    private let ephemeral: Bool
 
     static func keychainAccount(for provider: AIProvider) -> String { "ai.apiKey." + provider.rawValue }
 
+    /// In-memory settings for a one-off live check: nothing is read from or
+    /// written to the user's stored configuration.
+    init(ephemeralProvider: AIProvider, key: String) {
+        ephemeral = true
+        provider = ephemeralProvider
+        endpoint = ephemeralProvider.defaultEndpoint
+        model = ephemeralProvider.defaultModel
+        apiKey = key
+    }
+
     init() {
+        ephemeral = false
         let d = UserDefaults.standard
         let savedProvider = AIProvider(rawValue: d.string(forKey: "ai.provider") ?? "") ?? .local
         provider = savedProvider
@@ -244,11 +265,13 @@ final class AISettings: ObservableObject {
         return detected
     }
     private func loadAPIKeyForCurrentProvider() {
+        guard !ephemeral else { return }
         let key = KeychainStore.get(account: Self.keychainAccount(for: provider)) ?? ""
         if apiKey != key { apiKey = key }
     }
     private func invalidateTest() { if testStatus != "Not tested" { testStatus = "Not tested" } }
     private func saveNonSecret() {
+        guard !ephemeral else { return }
         let d = UserDefaults.standard
         d.set(provider.rawValue, forKey: "ai.provider")
         d.set(endpoint, forKey: "ai.endpoint")
@@ -267,15 +290,18 @@ final class AIModelCatalog: ObservableObject {
     @Published private(set) var error: String?
 
     /// Per-provider cache, so switching back and forth doesn't refetch.
-    private var cache: [AIProvider: [String]] = [:]
+    private var cache: [AIProvider: [ModelOption]] = [:]
 
-    func models(for provider: AIProvider) -> [String] { cache[provider] ?? [] }
+    func models(for provider: AIProvider) -> [String] { (cache[provider] ?? []).map(\.id) }
+
+    func options(for provider: AIProvider) -> [ModelOption] { cache[provider] ?? [] }
 
     func load(settings: AISettings, force: Bool = false) async {
         let provider = settings.provider
         if !force, let hit = cache[provider], !hit.isEmpty {
-            models = hit
+            models = hit.map(\.id)
             error = nil
+            selectModelIfNeeded(settings: settings, options: hit)
             return
         }
         loading = true
@@ -285,13 +311,30 @@ final class AIModelCatalog: ObservableObject {
             let list = try await Self.fetch(settings: settings)
             guard settings.provider == provider else { return }  // user switched mid-flight
             cache[provider] = list
-            models = list
+            models = list.map(\.id)
             if list.isEmpty { error = "The provider returned no models." }
+            selectModelIfNeeded(settings: settings, options: list)
         } catch {
             guard settings.provider == provider else { return }
             models = []
             self.error = error.localizedDescription
         }
+    }
+
+    /// Picks a model when the saved one is empty, or belongs to a different
+    /// provider.
+    ///
+    /// Without this, switching provider — including automatically, from a
+    /// pasted key — left the model either blank or set to the previous
+    /// provider's id. `Test connection` still passed, because it only lists
+    /// models, and then every generation failed with the provider's own
+    /// `model_not_found` 404.
+    private func selectModelIfNeeded(settings: AISettings, options: [ModelOption]) {
+        guard !options.isEmpty else { return }
+        let current = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty, options.contains(where: { $0.id == current }) { return }
+        guard let preferred = Self.preferredModel(from: options) else { return }
+        settings.model = preferred
     }
 
     /// Clears the list when the provider changes, so a stale list is never
@@ -301,7 +344,7 @@ final class AIModelCatalog: ObservableObject {
         error = nil
     }
 
-    static func fetch(settings: AISettings) async throws -> [String] {
+    static func fetch(settings: AISettings) async throws -> [ModelOption] {
         let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !endpoint.isEmpty else {
             throw NSError(domain: "MacdrawAI", code: 30, userInfo: [NSLocalizedDescriptionKey: "Set the endpoint first."])
@@ -319,11 +362,12 @@ final class AIModelCatalog: ObservableObject {
             let native = endpoint.replacingOccurrences(of: "/v1", with: "")
             return (try? await request(url: native + "/api/tags", settings: settings)) ?? []
         }
+
         let path = settings.provider == .anthropic ? "/models?limit=200" : "/models"
         return try await request(url: endpoint + path, settings: settings)
     }
 
-    private static func request(url urlString: String, settings: AISettings) async throws -> [String] {
+    private static func request(url urlString: String, settings: AISettings) async throws -> [ModelOption] {
         guard let url = URL(string: urlString) else {
             throw NSError(domain: "MacdrawAI", code: 32, userInfo: [NSLocalizedDescriptionKey: "The endpoint URL is invalid."])
         }
@@ -351,7 +395,36 @@ final class AIModelCatalog: ObservableObject {
             throw NSError(domain: "MacdrawAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey:
                 "Provider returned \(http.statusCode): \(text.prefix(180))"])
         }
-        return parse(data, provider: settings.provider)
+        return parseOptions(data, provider: settings.provider)
+    }
+
+    /// One entry from a provider's model list, with the metadata needed to
+    /// tell a chat model from a transcription or text-to-speech one and to
+    /// rank the plausible defaults.
+    struct ModelOption {
+        let id: String
+        /// Whether the model can return chat text at all.
+        let isChat: Bool
+        /// `max_completion_tokens` where the provider reports it. A 512-token
+        /// classifier should never be auto-picked over a real chat model.
+        let maxOutput: Int?
+    }
+
+    /// The model to use when the saved one is empty or gone: the chat model
+    /// with the most output headroom, falling back to list order (Anthropic
+    /// and OpenRouter return newest-first) when the provider reports no
+    /// metadata.
+    static func preferredModel(from options: [ModelOption]) -> String? {
+        let chat = options.filter(\.isChat)
+        guard !chat.isEmpty else { return options.first?.id }
+        // Drop anything that physically cannot hold a diagram: Groq lists
+        // 512-token prompt-guard classifiers as text-to-text models.
+        let roomy = chat.filter { ($0.maxOutput ?? Int.max) >= 2048 }
+        // Then take the provider's own first choice. List order is meaningful
+        // — Anthropic and OpenRouter return newest-first — and picking by
+        // "largest output ceiling" instead would both be arbitrary between
+        // ties and silently opt the user into the priciest model.
+        return (roomy.first ?? chat.first)?.id
     }
 
     /// Normalizes every known list shape:
@@ -359,9 +432,13 @@ final class AIModelCatalog: ObservableObject {
     ///   Gemini                                  ->  { "models": [ { "name": "models/…" } ] }
     ///   Ollama (native)                         ->  { "models": [ { "name": … } ] }
     static func parse(_ data: Data, provider: AIProvider) -> [String] {
+        parseOptions(data, provider: provider).map(\.id)
+    }
+
+    static func parseOptions(_ data: Data, provider: AIProvider) -> [ModelOption] {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [] }
         let rows = (root["data"] as? [[String: Any]]) ?? (root["models"] as? [[String: Any]]) ?? []
-        var out: [String] = []
+        var out: [ModelOption] = []
         var seen = Set<String>()
         for row in rows {
             guard var id = (row["id"] ?? row["name"] ?? row["model"]) as? String else { continue }
@@ -376,11 +453,24 @@ final class AIModelCatalog: ObservableObject {
             let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
             seen.insert(trimmed)
-            out.append(trimmed)
+
+            // Groq (and other OpenAI-compatible hosts) list speech and
+            // transcription models alongside chat ones. `output_modalities`
+            // separates them: a chat model emits text, Whisper emits
+            // "transcription" and Orpheus emits "speech". Offering those in a
+            // text-to-diagram picker is how you end up sending a prompt to a
+            // speech synthesiser.
+            let outputs = (row["output_modalities"] as? [String]) ?? []
+            let isChat = outputs.isEmpty || outputs.contains("text")
+            let maxOutput = (row["max_completion_tokens"] as? Int)
+                ?? (row["max_output_length"] as? Int)
+
+            out.append(ModelOption(id: trimmed, isChat: isChat, maxOutput: maxOutput))
         }
         // Anthropic and OpenRouter already return newest-first, which is the
         // order a user wants to pick from; local tags come back arbitrary.
-        return provider == .local ? out.sorted() : out
+        let chatFirst = out.filter(\.isChat) + out.filter { !$0.isChat }
+        return provider == .local ? chatFirst.sorted { $0.id < $1.id } : chatFirst
     }
 }
 
@@ -732,7 +822,24 @@ enum KeychainStore {
             // which costs tokens — and with adaptive thinking on, a small
             // allowance can be spent entirely on reasoning and come back with
             // no text, reporting a working key as broken.
-            return await healthCheck(settings: settings)
+            let status = await healthCheck(settings: settings)
+            guard status.hasPrefix("Connected") else { return status }
+            // A valid key with a model the provider doesn't serve used to
+            // report "Connected" and then 404 on the first generation. The
+            // listing is already in hand, so check the model against it.
+            let wanted = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !wanted.isEmpty else { return "Connected, but no model is selected." }
+            if settings.provider == .gemini { return status }
+            guard let options = try? await AIModelCatalog.fetch(settings: settings), !options.isEmpty else {
+                return status
+            }
+            guard let match = options.first(where: { $0.id == wanted }) else {
+                return "Connected, but \(wanted) is not available on this key."
+            }
+            if !match.isChat {
+                return "Connected, but \(wanted) does not return text — pick a chat model."
+            }
+            return status
         } catch { return error.localizedDescription }
     }
 
@@ -855,6 +962,15 @@ enum KeychainStore {
         guard let http = response as? HTTPURLResponse else { throw NSError(domain: "MacdrawAI", code: 5, userInfo: [NSLocalizedDescriptionKey: "No response from provider."]) }
         guard (200..<300).contains(http.statusCode) else {
             let text = String(data: data, encoding: .utf8) ?? "Unknown error"
+            // 404 from a chat endpoint almost always means the model id, not
+            // a bad URL — say so, because "404" on its own sends people
+            // looking at their endpoint.
+            if http.statusCode == 404 {
+                let model = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
+                let named = model.isEmpty ? "No model is selected" : "\(model) is not available on this key"
+                throw NSError(domain: "MacdrawAI", code: 404, userInfo: [NSLocalizedDescriptionKey:
+                    "\(named). Open Settings and pick one from the Model dropdown."])
+            }
             throw NSError(domain: "MacdrawAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Provider returned \(http.statusCode): \(text.prefix(240))"])
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]

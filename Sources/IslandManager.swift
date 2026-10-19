@@ -1823,6 +1823,55 @@ private func toggleSidebar() {
                         }
                         log("model catalog test: PASS")
 
+                        log("model selection test: non-chat models are never auto-picked")
+                        // Shaped like a real Groq listing: chat models, a
+                        // 512-token classifier, a speech model and a
+                        // transcription model.
+                        let mixedList = Data("""
+                        {"data":[
+                          {"id":"chat-big","output_modalities":["text"],"max_completion_tokens":65536},
+                          {"id":"chat-small","output_modalities":["text"],"max_completion_tokens":65536},
+                          {"id":"guard-tiny","output_modalities":["text"],"max_completion_tokens":512},
+                          {"id":"speech-model","output_modalities":["speech"],"max_completion_tokens":50000},
+                          {"id":"transcribe-model","output_modalities":["transcription"],"max_completion_tokens":448}
+                        ]}
+                        """.utf8)
+                        let options = AIModelCatalog.parseOptions(mixedList, provider: .groq)
+                        let chatIDs = options.filter(\.isChat).map(\.id)
+                        log("chat-capable: \(chatIDs)")
+                        if chatIDs != ["chat-big", "chat-small", "guard-tiny"] {
+                            log("FAIL: speech and transcription models must not count as chat models")
+                            exit(1)
+                        }
+                        let picked = AIModelCatalog.preferredModel(from: options)
+                        log("auto-selected: \(picked ?? "nothing")")
+                        if picked != "chat-big" {
+                            log("FAIL: should pick the provider's first roomy chat model, got \(picked ?? "nothing")")
+                            exit(1)
+                        }
+                        // A listing of only tiny classifiers still has to
+                        // yield something rather than leaving the model empty,
+                        // which is what produced the 404.
+                        let tinyOnly = AIModelCatalog.parseOptions(
+                            Data(#"{"data":[{"id":"guard-tiny","output_modalities":["text"],"max_completion_tokens":512}]}"#.utf8),
+                            provider: .groq)
+                        if AIModelCatalog.preferredModel(from: tinyOnly) != "guard-tiny" {
+                            log("FAIL: a model must still be selected when every option is small")
+                            exit(1)
+                        }
+                        if AIModelCatalog.preferredModel(from: []) != nil {
+                            log("FAIL: an empty listing should select nothing")
+                            exit(1)
+                        }
+                        // Providers that report no modality metadata (OpenAI,
+                        // Anthropic, OpenRouter) keep list order.
+                        let plainList = Data(#"{"data":[{"id":"first"},{"id":"second"}]}"#.utf8)
+                        if AIModelCatalog.preferredModel(from: AIModelCatalog.parseOptions(plainList, provider: .openAI)) != "first" {
+                            log("FAIL: without metadata the provider's first model wins")
+                            exit(1)
+                        }
+                        log("model selection test: PASS")
+
                         log("provider wiring test: each provider routes to the right wire format and auth")
                         if AIProvider.grok.wireFormat != .openAIChat {
                             log("FAIL: Grok speaks the OpenAI chat-completions shape")
@@ -2494,6 +2543,22 @@ private func toggleSidebar() {
         }
     }
 
+    /// Whether a text field inside the overlay currently has focus.
+    ///
+    /// Checks this window's own responder chain as well as the app-wide key
+    /// window: a non-activating panel is frequently not `NSApp.keyWindow`
+    /// even while the user is typing into it. An `NSTextField` being edited
+    /// reports its field editor (an `NSTextView`) as first responder, so both
+    /// classes count. SwiftUI's TextField/SecureField bridge to NSTextField;
+    /// TextEditor and search fields bridge to NSTextView.
+    private var isEditingAField: Bool {
+        let responders = [window.firstResponder, NSApp.keyWindow?.firstResponder]
+        return responders.contains { responder in
+            guard let responder else { return false }
+            return responder is NSTextView || responder is NSTextField
+        }
+    }
+
     /// Every key press that reaches the overlay, in one place.
     ///
     /// The local event monitor is a one-line forwarder to this, so the whole
@@ -2520,17 +2585,17 @@ private func toggleSidebar() {
             return event
         }
 
-        // While a search field is focused (the "/" palette or the shapes
-        // palette search), keys belong to it — never trigger tools from
-        // typing a shortcut letter into a search box.
-        // SwiftUI TextField/SecureField bridge to NSTextField, while
-        // TextEditor/search fields bridge to NSTextView. Let both classes
-        // receive standard editing commands such as Cmd+V instead of
-        // routing them to the canvas paste handler.
-        if let responder = NSApp.keyWindow?.firstResponder,
-           responder is NSTextView || responder is NSTextField {
-            return event
-        }
+        // Editing a field anywhere in the overlay — the API-key box, the "/"
+        // palette search, a prompt — means every key belongs to that field,
+        // Cmd+V included.
+        //
+        // This used to consult only `NSApp.keyWindow`. The overlay is a
+        // non-activating panel, so whenever another app holds key status
+        // `NSApp.keyWindow` is nil, the guard fell through, and Cmd+V in the
+        // API-key field was swallowed and sent to the canvas paste handler
+        // instead — which is why a key could only be entered with the
+        // clipboard button.
+        if isEditingAField { return event }
 
         if event.keyCode == 53 { // Esc — the canvas clears its selection
             return event

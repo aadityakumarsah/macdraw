@@ -491,6 +491,7 @@ struct ToolbarView: View {
     private var bottomRow: some View {
         HStack(spacing: 8) {
             strokeColorButton
+            quickSwatches
             fillColorButton
             Divider().frame(height: 24)
             shapePropertiesButton
@@ -500,6 +501,31 @@ struct ToolbarView: View {
             fontButton
             Spacer(minLength: 0)
             backgroundPicker
+        }
+    }
+
+    /// The five quick colors, inline in the bar.
+    ///
+    /// Moving the palette into a popover meant the bar no longer showed any
+    /// colour at all — you had to open a panel to see or change one. These are
+    /// Excalidraw's `DEFAULT_ELEMENT_STROKE_PICKS` (black, red, green, blue,
+    /// yellow); the full 5x3 grid with every shade and the hex field stays one
+    /// click away behind the Stroke and Fill buttons.
+    private var quickSwatches: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(Palette.strokePicks.enumerated()), id: \.offset) { _, color in
+                Button {
+                    state.strokeColor = color
+                } label: {
+                    ColorSwatch(
+                        color: color,
+                        size: 18,
+                        selected: color.hexDescription == state.strokeColor.hexDescription
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Stroke \(color.hexDescription)")
+            }
         }
     }
 
