@@ -2982,6 +2982,98 @@ final class CanvasView: NSView, NSTextViewDelegate {
         needsDisplay = true
     }
 
+    /// Places a generated scene on the canvas, honouring the styling the
+    /// model chose.
+    ///
+    /// Unlike `insertAIDiagram`, which overrides everything with the current
+    /// toolbar settings, this keeps the scene's own colors, fills, sloppiness
+    /// and stroke styles — the composition is the point. Toolbar settings are
+    /// the fallback for fields the model left out.
+    func insertAIScene(_ spec: SceneSpec, at screenPoint: CGPoint) {
+        commitPendingText()
+        guard !spec.elements.isEmpty else { return }
+        pushUndo()
+
+        let sourceBounds = spec.elements.reduce(CGRect.null) { partial, element in
+            let rect = element.rect
+            let fromPoints = element.cgPoints.reduce(CGRect.null) { inner, p in
+                inner.union(CGRect(x: p.x, y: p.y, width: 0, height: 0))
+            }
+            return partial.union(rect.isEmpty ? fromPoints : rect.union(fromPoints))
+        }
+        guard !sourceBounds.isNull else { return }
+        let target = screenToWorld(screenPoint)
+        let offset = CGPoint(x: target.x - sourceBounds.midX, y: target.y - sourceBounds.midY)
+
+        if let background = SceneVocabulary.background(spec.background) {
+            state.canvasBackground = background
+        }
+
+        let firstIndex = annotations.count
+        // Draw order: the model's zIndex when it gave one, otherwise the order
+        // it listed the elements in.
+        let ordered = spec.elements.enumerated().sorted { lhs, rhs in
+            (lhs.element.zIndex ?? lhs.offset) < (rhs.element.zIndex ?? rhs.offset)
+        }
+        for (_, element) in ordered {
+            guard let kind = SceneVocabulary.kind(element.kind) else { continue }
+            let points = element.cgPoints.map { CGPoint(x: $0.x + offset.x, y: $0.y + offset.y) }
+            let rect = CGRect(
+                x: element.x + offset.x, y: element.y + offset.y,
+                width: element.w, height: element.h
+            )
+            let isConnector = SceneVocabulary.isConnector(kind) || kind == .freedraw
+            guard !isConnector || points.count >= 2 else { continue }
+
+            let stroke = SceneColor.parse(element.stroke) ?? state.strokeColor
+            let fill = SceneColor.parse(element.fill)
+            let sloppiness = SceneVocabulary.sloppiness(element.sloppiness) ?? state.sloppiness
+            let edges = SceneVocabulary.edgeStyle(element.edges) ?? state.edgeStyle
+            let label = element.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            var item = Annotation(
+                kind: kind,
+                rect: isConnector ? boundingRect(of: points) : rect,
+                strokeColor: stroke,
+                fillColor: fill,
+                fillOpacity: 1,
+                strokeWidth: element.strokeWidth ?? state.strokeWidth,
+                opacity: element.opacity ?? state.elementOpacity,
+                points: points,
+                text: kind == .text ? label : "",
+                fontFamily: element.fontFamily ?? state.fontFamily,
+                fontSize: element.fontSize ?? state.fontSize,
+                zIndex: nextZIndex(),
+                strokeStyle: SceneVocabulary.strokeStyle(element.strokeStyle) ?? state.strokeStyle,
+                arrowStart: SceneVocabulary.arrowhead(element.startArrow) ?? .none,
+                arrowEnd: SceneVocabulary.arrowhead(element.endArrow) ?? (SceneVocabulary.isConnector(kind) ? .arrow : .none),
+                sloppiness: sloppiness.roughness,
+                edgeRoughness: sloppiness.edgeRoughness,
+                rx: edges == .round ? state.cornerRadius : 0,
+                ry: edges == .round ? state.cornerRadiusY : 0
+            )
+            item.fillStyle = SceneVocabulary.fillStyle(element.fillStyle) ?? state.fillStyle
+            // A label on a closed shape renders inside it; a text element
+            // carries its own text.
+            if kind != .text, !label.isEmpty, isClosed(kind) {
+                item.text = label
+                item.textInside = true
+                item.textAnchor = .center
+            }
+            if let symbol = element.symbol, AIIconCatalog.icons.contains(symbol) {
+                item.symbol = symbol
+            }
+            annotations.append(item)
+        }
+
+        guard annotations.count > firstIndex else { return }
+        selected = Set(firstIndex..<annotations.count)
+        state.tool = .selection
+        refreshConnectorGeometry()
+        needsDisplay = true
+        Haptics.impact()
+    }
+
     private func facingSide(from source: CGPoint, toward target: CGPoint) -> Int {
         let dx = target.x - source.x
         let dy = target.y - source.y

@@ -462,13 +462,16 @@ private func toggleSidebar() {
         container.sidebarHost = sidebar
 
         let aiDrawer = NSHostingView(
-            rootView: AIDiagramDrawer(settings: aiSettings, onInsert: { [weak self, weak canvas] diagram in
+            rootView: AIDiagramDrawer(settings: aiSettings, onInsert: { [weak self, weak canvas] generated in
                 guard let self, let canvas else { return }
                 // The click is inside the drawer, so mouse location would put
-                // the diagram beneath the drawer. Use the visible canvas
+                // the result beneath the drawer. Use the visible canvas
                 // center as a stable insertion target instead.
                 let p = CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
-                canvas.insertAIDiagram(diagram, at: p)
+                switch generated {
+                case .diagram(let diagram): canvas.insertAIDiagram(diagram, at: p)
+                case .scene(let scene): canvas.insertAIScene(scene, at: p)
+                }
                 self.toggleAIDrawer()
             }, onClose: { [weak self] in self?.toggleAIDrawer() })
         )
@@ -758,6 +761,43 @@ private func toggleSidebar() {
             log("SELFTEST PASS")
             exit(0)
         }
+    }
+
+    /// Dev hook (`--scene`): runs a fixture scene through the real harness
+    /// path — repair, measure, insert — so the rendering can be checked
+    /// without a provider key.
+    func selftestInsertSampleAIScene() {
+        guard let canvas = self.canvas else { return }
+        let json = """
+        {"title":"Pipeline","background":"transparent","elements":[
+          {"id":"src","kind":"cloud","x":0,"y":0,"w":210,"h":130,"text":"Sources",
+           "stroke":"#1971c2","fill":"#a5d8ff","fillStyle":"hachure",
+           "sloppiness":"artist","symbol":"cloud"},
+          {"id":"ing","kind":"rect","x":300,"y":10,"w":200,"h":110,"text":"Ingest",
+           "stroke":"#2f9e44","fill":"#b2f2bb","fillStyle":"crossHatch",
+           "sloppiness":"artist","edges":"round"},
+          {"id":"q","kind":"queue","x":600,"y":10,"w":200,"h":110,"text":"Queue",
+           "stroke":"#e8590c","fill":"#ffd8a8","fillStyle":"zigzag","sloppiness":"artist"},
+          {"id":"db","kind":"serverStack","x":300,"y":230,"w":200,"h":130,"text":"Store",
+           "stroke":"#9c36b5","fill":"#eebefa","fillStyle":"hachure","sloppiness":"artist"},
+          {"id":"note","kind":"note","x":600,"y":230,"w":200,"h":120,"text":"Retries here",
+           "stroke":"#1e1e1e","fill":"#ffec99","fillStyle":"solid","sloppiness":"cartoonist"},
+          {"id":"title","kind":"text","x":0,"y":-90,"w":420,"h":46,
+           "text":"Data pipeline","stroke":"#1e1e1e","fontSize":34},
+          {"id":"a1","kind":"arrow","points":[[210,65],[300,65]],
+           "stroke":"#1e1e1e","endArrow":"triangle"},
+          {"id":"a2","kind":"arrow","points":[[500,65],[600,65]],
+           "stroke":"#1e1e1e","endArrow":"triangle"},
+          {"id":"a3","kind":"curvedConnector","points":[[400,120],[400,230]],
+           "stroke":"#1e1e1e","strokeStyle":"dashed","endArrow":"arrow"},
+          {"id":"a4","kind":"orthogonal","points":[[700,120],[700,230]],
+           "stroke":"#1e1e1e","strokeStyle":"dotted","endArrow":"none"}
+        ]}
+        """
+        guard let spec = try? SceneAI.decode(json) else { return }
+        let attempt = SceneAI.evaluate(spec)
+        Diag.log("sample scene: \(attempt.spec.elements.count) elements, score \(attempt.score), defects \(attempt.defects.count)")
+        canvas.insertAIScene(attempt.spec, at: CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY))
     }
 
     /// Dev hook (`--ai`): opens the AI drawer so its settings panel can be
@@ -1435,6 +1475,176 @@ private func toggleSidebar() {
                         self.state.sloppiness = .artist
                         self.state.fillEnabled = false
                         self.state.tool = .selection
+
+                        log("scene harness test: the critic measures real defects")
+                        // A deliberately broken scene: duplicate id, unknown
+                        // kind, no size, off-canvas, bad colour, a connector
+                        // with one point, and two boxes on top of each other.
+                        let brokenJSON = """
+                        {"elements":[
+                          {"id":"a","kind":"rect","x":0,"y":0,"w":200,"h":120,"fill":"#a5d8ff","stroke":"#1971c2"},
+                          {"id":"a","kind":"rect","x":20,"y":10,"w":200,"h":120},
+                          {"id":"c","kind":"blorp","x":10,"y":400,"w":100,"h":60},
+                          {"id":"d","kind":"ellipse","x":0,"y":600,"w":0,"h":0},
+                          {"id":"e","kind":"rect","x":99999,"y":0,"w":80,"h":50},
+                          {"id":"f","kind":"rect","x":0,"y":800,"w":90,"h":50,"stroke":"not-a-colour"},
+                          {"id":"g","kind":"arrow","points":[[0,0]]}
+                        ]}
+                        """
+                        guard let broken = try? SceneAI.decode(brokenJSON) else {
+                            log("FAIL: the broken scene fixture should still decode")
+                            exit(1)
+                        }
+                        let brokenDefects = SceneCritic.defects(broken)
+                        log("critic found \(brokenDefects.count) defects: \(brokenDefects.map { String(describing: $0) }.prefix(8).joined(separator: ", "))")
+                        func hasDefect(_ test: (SceneDefect) -> Bool, _ name: String) {
+                            if !brokenDefects.contains(where: test) {
+                                log("FAIL: the critic should report \(name)")
+                                exit(1)
+                            }
+                        }
+                        hasDefect({ if case .duplicateID = $0 { return true }; return false }, "a duplicate id")
+                        hasDefect({ if case .unknownKind = $0 { return true }; return false }, "an unknown kind")
+                        hasDefect({ if case .degenerateSize = $0 { return true }; return false }, "a zero-size element")
+                        hasDefect({ if case .offCanvas = $0 { return true }; return false }, "an off-canvas element")
+                        hasDefect({ if case .badColor = $0 { return true }; return false }, "a malformed colour")
+                        hasDefect({ if case .connectorNeedsPoints = $0 { return true }; return false }, "a one-point connector")
+                        hasDefect({ if case .overlap = $0 { return true }; return false }, "overlapping shapes")
+
+                        log("scene harness test: the doctor repairs what it can without the model")
+                        let healed = SceneDoctor.repair(broken)
+                        let healedDefects = SceneCritic.defects(healed)
+                        log("after repair: \(healedDefects.count) defects, \(healed.elements.count) elements")
+                        if healedDefects.count >= brokenDefects.count {
+                            log("FAIL: repair should reduce the defect count, \(brokenDefects.count) -> \(healedDefects.count)")
+                            exit(1)
+                        }
+                        for check in [
+                            ("duplicate ids", { (d: SceneDefect) -> Bool in if case .duplicateID = d { return true }; return false }),
+                            ("unknown kinds", { if case .unknownKind = $0 { return true }; return false }),
+                            ("zero-size elements", { if case .degenerateSize = $0 { return true }; return false }),
+                            ("off-canvas elements", { if case .offCanvas = $0 { return true }; return false }),
+                            ("malformed colours", { if case .badColor = $0 { return true }; return false }),
+                            ("overlaps", { if case .overlap = $0 { return true }; return false }),
+                        ] as [(String, (SceneDefect) -> Bool)] {
+                            if healedDefects.contains(where: check.1) {
+                                log("FAIL: repair should have eliminated \(check.0)")
+                                exit(1)
+                            }
+                        }
+                        // The one-point arrow cannot be placed, so it is the
+                        // only element repair is allowed to drop.
+                        if healed.elements.count != broken.elements.count - 1 {
+                            log("FAIL: repair should drop exactly the unplaceable connector, got \(healed.elements.count) of \(broken.elements.count)")
+                            exit(1)
+                        }
+                        // Idempotent: a second pass is a no-op.
+                        if SceneCritic.score(SceneDoctor.repair(healed)) != SceneCritic.score(healed) {
+                            log("FAIL: repair should be idempotent")
+                            exit(1)
+                        }
+                        if SceneCritic.score(healed) >= SceneCritic.score(broken) {
+                            log("FAIL: the repaired scene should score better than the draft")
+                            exit(1)
+                        }
+
+                        log("scene harness test: vocabulary and colours")
+                        if SceneVocabulary.kind("Rectangle") != .rect || SceneVocabulary.kind("cross-hatch") != nil {
+                            log("FAIL: kind synonyms should resolve case/separator-insensitively")
+                            exit(1)
+                        }
+                        if SceneVocabulary.fillStyle("cross-hatch") != .crossHatch
+                            || SceneVocabulary.sloppiness("Artist") != .artist
+                            || SceneVocabulary.edgeStyle("ROUNDED") != .round
+                            || SceneVocabulary.arrowhead("triangle") != .triangle {
+                            log("FAIL: style vocabulary should resolve case/separator-insensitively")
+                            exit(1)
+                        }
+                        if SceneColor.parse("#a5d8ff")?.hexDescription.lowercased() != "#a5d8ff" {
+                            log("FAIL: hex colours should parse")
+                            exit(1)
+                        }
+                        if SceneColor.parse("blue.4")?.hexDescription.lowercased() != "#1971c2" {
+                            log("FAIL: palette names should resolve to their shade")
+                            exit(1)
+                        }
+                        if SceneColor.parse("transparent") != nil || !SceneColor.isWellFormed("transparent") {
+                            log("FAIL: transparent is a valid value that parses to no colour")
+                            exit(1)
+                        }
+                        if SceneColor.isWellFormed("rebeccapurple") {
+                            log("FAIL: an unparseable colour should not be well-formed")
+                            exit(1)
+                        }
+
+                        log("scene harness test: a good scene lands on the canvas with its own styling")
+                        let goodJSON = """
+                        {"title":"Flow","background":"transparent","elements":[
+                          {"id":"n1","kind":"rect","x":0,"y":0,"w":200,"h":120,"text":"Ingest",
+                           "stroke":"#1971c2","fill":"#a5d8ff","fillStyle":"hachure",
+                           "sloppiness":"artist","edges":"round","strokeWidth":2},
+                          {"id":"n2","kind":"cloud","x":320,"y":0,"w":200,"h":120,"text":"Queue",
+                           "stroke":"#e8590c","fill":"#ffd8a8","fillStyle":"crossHatch"},
+                          {"id":"n3","kind":"note","x":0,"y":220,"w":200,"h":110,"text":"Retry",
+                           "stroke":"#2f9e44","fill":"#b2f2bb","fillStyle":"zigzag"},
+                          {"id":"t1","kind":"text","x":320,"y":220,"w":200,"h":40,"text":"Pipeline"},
+                          {"id":"a1","kind":"arrow","points":[[200,60],[320,60]],
+                           "endArrow":"triangle","strokeStyle":"dashed","stroke":"#1e1e1e"},
+                          {"id":"a2","kind":"curvedConnector","points":[[100,120],[100,220]],"stroke":"#1e1e1e"}
+                        ]}
+                        """
+                        guard let good = try? SceneAI.decode(goodJSON) else {
+                            log("FAIL: the good scene fixture should decode")
+                            exit(1)
+                        }
+                        let goodDefects = SceneCritic.defects(SceneDoctor.repair(good))
+                        log("good scene defects: \(goodDefects.map { String(describing: $0) })")
+                        if !goodDefects.isEmpty {
+                            log("FAIL: a well-formed scene should measure clean")
+                            exit(1)
+                        }
+                        let beforeInsert = canvas.annotations.count
+                        canvas.insertAIScene(SceneDoctor.repair(good), at: CGPoint(x: 700, y: 500))
+                        let placed = canvas.annotations.count - beforeInsert
+                        log("inserted \(placed) annotations from a 6-element scene")
+                        if placed != 6 {
+                            log("FAIL: every scene element should become an annotation, got \(placed)")
+                            exit(1)
+                        }
+                        let inserted = Array(canvas.annotations.suffix(placed))
+                        guard let hachure = inserted.first(where: { $0.kind == .rect }) else {
+                            log("FAIL: the rect element should have been placed")
+                            exit(1)
+                        }
+                        log("placed rect: fill=\(hachure.fillStyle.rawValue) stroke=\(hachure.strokeColor.hexDescription) text=\(hachure.text.debugDescription) inside=\(hachure.textInside)")
+                        if hachure.fillStyle != .hachure {
+                            log("FAIL: the scene's own fill style should survive insertion")
+                            exit(1)
+                        }
+                        if hachure.strokeColor.hexDescription.lowercased() != "#1971c2" {
+                            log("FAIL: the scene's own stroke colour should survive insertion")
+                            exit(1)
+                        }
+                        if hachure.text != "Ingest" || !hachure.textInside {
+                            log("FAIL: a label on a closed shape should render inside it")
+                            exit(1)
+                        }
+                        if hachure.sloppiness != Sloppiness.artist.roughness {
+                            log("FAIL: the scene's own sloppiness should survive insertion")
+                            exit(1)
+                        }
+                        guard let arrow = inserted.first(where: { $0.kind == .arrow }) else {
+                            log("FAIL: the arrow element should have been placed")
+                            exit(1)
+                        }
+                        if arrow.arrowEnd != .triangle || arrow.strokeStyle != .dashed || arrow.points.count != 2 {
+                            log("FAIL: arrowheads, stroke style and points should survive insertion")
+                            exit(1)
+                        }
+                        // Clean up so later steps see the canvas they expect.
+                        canvas.selftestSelect(Array(beforeInsert..<canvas.annotations.count))
+                        canvas.deleteSelected()
+                        log("scene harness test: PASS")
 
                         log("model catalog test: every provider list shape normalizes to plain ids")
                         let anthropicList = Data("""

@@ -731,12 +731,17 @@ enum KeychainStore {
     /// claude-opus-5-5; the harness raises it for the final polish pass.
     static let defaultEffort = "medium"
 
-    private static func request(
+    /// One completion, against whichever provider is configured. `system` is
+    /// a parameter so scene generation can share this transport instead of
+    /// duplicating the seven-provider branching.
+    static func request(
         prompt: String,
+        system: String? = nil,
         settings: AISettings,
         maxTokens: Int = maxOutputTokens,
         effort: String = defaultEffort
     ) async throws -> String {
+        let systemPrompt = system ?? Self.systemPrompt
         let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let urlString: String
         var body: [String: Any]
@@ -846,11 +851,35 @@ private struct AIChatBubble: View {
     }
 }
 
+/// What the drawer produced, so the canvas can place it the right way.
+enum AIGeneration {
+    case diagram(DiagramSpec)
+    case scene(SceneSpec)
+}
+
+/// Which generator the drawer runs. A diagram is a node/edge flowchart that
+/// the connector system wires together; a scene is a free composition using
+/// macdraw's full shape, colour and fill vocabulary.
+enum AIGenerationMode: String, CaseIterable, Identifiable {
+    case scene = "Drawing"
+    case diagram = "Diagram"
+    var id: String { rawValue }
+    var blurb: String {
+        switch self {
+        case .scene: return "Any shapes, colours and hand-drawn fills. Best for illustrations and layouts."
+        case .diagram: return "Nodes and connectors that stay glued together. Best for flows and architecture."
+        }
+    }
+}
+
 struct AIDiagramDrawer: View {
     @ObservedObject var settings: AISettings
-    let onInsert: (DiagramSpec) -> Void
+    let onInsert: (AIGeneration) -> Void
     let onClose: () -> Void
     @State private var prompt = ""
+    @State private var mode: AIGenerationMode = .scene
+    @State private var scene: SceneSpec?
+    @State private var sceneReport = ""
     @State private var diagram: DiagramSpec?
     @State private var isGenerating = false
     @State private var generatingStatus = ""
@@ -865,19 +894,42 @@ struct AIDiagramDrawer: View {
             Divider()
             if settingsOpen { AISettingsView(settings: settings) }
             ScrollView { VStack(alignment: .leading, spacing: 12) {
-                Text("Describe a flowchart, architecture, or process. Review it before it reaches your canvas.").font(.system(size: 12)).foregroundStyle(.secondary)
+                Picker("", selection: $mode) { ForEach(AIGenerationMode.allCases) { Text($0.rawValue).tag($0) } }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                Text(mode.blurb).font(.system(size: 12)).foregroundStyle(.secondary)
                 ForEach(messages) { message in AIChatBubble(message: message) }
                 TextEditor(text: $prompt).font(.system(size: 13)).frame(height: 108).padding(7).background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
-                HStack { Button("Example") { prompt = "Create an onboarding flow: Start, create account, verify email, decision: verified?, dashboard or resend email." }.buttonStyle(.borderless); Spacer(); if !messages.isEmpty { Button("Clear chat") { messages.removeAll(); diagram = nil; error = "" }.buttonStyle(.borderless) }; Button { generate() } label: { Label(isGenerating ? "Generating…" : "Generate", systemImage: "arrow.up.circle.fill") }.disabled(isGenerating).buttonStyle(.borderedProminent) }
+                HStack {
+                    Button("Example") { prompt = mode == .scene ? exampleScenePrompt : exampleDiagramPrompt }.buttonStyle(.borderless)
+                    Spacer()
+                    if !messages.isEmpty { Button("Clear chat") { messages.removeAll(); diagram = nil; scene = nil; sceneReport = ""; error = "" }.buttonStyle(.borderless) }
+                    Button { generate() } label: { Label(isGenerating ? "Generating…" : "Generate", systemImage: "arrow.up.circle.fill") }.disabled(isGenerating).buttonStyle(.borderedProminent)
+                }
                 if isGenerating && !generatingStatus.isEmpty { Text(generatingStatus).font(.system(size: 11)).foregroundStyle(.secondary) }
                 if !error.isEmpty { Text(error).font(.system(size: 11)).foregroundStyle(.red) }
-                if let diagram { DiagramPreview(diagram: diagram).frame(height: 245).background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 10)); HStack { Text("\(diagram.nodes.count) objects · \(diagram.edges.count) editable connectors").font(.system(size: 11)).foregroundStyle(.secondary); Spacer(); Button("Insert into canvas") { onInsert(diagram) }.buttonStyle(.borderedProminent) } }
+                if let diagram { DiagramPreview(diagram: diagram).frame(height: 245).background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 10)); HStack { Text("\(diagram.nodes.count) objects · \(diagram.edges.count) editable connectors").font(.system(size: 11)).foregroundStyle(.secondary); Spacer(); Button("Insert into canvas") { onInsert(.diagram(diagram)) }.buttonStyle(.borderedProminent) } }
+                if let scene {
+                    HStack {
+                        Text(sceneReport).font(.system(size: 11)).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Insert into canvas") { onInsert(.scene(scene)) }.buttonStyle(.borderedProminent)
+                    }
+                }
             }.padding(14) }
         }.frame(width: 390, height: 520).background(.ultraThinMaterial)
     }
+    private var exampleScenePrompt: String {
+        "A hand-drawn poster of a coffee shop menu: a big framed title, three drink cards with icons and prices, and a small note at the bottom."
+    }
+    private var exampleDiagramPrompt: String {
+        "Create an onboarding flow: Start, create account, verify email, decision: verified?, dashboard or resend email."
+    }
+
     private func generate() {
         let request = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !request.isEmpty else { error = "Describe the diagram first."; return }
+        guard !request.isEmpty else { error = mode == .scene ? "Describe what to draw first." : "Describe the diagram first."; return }
+        if mode == .scene { generateScene(request); return }
         let previous = diagram.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) }
         let modelPrompt = previous.map { "Update this existing diagram according to the request. Preserve useful nodes and edges unless the request changes them. Existing JSON: \($0)\nRequest: \(request)" } ?? request
         messages.append(AIChatMessage(role: "user", text: request))
@@ -889,6 +941,47 @@ struct AIDiagramDrawer: View {
                     Task { @MainActor in self.generatingStatus = status }
                 }
                 await MainActor.run { diagram = output; generatingStatus = ""; messages.append(AIChatMessage(role: "assistant", text: "Generated \(output.nodes.count) nodes and \(output.edges.count) connectors. Review the preview, then insert it into the canvas.")); isGenerating = false }
+            } catch {
+                await MainActor.run { self.error = error.localizedDescription; generatingStatus = ""; isGenerating = false }
+            }
+        }
+    }
+
+    /// Runs the scene harness. The status line reports what the harness
+    /// measured on each pass, so a long run shows its working instead of
+    /// sitting on "Generating…".
+    private func generateScene(_ request: String) {
+        let previous = scene.flatMap { SceneAI.encode($0) }
+        let modelPrompt = previous.map {
+            """
+            Update this existing drawing according to the request. Keep what
+            still fits; change only what the request asks for.
+
+            Existing scene:
+            \($0)
+
+            Request: \(request)
+            """
+        } ?? request
+        messages.append(AIChatMessage(role: "user", text: request))
+        prompt = ""
+        isGenerating = true; generatingStatus = "Starting…"; error = ""
+        Task {
+            do {
+                let output = try await SceneAI.generate(prompt: modelPrompt, settings: settings) { status in
+                    Task { @MainActor in self.generatingStatus = status }
+                }
+                let remaining = SceneCritic.defects(output)
+                await MainActor.run {
+                    scene = output
+                    diagram = nil
+                    sceneReport = remaining.isEmpty
+                        ? "\(output.elements.count) elements · no issues found"
+                        : "\(output.elements.count) elements · \(remaining.count) issue\(remaining.count == 1 ? "" : "s") left"
+                    generatingStatus = ""
+                    messages.append(AIChatMessage(role: "assistant", text: sceneReport + ". Insert it into the canvas to edit it."))
+                    isGenerating = false
+                }
             } catch {
                 await MainActor.run { self.error = error.localizedDescription; generatingStatus = ""; isGenerating = false }
             }
