@@ -779,7 +779,15 @@ enum KeychainStore {
             body = ["model": settings.model, "temperature": 0.2, "max_tokens": maxTokens, "messages": [["role": "system", "content": systemPrompt], ["role": "user", "content": prompt]]]
         }
         guard let url = URL(string: urlString) else { throw NSError(domain: "MacdrawAI", code: 4, userInfo: [NSLocalizedDescriptionKey: "The endpoint URL is invalid."]) }
-        var req = URLRequest(url: url); req.httpMethod = "POST"; req.timeoutInterval = 35
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        // A thinking model can spend a minute or more on one pass before the
+        // first byte arrives, and the harness runs several passes. The old 35s
+        // was tuned for a non-thinking one-shot and would abort a request that
+        // was working fine. Each response is a small JSON object, so a
+        // generous non-streaming timeout is enough here; streaming would only
+        // be needed for long prose output.
+        req.timeoutInterval = 240
         headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: req)
