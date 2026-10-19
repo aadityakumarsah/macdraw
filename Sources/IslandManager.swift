@@ -1505,6 +1505,119 @@ private func toggleSidebar() {
                         }
                         log("mid-box dodge: connector cleared the box (maxY=\(pathPts.map(\.y).max() ?? 0))")
 
+                        log("table paste test: markdown, HTML and TSV tables become a grid")
+                        let markdownTable = """
+                        | Name | Role | Years |
+                        |------|------|-------|
+                        | Ada  | Eng  | 7     |
+                        | Linus| Ops  | 12    |
+                        """
+                        guard let md = TableImport.fromText(markdownTable) else {
+                            log("FAIL: a markdown pipe table should be recognized")
+                            exit(1)
+                        }
+                        log("markdown table: \(md.rows)x\(md.columns) header=\(md.hasHeader) cells=\(md.cells.prefix(6))")
+                        if md.rows != 3 || md.columns != 3 || !md.hasHeader {
+                            log("FAIL: expected a 3x3 table with a header, got \(md.rows)x\(md.columns) header=\(md.hasHeader)")
+                            exit(1)
+                        }
+                        if md.cell(row: 0, column: 1) != "Role" || md.cell(row: 2, column: 2) != "12" {
+                            log("FAIL: markdown cells landed in the wrong places")
+                            exit(1)
+                        }
+
+                        let htmlTable = """
+                        <table><tr><th>Name</th><th>Role</th></tr>
+                        <tr><td>Ada&nbsp;L</td><td>Eng &amp; Research</td></tr>
+                        <tr><td>Linus</td><td>Ops</td></tr></table>
+                        """
+                        guard let html = TableImport.fromHTML(htmlTable) else {
+                            log("FAIL: an HTML table should be recognized")
+                            exit(1)
+                        }
+                        log("html table: \(html.rows)x\(html.columns) header=\(html.hasHeader) cells=\(html.cells)")
+                        if html.rows != 3 || html.columns != 2 || !html.hasHeader {
+                            log("FAIL: expected a 3x2 HTML table with a header")
+                            exit(1)
+                        }
+                        if html.cell(row: 1, column: 1) != "Eng & Research" {
+                            log("FAIL: HTML entities should decode, got \(html.cell(row: 1, column: 1))")
+                            exit(1)
+                        }
+                        if html.cell(row: 1, column: 0) != "Ada L" {
+                            log("FAIL: &nbsp; should become a space, got \(html.cell(row: 1, column: 0))")
+                            exit(1)
+                        }
+
+                        let tsv = "Name\tRole\nAda\tEng\nLinus\tOps"
+                        guard let tabbed = TableImport.fromText(tsv), tabbed.rows == 3, tabbed.columns == 2 else {
+                            log("FAIL: a tab-separated table should be recognized")
+                            exit(1)
+                        }
+                        // Prose must not be mistaken for a table.
+                        if TableImport.fromText("just a sentence\nand another one") != nil {
+                            log("FAIL: plain prose should not parse as a table")
+                            exit(1)
+                        }
+                        if TableImport.fromText("a | b") != nil {
+                            log("FAIL: a single pipe line is not a table")
+                            exit(1)
+                        }
+
+                        // And it has to land on the canvas as a real element.
+                        let beforeTable = canvas.annotations.count
+                        guard let tableElement = canvas.tableAnnotation(from: md) else {
+                            log("FAIL: could not build a table annotation")
+                            exit(1)
+                        }
+                        canvas.selftestAppend(tableElement)
+                        guard let grid = canvas.annotations.last, grid.kind == .table else {
+                            log("FAIL: the table element was not placed")
+                            exit(1)
+                        }
+                        log("table element: \(Int(grid.rect.width))x\(Int(grid.rect.height)) cols=\(grid.tableColumns) cells=\(grid.nodeTexts.count)")
+                        if grid.tableColumns != 3 || grid.nodeTexts.count != 9 {
+                            log("FAIL: the table element should carry 3 columns and 9 cells")
+                            exit(1)
+                        }
+                        if grid.rect.width < 160 || grid.rect.height < 60 {
+                            log("FAIL: the table should size itself to its content, got \(grid.rect)")
+                            exit(1)
+                        }
+                        if !grid.tableHasHeader {
+                            log("FAIL: the header flag should survive onto the element")
+                            exit(1)
+                        }
+                        // A cell must be editable in place, through the same
+                        // per-cell path the data-structure shapes use.
+                        let tableIndex = canvas.annotations.count - 1
+                        let cells = canvas.selftestNodeRects(tableIndex)
+                        log("table cells: \(cells.count)")
+                        if cells.count != 9 {
+                            log("FAIL: a 3x3 table should expose 9 editable cells, got \(cells.count)")
+                            exit(1)
+                        }
+                        let target = cells[4]
+                        let cellPoint = self.win(CGPoint(x: target.midX, y: target.midY))
+                        self.state.tool = .selection
+                        canvas.mouseDown(with: self.mouseEvent(at: cellPoint, type: .leftMouseDown, clickCount: 2))
+                        canvas.mouseUp(with: self.mouseEvent(at: cellPoint, type: .leftMouseUp, clickCount: 2))
+                        if !canvas.isEditingText {
+                            log("FAIL: double-clicking a cell should open its editor")
+                            exit(1)
+                        }
+                        canvas.selftestSetText("Edited")
+                        canvas.commitPendingText()
+                        let after = canvas.selftestNodeTexts(tableIndex)
+                        log("cell 4 is now: \(after.indices.contains(4) ? after[4] : "<missing>")")
+                        if !after.contains("Edited") {
+                            log("FAIL: the edited cell value should be stored, got \(after)")
+                            exit(1)
+                        }
+                        canvas.selftestSelect(Array(beforeTable..<canvas.annotations.count))
+                        canvas.deleteSelected()
+                        log("table paste test: PASS")
+
                         log("auto-bind test: a plain arrow drawn box-to-box glues itself and follows")
                         self.state.tool = .rectangle
                         self.state.lastNonTextTool = .rectangle

@@ -50,6 +50,9 @@ enum ShapeKind: String {
     case heap
     case graph
     case set
+    /// A grid of cells. `nodeTexts` holds them row-major and
+    /// `tableColumns` gives the width, so the row count is implied.
+    case table
 }
 
 /// How the outline of a shape is stroked.
@@ -234,6 +237,7 @@ enum Tool: String, CaseIterable {
     case heap
     case graph
     case set
+    case table
 
     /// Tools that draw rect-based shapes, shown in the shape palette.
     static let shapePalette: [Tool] = [
@@ -246,6 +250,7 @@ enum Tool: String, CaseIterable {
         .doubleArrow, .curvedConnector, .orthogonal, .connector,
         // Data structures
         .linkedList, .stack, .heap, .graph, .set,
+        .table,
     ]
 
     var iconName: String {
@@ -299,6 +304,7 @@ enum Tool: String, CaseIterable {
         case .heap: return "heap"
         case .graph: return "graph"
         case .set: return "set"
+        case .table: return "rectangle.grid.2x2"
         }
     }
 
@@ -353,6 +359,7 @@ enum Tool: String, CaseIterable {
         case .heap: return "Heap"
         case .graph: return "Graph"
         case .set: return "Set"
+        case .table: return "Table"
         }
     }
 
@@ -398,6 +405,7 @@ enum Tool: String, CaseIterable {
         case .heap: return .heap
         case .graph: return .graph
         case .set: return .set
+        case .table: return .table
         default: return nil
         }
     }
@@ -492,6 +500,12 @@ struct Annotation {
 
     /// How the interior is painted (hachure / cross-hatch / zigzag / solid).
     var fillStyle: FillStyle = .solid
+
+    /// Column count of a `.table`. Cells live in `nodeTexts`, row-major, so
+    /// the row count is `nodeTexts.count / tableColumns`.
+    var tableColumns: Int = 0
+    /// Whether a `.table`'s first row is a header (drawn emphasized).
+    var tableHasHeader: Bool = false
 
     /// The stored rich text, or nil when the annotation is plain.
     func richText() -> NSAttributedString? {

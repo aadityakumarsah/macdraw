@@ -138,6 +138,8 @@ struct PersistedAnnotation: Codable {
     /// still read so pre-1.22 pages (and pasted scenes) keep their images.
     var imageFileID: String?
     var fillStyle: String?
+    var tableColumns: Int?
+    var tableHasHeader: Bool?
 }
 
 private func colorComponents(_ c: NSColor) -> [CGFloat] {
@@ -215,7 +217,9 @@ private extension Annotation {
             nodeTexts: nodeTexts.isEmpty ? nil : nodeTexts,
             id: id,
             imageFileID: fileID,
-            fillStyle: fillStyle.rawValue
+            fillStyle: fillStyle.rawValue,
+            tableColumns: tableColumns == 0 ? nil : tableColumns,
+            tableHasHeader: tableHasHeader ? true : nil
         )
     }
 
@@ -284,7 +288,9 @@ private extension Annotation {
             nodeTexts: p.nodeTexts ?? [],
             id: p.id ?? UUID().uuidString,
             imageFileID: fileID,
-            fillStyle: FillStyle(rawValue: p.fillStyle ?? "") ?? .solid
+            fillStyle: FillStyle(rawValue: p.fillStyle ?? "") ?? .solid,
+            tableColumns: p.tableColumns ?? 0,
+            tableHasHeader: p.tableHasHeader ?? false
         )
     }
 }
@@ -2360,7 +2366,34 @@ final class CanvasView: NSView, NSTextViewDelegate {
             a.fillStyle = .solid
             annotations.append(a)
         }
+
+        // A pasted table, so --sample also shows the grid renderer.
+        let markdown = """
+        | Stage | Owner | Days |
+        |-------|-------|------|
+        | Screen | Recruiting | 2 |
+        | Interview | Hiring manager | 5 |
+        | Offer | Finance | 3 |
+        """
+        if let parsed = TableImport.fromText(markdown), var table = tableAnnotation(from: parsed) {
+            table.rect.origin = CGPoint(x: 160, y: 650)
+            table.createdAt = Date(timeIntervalSince1970: 4000)
+            // An explicit colour so the sample reads on a dark backdrop; in
+            // real use the table takes the current stroke colour.
+            table.strokeColor = Palette.blue[4]
+            table.fillColor = Palette.blue[0]
+            annotations.append(table)
+        }
+
         selected = []
+        needsDisplay = true
+    }
+
+    /// Self-test hook: place a prepared annotation directly.
+    func selftestAppend(_ annotation: Annotation) {
+        var placed = annotation
+        placed.rect.origin = CGPoint(x: 2200, y: 300)
+        annotations.append(placed)
         needsDisplay = true
     }
 
@@ -3397,6 +3430,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// detected and dropped in as perfectly-aligned monospaced code blocks.
     private func pasteSystemText() -> Bool {
         let pb = NSPasteboard.general
+        // A table is recognized before anything else: the HTML flavour
+        // carries real cell boundaries, and a markdown or TSV table pasted as
+        // one text block is unreadable.
+        if let table = TableImport.table(from: pb), let annotation = tableAnnotation(from: table) {
+            return pasteAnnotationBatch([annotation])
+        }
         guard let string = pb.string(forType: .string), !string.isEmpty else { return false }
         let style = PasteStyle(
             strokeColor: state.strokeColor,
@@ -3411,6 +3450,35 @@ final class CanvasView: NSView, NSTextViewDelegate {
             annotation = ClipboardImport.textAnnotation(from: string, rtfData: rtf, style: style)
         }
         return pasteAnnotationBatch([annotation])
+    }
+
+    /// Builds a table element sized to its own content.
+    func tableAnnotation(from table: TableImport.Table) -> Annotation? {
+        guard table.columns >= 2, table.rows >= 2 else { return nil }
+        let fontSize = min(max(state.fontSize * 0.55, 11), 18)
+        let font = Fonts.nsFont(for: state.fontFamily, size: fontSize)
+        let size = TableImport.naturalSize(for: table, font: font)
+        var annotation = Annotation(
+            kind: .table,
+            rect: CGRect(origin: .zero, size: size),
+            strokeColor: state.strokeColor,
+            fillColor: nil,
+            fillOpacity: 1,
+            strokeWidth: max(1, min(state.strokeWidth, 2)),
+            opacity: state.elementOpacity,
+            points: [],
+            fontFamily: state.fontFamily,
+            fontSize: fontSize,
+            zIndex: nextZIndex(),
+            strokeStyle: .solid,
+            // A grid reads badly hand-drawn — the lines stop lining up.
+            sloppiness: 0,
+            edgeRoughness: 0
+        )
+        annotation.nodeTexts = table.cells
+        annotation.tableColumns = table.columns
+        annotation.tableHasHeader = table.hasHeader
+        return annotation
     }
 
     /// Pastes an NSImage found on the system pasteboard as a new image
@@ -4100,6 +4168,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             drawImageAnnotation(a)
         case .laser:
             drawLaser(a)
+        case .table:
+            drawTable(a, index: index)
         default:
             let path = cachedPath(for: a, index: index)
             if let fill = a.fillColor, shouldFill(a), a.kind != .set {
@@ -4174,7 +4244,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             }
             // Node values of a data-structure shape — same treatment: rotate
             // and scale with the shape, hidden while the edit field is open.
-            if isDataStructure(a.kind),
+            if isDataStructure(a.kind), a.kind != .table,
                !(editingView != nil && editingIndex == index) {
                 drawDataStructureTexts(a)
             }
@@ -4857,6 +4927,109 @@ final class CanvasView: NSView, NSTextViewDelegate {
         )
     }
 
+    // MARK: - tables
+
+    /// Grid geometry for a table: the x offset of each column boundary and
+    /// the uniform row height.
+    private func tableLayout(_ a: Annotation) -> (columnEdges: [CGFloat], rowHeight: CGFloat, rows: Int)? {
+        let columns = max(a.tableColumns, 1)
+        guard columns > 0, !a.nodeTexts.isEmpty else { return nil }
+        let rows = Int(ceil(Double(a.nodeTexts.count) / Double(columns)))
+        guard rows > 0, a.rect.width > 1, a.rect.height > 1 else { return nil }
+        let font = Fonts.nsFont(for: a.fontFamily, size: a.fontSize)
+        let table = TableImport.Table(
+            cells: a.nodeTexts, columns: columns, rows: rows, hasHeader: a.tableHasHeader
+        )
+        let widths = TableImport.columnWidths(for: table, font: font, totalWidth: a.rect.width)
+        var edges: [CGFloat] = [a.rect.minX]
+        var x = a.rect.minX
+        for width in widths {
+            x += width
+            edges.append(x)
+        }
+        return (edges, a.rect.height / CGFloat(rows), rows)
+    }
+
+    /// Draws a table: a filled header band, grid lines, and each cell's text
+    /// clipped to its cell so a long value cannot bleed into its neighbour.
+    private func drawTable(_ a: Annotation, index: Int) {
+        guard let layout = tableLayout(a) else { return }
+        // The cell being typed into is covered by its edit field; drawing the
+        // old value underneath would show through.
+        let editingCell = (editingView != nil && editingIndex == index) ? editingNodeIndex : nil
+        let columns = max(a.tableColumns, 1)
+        let font = Fonts.nsFont(for: a.fontFamily, size: a.fontSize)
+        let headerFont = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
+
+        // Background, including the header band.
+        if let fill = a.fillColor, shouldFill(a) {
+            let rgb = fill.usingColorSpace(.sRGB) ?? fill
+            rgb.withAlphaComponent(rgb.alphaComponent * max(0, min(1, a.fillOpacity))).setFill()
+            NSBezierPath(rect: a.rect).fill()
+        }
+        if a.tableHasHeader {
+            a.strokeColor.withAlphaComponent(0.12).setFill()
+            NSBezierPath(rect: CGRect(
+                x: a.rect.minX, y: a.rect.minY,
+                width: a.rect.width, height: layout.rowHeight
+            )).fill()
+        }
+
+        // Grid.
+        let grid = NSBezierPath()
+        for edge in layout.columnEdges {
+            grid.move(to: CGPoint(x: edge, y: a.rect.minY))
+            grid.line(to: CGPoint(x: edge, y: a.rect.maxY))
+        }
+        for row in 0...layout.rows {
+            let y = a.rect.minY + CGFloat(row) * layout.rowHeight
+            grid.move(to: CGPoint(x: a.rect.minX, y: y))
+            grid.line(to: CGPoint(x: a.rect.maxX, y: y))
+        }
+        a.strokeColor.withAlphaComponent(0.55).setStroke()
+        grid.lineWidth = max(0.75, a.strokeWidth * 0.5)
+        grid.stroke()
+
+        // Outer border, heavier than the inner lines.
+        a.strokeColor.setStroke()
+        let border = NSBezierPath(rect: a.rect)
+        border.lineWidth = a.strokeWidth
+        border.stroke()
+
+        // Cell text.
+        let inset: CGFloat = 6
+        for index in a.nodeTexts.indices {
+            let row = index / columns
+            let column = index % columns
+            guard row < layout.rows, column + 1 < layout.columnEdges.count else { continue }
+            guard index != editingCell else { continue }
+            let text = a.nodeTexts[index]
+            guard !text.isEmpty else { continue }
+            let cell = CGRect(
+                x: layout.columnEdges[column],
+                y: a.rect.minY + CGFloat(row) * layout.rowHeight,
+                width: layout.columnEdges[column + 1] - layout.columnEdges[column],
+                height: layout.rowHeight
+            )
+            let isHeader = a.tableHasHeader && row == 0
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: isHeader ? headerFont : font,
+                .foregroundColor: a.strokeColor,
+            ]
+            let measured = (text as NSString).size(withAttributes: attributes)
+            let textRect = CGRect(
+                x: cell.minX + inset,
+                y: cell.minY + max(0, (cell.height - measured.height) / 2),
+                width: max(0, cell.width - inset * 2),
+                height: measured.height
+            )
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: cell.insetBy(dx: 1, dy: 1)).addClip()
+            (text as NSString).draw(in: textRect, withAttributes: attributes)
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
     /// Solid backgrounds/borders for code blocks — shared by the rendered
     /// block and the live editing field so typing matches the result.
     private func codeBlockColors(dark: Bool) -> (background: NSColor, border: NSColor) {
@@ -5306,6 +5479,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     private func bezierPath(for a: Annotation) -> NSBezierPath {
         let r = a.rect
+        // A table draws its own grid and border in `drawTable`; this path is
+        // only used for hit-testing and selection bounds.
+        if a.kind == .table { return NSBezierPath(rect: r) }
         let slop = a.sloppiness
         let edge = a.edgeRoughness
         let rough = slop > 0.02 || edge > 0.02
@@ -5762,9 +5938,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// True when the shape is one of the data-structure kinds (linked list,
     /// stack, heap, graph, set) — multi-node shapes with editable values.
+    /// Shapes whose text lives in per-cell slots (`nodeTexts`) rather than in
+    /// a single `text`. Tables join the data structures here so a cell can be
+    /// edited by double-clicking it, through the same path.
     private func isDataStructure(_ kind: ShapeKind) -> Bool {
         switch kind {
-        case .linkedList, .stack, .heap, .graph, .set:
+        case .linkedList, .stack, .heap, .graph, .set, .table:
             return true
         default:
             return false
@@ -5774,6 +5953,30 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Frames of the individual nodes of a data-structure shape, laid out
     /// inside the annotation's rect.
     private func dataStructureNodes(for a: Annotation) -> [CGRect] {
+        if a.kind == .table { return tableCells(for: a) }
+        return dataStructureNodeRects(for: a)
+    }
+
+    /// Every cell of a table, row-major — the same order as `nodeTexts`.
+    private func tableCells(for a: Annotation) -> [CGRect] {
+        guard let layout = tableLayout(a) else { return [] }
+        let columns = max(a.tableColumns, 1)
+        var out: [CGRect] = []
+        out.reserveCapacity(layout.rows * columns)
+        for row in 0..<layout.rows {
+            for column in 0..<columns where column + 1 < layout.columnEdges.count {
+                out.append(CGRect(
+                    x: layout.columnEdges[column],
+                    y: a.rect.minY + CGFloat(row) * layout.rowHeight,
+                    width: layout.columnEdges[column + 1] - layout.columnEdges[column],
+                    height: layout.rowHeight
+                ))
+            }
+        }
+        return out
+    }
+
+    private func dataStructureNodeRects(for a: Annotation) -> [CGRect] {
         let r = a.rect
         switch a.kind {
         case .linkedList:
@@ -6722,7 +6925,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
              .process, .predefinedProcess, .delay, .manualInput, .display,
              .cloud, .serverStack, .queue, .firewall, .cube,
              .callout, .note,
-             .linkedList, .stack, .heap, .graph, .set:
+             .linkedList, .stack, .heap, .graph, .set, .table:
             return true
         default:
             return false
