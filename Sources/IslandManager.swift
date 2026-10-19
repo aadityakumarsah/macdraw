@@ -760,6 +760,10 @@ private func toggleSidebar() {
         }
     }
 
+    /// Dev hook (`--ai`): opens the AI drawer so its settings panel can be
+    /// screenshotted without clicking through the UI.
+    func selftestOpenAIDrawer() { toggleAIDrawer() }
+
     /// Dev hook (`--sample`): sketches a long wavy stroke through the real
     /// mouse path, so a screenshot shows whether the incremental repaints
     /// used while drawing keep the whole stroke on screen.
@@ -1431,6 +1435,70 @@ private func toggleSidebar() {
                         self.state.sloppiness = .artist
                         self.state.fillEnabled = false
                         self.state.tool = .selection
+
+                        log("model catalog test: every provider list shape normalizes to plain ids")
+                        let anthropicList = Data("""
+                        {"data":[{"type":"model","id":"claude-opus-5-5","display_name":"Claude Opus 5.5"},
+                                 {"type":"model","id":"claude-sonnet-5-5","display_name":"Claude Sonnet 5.5"}]}
+                        """.utf8)
+                        let anthropicModels = AIModelCatalog.parse(anthropicList, provider: .anthropic)
+                        log("anthropic models: \(anthropicModels)")
+                        if anthropicModels != ["claude-opus-5-5", "claude-sonnet-5-5"] {
+                            log("FAIL: anthropic model list should preserve API order and read .id")
+                            exit(1)
+                        }
+                        // Grok and the other OpenAI-compatible providers share
+                        // the {"data":[{"id":…}]} shape.
+                        let grokList = Data(#"{"data":[{"id":"grok-test-a"},{"id":"grok-test-b"}]}"#.utf8)
+                        if AIModelCatalog.parse(grokList, provider: .grok) != ["grok-test-a", "grok-test-b"] {
+                            log("FAIL: grok model list should read .id from .data")
+                            exit(1)
+                        }
+                        // Gemini prefixes ids and mixes in non-chat models.
+                        let geminiList = Data("""
+                        {"models":[{"name":"models/gemini-2.5-flash","supportedGenerationMethods":["generateContent"]},
+                                   {"name":"models/text-embedding-004","supportedGenerationMethods":["embedContent"]}]}
+                        """.utf8)
+                        let geminiModels = AIModelCatalog.parse(geminiList, provider: .gemini)
+                        log("gemini models: \(geminiModels)")
+                        if geminiModels != ["gemini-2.5-flash"] {
+                            log("FAIL: gemini list should strip models/ and drop non-generateContent models")
+                            exit(1)
+                        }
+                        // Ollama's native /api/tags shape, deduped and sorted.
+                        let ollamaList = Data(#"{"models":[{"name":"llama3.2:latest"},{"name":"codellama"},{"name":"llama3.2:latest"}]}"#.utf8)
+                        let ollamaModels = AIModelCatalog.parse(ollamaList, provider: .local)
+                        log("ollama models: \(ollamaModels)")
+                        if ollamaModels != ["codellama", "llama3.2:latest"] {
+                            log("FAIL: ollama list should dedupe and sort")
+                            exit(1)
+                        }
+                        if !AIModelCatalog.parse(Data("not json".utf8), provider: .grok).isEmpty {
+                            log("FAIL: unparseable model list should yield no models, not crash")
+                            exit(1)
+                        }
+                        log("model catalog test: PASS")
+
+                        log("provider wiring test: each provider routes to the right wire format and auth")
+                        if AIProvider.grok.wireFormat != .openAIChat {
+                            log("FAIL: Grok speaks the OpenAI chat-completions shape")
+                            exit(1)
+                        }
+                        if AIProvider.anthropic.wireFormat != .anthropicMessages {
+                            log("FAIL: Anthropic uses the /messages shape")
+                            exit(1)
+                        }
+                        if AIProvider.anthropic.defaultModel != "claude-opus-5-5" {
+                            log("FAIL: the Anthropic default model should be current, got \(AIProvider.anthropic.defaultModel)")
+                            exit(1)
+                        }
+                        for provider in AIProvider.allCases where provider != .custom {
+                            if provider.defaultEndpoint.isEmpty {
+                                log("FAIL: \(provider.rawValue) needs a default endpoint")
+                                exit(1)
+                            }
+                        }
+                        log("provider wiring test: PASS")
 
                         log("shape library test: palette contents are all drawable tools")
                         if Tool.shapePalette.count < 25 {

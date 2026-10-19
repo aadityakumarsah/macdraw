@@ -9,6 +9,7 @@ import Security
 enum AIProvider: String, CaseIterable, Identifiable {
     case openAI = "OpenAI / Codex"
     case anthropic = "Anthropic / Claude"
+    case grok = "xAI / Grok"
     case openRouter = "OpenRouter"
     case gemini = "Google Gemini"
     case custom = "OpenAI-compatible"
@@ -18,22 +19,57 @@ enum AIProvider: String, CaseIterable, Identifiable {
         switch self {
         case .openAI: return "https://api.openai.com/v1"
         case .anthropic: return "https://api.anthropic.com/v1"
+        case .grok: return "https://api.x.ai/v1"
         case .openRouter: return "https://openrouter.ai/api/v1"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
         case .custom: return ""
         case .local: return "http://127.0.0.1:11434/v1"
         }
     }
+
+    /// Starting point only. Every provider here publishes a models endpoint,
+    /// so the Model dropdown lists what the key can actually reach and the
+    /// user picks from that instead of typing an id by hand.
     var defaultModel: String {
         switch self {
         case .openAI: return "gpt-4.1-mini"
-        case .anthropic: return "claude-sonnet-4-20250514"
+        case .anthropic: return "claude-opus-5-5"
+        case .grok: return ""
         case .openRouter: return "openai/gpt-4.1-mini"
         case .gemini: return "gemini-2.5-flash"
         case .custom: return ""
         case .local: return "llama3.2"
         }
     }
+
+    /// Wire protocol, which is what the request/response code branches on.
+    /// Grok, OpenRouter, Ollama and "OpenAI-compatible" all speak the OpenAI
+    /// chat-completions shape, so they share one path.
+    var wireFormat: AIWireFormat {
+        switch self {
+        case .anthropic: return .anthropicMessages
+        case .gemini: return .geminiGenerateContent
+        case .openAI, .grok, .openRouter, .custom, .local: return .openAIChat
+        }
+    }
+
+    var keyHelpURL: String? {
+        switch self {
+        case .anthropic: return "https://platform.claude.com/settings/keys"
+        case .grok: return "https://console.x.ai"
+        case .openAI: return "https://platform.openai.com/api-keys"
+        case .openRouter: return "https://openrouter.ai/keys"
+        case .gemini: return "https://aistudio.google.com/app/apikey"
+        case .custom, .local: return nil
+        }
+    }
+}
+
+/// The three request/response shapes macdraw speaks.
+enum AIWireFormat {
+    case anthropicMessages
+    case openAIChat
+    case geminiGenerateContent
 }
 
 struct DiagramNode: Codable, Identifiable {
@@ -156,6 +192,134 @@ final class AISettings: ObservableObject {
         d.set(provider.rawValue, forKey: "ai.provider")
         d.set(endpoint, forKey: "ai.endpoint")
         d.set(model, forKey: "ai.model")
+    }
+}
+
+/// Lists the models a provider will actually serve for the configured key, so
+/// the Model field can be a dropdown instead of a free-text box the user has
+/// to type an exact id into. Every supported provider publishes this; the
+/// shapes differ, so each one is normalized to a plain list of ids here.
+@MainActor
+final class AIModelCatalog: ObservableObject {
+    @Published private(set) var models: [String] = []
+    @Published private(set) var loading = false
+    @Published private(set) var error: String?
+
+    /// Per-provider cache, so switching back and forth doesn't refetch.
+    private var cache: [AIProvider: [String]] = [:]
+
+    func models(for provider: AIProvider) -> [String] { cache[provider] ?? [] }
+
+    func load(settings: AISettings, force: Bool = false) async {
+        let provider = settings.provider
+        if !force, let hit = cache[provider], !hit.isEmpty {
+            models = hit
+            error = nil
+            return
+        }
+        loading = true
+        error = nil
+        defer { loading = false }
+        do {
+            let list = try await Self.fetch(settings: settings)
+            guard settings.provider == provider else { return }  // user switched mid-flight
+            cache[provider] = list
+            models = list
+            if list.isEmpty { error = "The provider returned no models." }
+        } catch {
+            guard settings.provider == provider else { return }
+            models = []
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// Clears the list when the provider changes, so a stale list is never
+    /// shown against the wrong provider.
+    func reset() {
+        models = []
+        error = nil
+    }
+
+    static func fetch(settings: AISettings) async throws -> [String] {
+        let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !endpoint.isEmpty else {
+            throw NSError(domain: "MacdrawAI", code: 30, userInfo: [NSLocalizedDescriptionKey: "Set the endpoint first."])
+        }
+        if settings.provider != .local, settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw NSError(domain: "MacdrawAI", code: 31, userInfo: [NSLocalizedDescriptionKey: "Add an API key to list models."])
+        }
+
+        // Ollama serves the OpenAI-compatible list at /v1/models, but older
+        // builds only answer the native /api/tags — try both.
+        if settings.provider == .local {
+            if let list = try? await request(url: endpoint + "/models", settings: settings), !list.isEmpty {
+                return list
+            }
+            let native = endpoint.replacingOccurrences(of: "/v1", with: "")
+            return (try? await request(url: native + "/api/tags", settings: settings)) ?? []
+        }
+        let path = settings.provider == .anthropic ? "/models?limit=200" : "/models"
+        return try await request(url: endpoint + path, settings: settings)
+    }
+
+    private static func request(url urlString: String, settings: AISettings) async throws -> [String] {
+        guard let url = URL(string: urlString) else {
+            throw NSError(domain: "MacdrawAI", code: 32, userInfo: [NSLocalizedDescriptionKey: "The endpoint URL is invalid."])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 15
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        switch settings.provider.wireFormat {
+        case .anthropicMessages:
+            req.setValue(settings.apiKey, forHTTPHeaderField: "x-api-key")
+            req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        case .geminiGenerateContent:
+            req.setValue(settings.apiKey, forHTTPHeaderField: "x-goog-api-key")
+        case .openAIChat:
+            if !settings.apiKey.isEmpty {
+                req.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+            }
+        }
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "MacdrawAI", code: 33, userInfo: [NSLocalizedDescriptionKey: "No response from provider."])
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let text = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw NSError(domain: "MacdrawAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey:
+                "Provider returned \(http.statusCode): \(text.prefix(180))"])
+        }
+        return parse(data, provider: settings.provider)
+    }
+
+    /// Normalizes every known list shape:
+    ///   Anthropic / OpenAI / Grok / OpenRouter  ->  { "data": [ { "id": … } ] }
+    ///   Gemini                                  ->  { "models": [ { "name": "models/…" } ] }
+    ///   Ollama (native)                         ->  { "models": [ { "name": … } ] }
+    static func parse(_ data: Data, provider: AIProvider) -> [String] {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [] }
+        let rows = (root["data"] as? [[String: Any]]) ?? (root["models"] as? [[String: Any]]) ?? []
+        var out: [String] = []
+        var seen = Set<String>()
+        for row in rows {
+            guard var id = (row["id"] ?? row["name"] ?? row["model"]) as? String else { continue }
+            // Gemini reports "models/gemini-…"; the request path adds the
+            // prefix back itself.
+            if provider == .gemini, id.hasPrefix("models/") { id.removeFirst("models/".count) }
+            // Gemini lists embedding and other non-chat models too.
+            if provider == .gemini {
+                let methods = (row["supportedGenerationMethods"] as? [String]) ?? []
+                if !methods.isEmpty, !methods.contains("generateContent") { continue }
+            }
+            let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
+            seen.insert(trimmed)
+            out.append(trimmed)
+        }
+        // Anthropic and OpenRouter already return newest-first, which is the
+        // order a user wants to pick from; local tags come back arbitrary.
+        return provider == .local ? out.sorted() : out
     }
 }
 
@@ -502,12 +666,12 @@ enum KeychainStore {
                 }
                 return "Connected (Ollama)"
             }
-            if settings.provider == .gemini { return await healthCheck(settings: settings) }
-            if settings.provider != .anthropic {
-                return await healthCheck(settings: settings)
-            }
-            _ = try await request(prompt: "Reply with the single word OK.", settings: settings, maxTokens: 1024)
-            return "Connected"
+            // Every remaining provider has a models endpoint, so the check
+            // is a free GET. It used to send a real Anthropic completion,
+            // which costs tokens — and with adaptive thinking on, a small
+            // allowance can be spent entirely on reasoning and come back with
+            // no text, reporting a working key as broken.
+            return await healthCheck(settings: settings)
         } catch { return error.localizedDescription }
     }
 
@@ -536,10 +700,16 @@ enum KeychainStore {
         request.httpMethod = "GET"
         request.timeoutInterval = 12
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if settings.provider == .gemini {
+        switch settings.provider.wireFormat {
+        case .geminiGenerateContent:
             request.setValue(settings.apiKey, forHTTPHeaderField: "x-goog-api-key")
-        } else if !settings.apiKey.isEmpty {
-            request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+        case .anthropicMessages:
+            request.setValue(settings.apiKey, forHTTPHeaderField: "x-api-key")
+            request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        case .openAIChat:
+            if !settings.apiKey.isEmpty {
+                request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+            }
         }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -551,7 +721,22 @@ enum KeychainStore {
             return "Connected (API key accepted)"
         } catch { return error.localizedDescription }
     }
-    private static func request(prompt: String, settings: AISettings, maxTokens: Int = 2600) async throws -> String {
+    /// Output ceiling for one diagram pass. A diagram spec is small, but on
+    /// Claude the ceiling has to cover thinking tokens as well as the JSON —
+    /// at the old 2600 an adaptive-thinking model could spend the whole
+    /// allowance reasoning and return nothing.
+    static let maxOutputTokens = 12000
+
+    /// How hard Claude works per pass. `medium` is the default on
+    /// claude-opus-5-5; the harness raises it for the final polish pass.
+    static let defaultEffort = "medium"
+
+    private static func request(
+        prompt: String,
+        settings: AISettings,
+        maxTokens: Int = maxOutputTokens,
+        effort: String = defaultEffort
+    ) async throws -> String {
         let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let urlString: String
         var body: [String: Any]
@@ -569,7 +754,18 @@ enum KeychainStore {
         } else if settings.provider == .anthropic {
             urlString = endpoint + "/messages"
             headers["x-api-key"] = settings.apiKey; headers["anthropic-version"] = "2023-06-01"
-            body = ["model": settings.model, "max_tokens": maxTokens, "system": systemPrompt, "messages": [["role": "user", "content": prompt]]]
+            // Adaptive thinking + effort is the current way to control how
+            // much reasoning Claude spends; `budget_tokens` is rejected on
+            // claude-opus-5-5 and the rest of the 5 family, and so is
+            // `temperature` (which is why this branch sets neither).
+            body = [
+                "model": settings.model,
+                "max_tokens": maxTokens,
+                "system": systemPrompt,
+                "thinking": ["type": "adaptive"],
+                "output_config": ["effort": effort],
+                "messages": [["role": "user", "content": prompt]],
+            ]
         } else {
             urlString = endpoint + "/chat/completions"
             if !settings.apiKey.isEmpty { headers["Authorization"] = "Bearer \(settings.apiKey)" }
@@ -595,7 +791,30 @@ enum KeychainStore {
             let text = values.compactMap { $0["text"] as? String }.joined()
             if !text.isEmpty { return text }
         }
-        if settings.provider == .anthropic, let blocks = json?["content"] as? [[String: Any]], let text = blocks.first?["text"] as? String { return text }
+        if settings.provider == .anthropic {
+            // A refusal is an HTTP 200 with no usable content — check it
+            // before reading the blocks.
+            if (json?["stop_reason"] as? String) == "refusal" {
+                let details = json?["stop_details"] as? [String: Any]
+                let category = details?["category"] as? String ?? "unspecified"
+                throw NSError(domain: "MacdrawAI", code: 9, userInfo: [NSLocalizedDescriptionKey:
+                    "Claude declined this request (\(category)). Rephrase the diagram description and try again."])
+            }
+            if let blocks = json?["content"] as? [[String: Any]] {
+                // With thinking on, content[0] is a thinking block and
+                // carries no "text" — reading only the first block made every
+                // response look like "no chat text". Join every text block.
+                let text = blocks
+                    .filter { ($0["type"] as? String) == "text" }
+                    .compactMap { $0["text"] as? String }
+                    .joined()
+                if !text.isEmpty { return text }
+                if (json?["stop_reason"] as? String) == "max_tokens" {
+                    throw NSError(domain: "MacdrawAI", code: 10, userInfo: [NSLocalizedDescriptionKey:
+                        "Claude used the whole output allowance on reasoning. Lower the effort or raise max tokens."])
+                }
+            }
+        }
         if let choices = json?["choices"] as? [[String: Any]], let message = choices.first?["message"] as? [String: Any], let text = message["content"] as? String { return text }
         throw NSError(domain: "MacdrawAI", code: 6, userInfo: [NSLocalizedDescriptionKey: "Provider did not return chat text."])
     }
@@ -636,7 +855,9 @@ struct AIDiagramDrawer: View {
     @State private var isGenerating = false
     @State private var generatingStatus = ""
     @State private var error = ""
-    @State private var settingsOpen = false
+    /// Opens with the settings panel expanded under `--ai`, so the provider
+    /// and model controls can be screenshotted without a click.
+    @State private var settingsOpen = CommandLine.arguments.contains("--ai")
     @State private var messages: [AIChatMessage] = []
     var body: some View {
         VStack(spacing: 0) {
@@ -677,21 +898,31 @@ struct AIDiagramDrawer: View {
 
 private struct AISettingsView: View {
     @ObservedObject var settings: AISettings
+    @StateObject private var catalog = AIModelCatalog()
     @State private var testing = false
+    @State private var typingModel = false
     @State private var installing = false
     @State private var setupStatus = ""
     @State private var setupNeedsHelp = false
     @State private var downloadFraction: Double?
     var body: some View { VStack(alignment: .leading, spacing: 8) {
-        Picker("Provider", selection: $settings.provider) { ForEach(AIProvider.allCases) { Text($0.rawValue).tag($0) } }.onChange(of: settings.provider) { _, _ in settings.useProviderDefaults() }
+        Picker("Provider", selection: $settings.provider) { ForEach(AIProvider.allCases) { Text($0.rawValue).tag($0) } }
+            .onChange(of: settings.provider) { _, _ in
+                settings.useProviderDefaults()
+                catalog.reset()
+                Task { await catalog.load(settings: settings) }
+            }
         TextField("Endpoint", text: $settings.endpoint).textFieldStyle(.roundedBorder)
-        TextField("Model", text: $settings.model).textFieldStyle(.roundedBorder)
+        modelPicker
         if settings.provider != .local {
             HStack(spacing: 6) {
                 SecureField(settings.provider == .gemini ? "Gemini API key (stored in Keychain)" : "API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder)
                 Button { pasteAPIKey() } label: { Image(systemName: "doc.on.clipboard") }.help("Paste API key from clipboard")
             }
-            if settings.provider == .gemini { Text("Create a key in Google AI Studio, then paste it here.").font(.system(size: 10)).foregroundStyle(.secondary) }
+            if let keyURL = settings.provider.keyHelpURL, let url = URL(string: keyURL) {
+                Link("Get an API key for \(settings.provider.rawValue)", destination: url)
+                    .font(.system(size: 10))
+            }
         }
         if settings.provider == .local {
             HStack(spacing: 8) {
@@ -718,11 +949,57 @@ private struct AISettingsView: View {
             Text(settings.testStatus).font(.system(size: 11)).foregroundStyle(settings.testStatus.hasPrefix("Connected") ? .green : .secondary)
         }
         if settings.provider == .local { Text("If automatic setup cannot finish, install Ollama from ollama.com/download/mac and click the setup button again.").font(.system(size: 10)).foregroundStyle(.secondary) }
-    }.padding(14).background(Color.primary.opacity(0.05)) }
+    }
+    .padding(14)
+    .background(Color.primary.opacity(0.05))
+    .task { await catalog.load(settings: settings) } }
+
+    /// Model chooser. Lists what the provider says the key can reach, with a
+    /// refresh, and falls back to free text when the list can't be fetched (an
+    /// unreachable custom endpoint, a key without list permission) so the
+    /// field is never a dead end.
+    @ViewBuilder
+    private var modelPicker: some View {
+        HStack(spacing: 6) {
+            if typingModel || (catalog.models.isEmpty && !catalog.loading) {
+                TextField("Model", text: $settings.model).textFieldStyle(.roundedBorder)
+            } else {
+                Picker("Model", selection: $settings.model) {
+                    // The saved model may not be in the fetched list (a
+                    // preview id, or a list that came back filtered) — keep it
+                    // selectable rather than silently switching the user's
+                    // model.
+                    if !settings.model.isEmpty, !catalog.models.contains(settings.model) {
+                        Text(settings.model).tag(settings.model)
+                    }
+                    ForEach(catalog.models, id: \.self) { Text($0).tag($0) }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if catalog.loading {
+                ProgressView().controlSize(.small)
+            } else {
+                Button {
+                    Task { await catalog.load(settings: settings, force: true) }
+                } label: { Image(systemName: "arrow.clockwise") }
+                    .help("Refresh the model list from \(settings.provider.rawValue)")
+            }
+            Button {
+                typingModel.toggle()
+            } label: { Image(systemName: typingModel ? "list.bullet" : "character.cursor.ibeam") }
+                .help(typingModel ? "Choose from the provider's list" : "Type a model id by hand")
+        }
+        if let error = catalog.error, !typingModel {
+            Text(error).font(.system(size: 10)).foregroundStyle(.orange)
+        }
+    }
 
     private func pasteAPIKey() {
         guard let value = NSPasteboard.general.string(forType: .string) else { return }
         settings.apiKey = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A key is usually the thing that was blocking the list.
+        Task { await catalog.load(settings: settings, force: true) }
     }
 
     private func openOllamaDownloadPage() {

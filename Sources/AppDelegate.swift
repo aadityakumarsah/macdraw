@@ -76,6 +76,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--show") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                 self?.island.toggle()
+                if CommandLine.arguments.contains("--ai") {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                        self?.island.selftestOpenAIDrawer()
+                    }
+                }
                 if CommandLine.arguments.contains("--sample") {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
                         self?.activeCanvas?.selftestInsertSampleScene()
