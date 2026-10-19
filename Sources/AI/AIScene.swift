@@ -202,6 +202,7 @@ enum SceneVocabulary {
         guard let raw else { return nil }
         switch normalize(raw) {
         case "round", "rounded", "soft": return .round
+        case "squircle", "smooth", "continuous": return .squircle
         case "sharp", "square", "hard": return .sharp
         default: return nil
         }

@@ -140,6 +140,7 @@ struct PersistedAnnotation: Codable {
     var fillStyle: String?
     var tableColumns: Int?
     var tableHasHeader: Bool?
+    var cornerSmoothing: CGFloat?
 }
 
 private func colorComponents(_ c: NSColor) -> [CGFloat] {
@@ -219,7 +220,8 @@ private extension Annotation {
             imageFileID: fileID,
             fillStyle: fillStyle.rawValue,
             tableColumns: tableColumns == 0 ? nil : tableColumns,
-            tableHasHeader: tableHasHeader ? true : nil
+            tableHasHeader: tableHasHeader ? true : nil,
+            cornerSmoothing: cornerSmoothing == 0 ? nil : cornerSmoothing
         )
     }
 
@@ -289,6 +291,7 @@ private extension Annotation {
             id: p.id ?? UUID().uuidString,
             imageFileID: fileID,
             fillStyle: FillStyle(rawValue: p.fillStyle ?? "") ?? .solid,
+            cornerSmoothing: p.cornerSmoothing ?? 0,
             tableColumns: p.tableColumns ?? 0,
             tableHasHeader: p.tableHasHeader ?? false
         )
@@ -849,15 +852,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 $0.edgeRoughness = sloppiness.edgeRoughness
             }
         }.store(in: &cancellables)
-        state.$edgeStyle.dropFirst().sink { [weak self] edges in
-            guard let self else { return }
-            let radius = edges == .round ? max(self.state.cornerRadius, 1) : 0
-            let radiusY = edges == .round ? max(self.state.cornerRadiusY, 1) : 0
-            self.applyToSelection(where: { $0.kind == .rect || $0.kind == .frame }) {
-                $0.rx = radius
-                $0.ry = radiusY
-            }
-        }.store(in: &cancellables)
+        Publishers.CombineLatest(state.$edgeStyle, state.$cornerRadiusAmount)
+            .dropFirst()
+            .sink { [weak self] edges, amount in
+                guard let self else { return }
+                let radius = edges == .sharp ? 0 : max(amount, 1)
+                self.applyToSelection(where: { $0.kind == .rect || $0.kind == .frame }) {
+                    $0.rx = radius
+                    $0.ry = radius
+                    $0.cornerSmoothing = edges.cornerSmoothing
+                }
+            }.store(in: &cancellables)
         state.$elementOpacity.dropFirst().sink { [weak self] opacity in
             self?.applyToSelection { $0.opacity = opacity }
         }.store(in: &cancellables)
@@ -1284,10 +1289,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 arrowEnd: state.tool == .line ? .none : state.arrowEnd,
                 sloppiness: state.sloppiness.roughness,
                 edgeRoughness: state.sloppiness.edgeRoughness,
-                rx: state.edgeStyle == .round ? state.cornerRadius : 0,
-                ry: state.edgeStyle == .round ? state.cornerRadiusY : 0,
+                rx: state.edgeStyle == .sharp ? 0 : state.cornerRadiusAmount,
+                ry: state.edgeStyle == .sharp ? 0 : state.cornerRadiusAmount,
                 dynamicWidth: state.pressureMode == .dynamic,
-                fillStyle: state.fillStyle
+                fillStyle: state.fillStyle,
+                cornerSmoothing: state.edgeStyle.cornerSmoothing
             )
             // Straight arrows are predictable by default. The explicit
             // Bending arrow tool is reserved for box-avoiding diagram links.
@@ -2375,6 +2381,27 @@ final class CanvasView: NSView, NSTextViewDelegate {
         | Interview | Hiring manager | 5 |
         | Offer | Finance | 3 |
         """
+        // Corner treatments side by side: sharp, circular arc, superellipse.
+        for (i, style) in EdgeStyle.allCases.enumerated() {
+            var corner = Annotation(
+                kind: .rect,
+                rect: CGRect(x: 820 + CGFloat(i) * 190, y: 650, width: 160, height: 120),
+                strokeColor: Palette.violet[4],
+                fillColor: Palette.violet[1],
+                fillOpacity: 1,
+                strokeWidth: 2,
+                points: [],
+                createdAt: Date(timeIntervalSince1970: Double(5000 + i)),
+                zIndex: nextZIndex(),
+                sloppiness: 0,
+                rx: style == .sharp ? 0 : 28,
+                ry: style == .sharp ? 0 : 28,
+                cornerSmoothing: style.cornerSmoothing
+            )
+            corner.fillStyle = .solid
+            annotations.append(corner)
+        }
+
         if let parsed = TableImport.fromText(markdown), var table = tableAnnotation(from: parsed) {
             table.rect.origin = CGPoint(x: 160, y: 650)
             table.createdAt = Date(timeIntervalSince1970: 4000)
@@ -5488,6 +5515,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let seed = roughSeed(for: a)
         switch a.kind {
         case .rect:
+            // Smooth corners are a precise construction; the rough builders
+            // would wobble them back into an ordinary arc, so they win.
+            if a.cornerSmoothing > 0, a.rx > 0.5 {
+                return superellipseRect(r, radius: a.rx, smoothing: a.cornerSmoothing)
+            }
             if rough {
                 return roughRoundedRect(r, rx: a.rx, ry: a.ry, slop: slop, edge: edge, seed: seed)
             }
@@ -6124,6 +6156,64 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     // MARK: - rough (hand-drawn) path generators
+
+    /// A rectangle whose corners are superellipse arcs rather than circular
+    /// ones — the corner eases into the straight edge instead of meeting it at
+    /// a tangent, which is what makes an app icon or a Figma shape with corner
+    /// smoothing look softer than a plain rounded rect at the same radius.
+    ///
+    /// Each corner is the quarter superellipse `x = r·cos(t)^(2/n)`,
+    /// `y = r·sin(t)^(2/n)`; `n == 2` is exactly a circle, and higher `n`
+    /// pushes the curve outwards towards the corner.
+    private func superellipseRect(_ r: CGRect, radius: CGFloat, smoothing: CGFloat) -> NSBezierPath {
+        let limit = min(r.width, r.height) / 2
+        let radius = min(max(radius, 0), limit)
+        guard radius > 0.5 else { return NSBezierPath(rect: r) }
+        // smoothing 0 -> n = 2 (exactly a circle); 1 -> n = 4 (a squircle).
+        let n = 2 + 2 * min(max(smoothing, 0), 1.5)
+        let power = 2 / n
+        let samples = 12
+
+        // Each corner is written out with its own start and end so the
+        // traversal direction is explicit. Deriving them from one shared
+        // table is what produced a spur on the first corner and a notch on
+        // the third.
+        func corner(
+            centerX: CGFloat, centerY: CGFloat,
+            dx: CGFloat, dy: CGFloat, swapped: Bool
+        ) -> [CGPoint] {
+            (0...samples).map { step in
+                let t = CGFloat(step) / CGFloat(samples) * (.pi / 2)
+                let a = pow(cos(t), power) * radius
+                let b = pow(sin(t), power) * radius
+                return swapped
+                    ? CGPoint(x: centerX + dx * b, y: centerY + dy * a)
+                    : CGPoint(x: centerX + dx * a, y: centerY + dy * b)
+            }
+        }
+
+        let path = NSBezierPath()
+        // Clockwise in this flipped space (minY is the visual top).
+        path.move(to: CGPoint(x: r.minX + radius, y: r.minY))
+        path.line(to: CGPoint(x: r.maxX - radius, y: r.minY))
+        // top-right: from the top edge round to the right edge
+        for p in corner(centerX: r.maxX - radius, centerY: r.minY + radius,
+                        dx: 1, dy: -1, swapped: true) { path.line(to: p) }
+        path.line(to: CGPoint(x: r.maxX, y: r.maxY - radius))
+        // bottom-right: right edge round to the bottom edge
+        for p in corner(centerX: r.maxX - radius, centerY: r.maxY - radius,
+                        dx: 1, dy: 1, swapped: false) { path.line(to: p) }
+        path.line(to: CGPoint(x: r.minX + radius, y: r.maxY))
+        // bottom-left: bottom edge round to the left edge
+        for p in corner(centerX: r.minX + radius, centerY: r.maxY - radius,
+                        dx: -1, dy: 1, swapped: true) { path.line(to: p) }
+        path.line(to: CGPoint(x: r.minX, y: r.minY + radius))
+        // top-left: left edge round to the top edge
+        for p in corner(centerX: r.minX + radius, centerY: r.minY + radius,
+                        dx: -1, dy: -1, swapped: false) { path.line(to: p) }
+        path.close()
+        return path
+    }
 
     /// How far a hand-drawn line strays from its ideal path.
     ///

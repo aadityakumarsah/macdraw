@@ -127,8 +127,27 @@ enum Sloppiness: String, CaseIterable, Codable {
 enum EdgeStyle: String, CaseIterable, Codable {
     case sharp
     case round
+    /// Continuous curvature — the corner eases into the edge instead of
+    /// meeting it at a tangent, the way an app icon or a Figma shape with
+    /// corner smoothing does. Geometrically a superellipse, not an arc.
+    case squircle
 
-    var label: String { self == .sharp ? "Sharp" : "Round" }
+    var label: String {
+        switch self {
+        case .sharp: return "Sharp"
+        case .round: return "Round"
+        case .squircle: return "Smooth"
+        }
+    }
+
+    /// How far the corner departs from a circular arc. 0 is an arc; higher
+    /// exponents push the curve outwards into a squircle.
+    var cornerSmoothing: CGFloat {
+        switch self {
+        case .sharp, .round: return 0
+        case .squircle: return 1
+        }
+    }
 }
 
 enum ArrowheadStyle: String, CaseIterable, Codable {
@@ -501,6 +520,10 @@ struct Annotation {
     /// How the interior is painted (hachure / cross-hatch / zigzag / solid).
     var fillStyle: FillStyle = .solid
 
+    /// 0 draws a circular corner arc; above 0 the corner becomes a
+    /// superellipse, easing into the edge instead of meeting it at a tangent.
+    var cornerSmoothing: CGFloat = 0
+
     /// Column count of a `.table`. Cells live in `nodeTexts`, row-major, so
     /// the row count is `nodeTexts.count / tableColumns`.
     var tableColumns: Int = 0
@@ -582,6 +605,9 @@ final class CanvasState: ObservableObject {
     @Published var sloppiness: Sloppiness = .artist
     /// Corner treatment of new rectangular shapes (Excalidraw's Edges).
     @Published var edgeStyle: EdgeStyle = .round
+    /// Corner radius of new rectangular shapes, in points. Driven by the
+    /// Edges slider; `edgeStyle == .sharp` overrides it to 0.
+    @Published var cornerRadiusAmount: CGFloat = 12
     @Published var elementOpacity: CGFloat = 1
     @Published var arrowStart: ArrowheadStyle = .none
     @Published var arrowEnd: ArrowheadStyle = .arrow

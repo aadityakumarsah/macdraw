@@ -398,10 +398,18 @@ struct ShapePropertiesPopover: View {
                         chip(selected: state.edgeStyle == value, help: "\(value.label) corners") {
                             state.edgeStyle = value
                         } label: {
-                            RoundedRectangle(cornerRadius: value == .round ? 6 : 0, style: .continuous)
-                                .stroke(Color.primary.opacity(0.85), lineWidth: 1.6)
-                                .frame(width: 18, height: 14)
+                            CornerPreview(style: value)
                         }
+                    }
+                    if state.edgeStyle != .sharp {
+                        Slider(value: $state.cornerRadiusAmount, in: 1...64, step: 1)
+                            .frame(width: 74)
+                            .help("Corner radius")
+                        Text("\(Int(state.cornerRadiusAmount))")
+                            .font(.system(size: 10, weight: .semibold))
+                            .monospacedDigit()
+                            .frame(width: 20)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -571,6 +579,53 @@ struct FillStylePreview: View {
             toRight.toggle()
         }
         return path
+    }
+}
+
+/// Miniature of a corner treatment: square, a circular arc, or the
+/// superellipse the Smooth option draws.
+struct CornerPreview: View {
+    let style: EdgeStyle
+
+    var body: some View {
+        Canvas { context, size in
+            let rect = CGRect(origin: .zero, size: size).insetBy(dx: 1.5, dy: 1.5)
+            var path = Path()
+            switch style {
+            case .sharp:
+                path = Path(rect)
+            case .round:
+                path = Path(roundedRect: rect, cornerRadius: 5)
+            case .squircle:
+                // Same construction as the canvas, including the explicit
+                // per-corner start and end — deriving them from one shared
+                // table is what put a spur on the first corner.
+                let r: CGFloat = 7
+                let power: CGFloat = 0.5
+                func corner(_ cx: CGFloat, _ cy: CGFloat, _ dx: CGFloat, _ dy: CGFloat, _ swapped: Bool) -> [CGPoint] {
+                    (0...8).map { step in
+                        let t = CGFloat(step) / 8 * (.pi / 2)
+                        let a = pow(cos(t), power) * r
+                        let b = pow(sin(t), power) * r
+                        return swapped
+                            ? CGPoint(x: cx + dx * b, y: cy + dy * a)
+                            : CGPoint(x: cx + dx * a, y: cy + dy * b)
+                    }
+                }
+                path.move(to: CGPoint(x: rect.minX + r, y: rect.minY))
+                path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.minY))
+                for p in corner(rect.maxX - r, rect.minY + r, 1, -1, true) { path.addLine(to: p) }
+                path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - r))
+                for p in corner(rect.maxX - r, rect.maxY - r, 1, 1, false) { path.addLine(to: p) }
+                path.addLine(to: CGPoint(x: rect.minX + r, y: rect.maxY))
+                for p in corner(rect.minX + r, rect.maxY - r, -1, 1, true) { path.addLine(to: p) }
+                path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
+                for p in corner(rect.minX + r, rect.minY + r, -1, -1, false) { path.addLine(to: p) }
+                path.closeSubpath()
+            }
+            context.stroke(path, with: .color(.primary.opacity(0.85)), lineWidth: 1.6)
+        }
+        .frame(width: 20, height: 16)
     }
 }
 
