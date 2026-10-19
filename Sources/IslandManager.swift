@@ -149,8 +149,41 @@ private func toggleSidebar() {
         }
     }
 
+    /// Builds the AI drawer the first time it is opened.
+    ///
+    /// It used to be constructed on every overlay open and parked off-screen
+    /// at x: -406 — a 390x520 SwiftUI tree with a text editor, a segmented
+    /// control and the provider settings, inflated in full before the user
+    /// had asked for any of it. That delayed every open, and the drawer is
+    /// hidden the vast majority of the time.
+    @discardableResult
+    private func makeAIDrawer() -> NSView? {
+        guard let container = contentView() as? ContainerView, let canvas else { return nil }
+        let aiDrawer = NSHostingView(
+            rootView: AIDiagramDrawer(settings: aiSettings, onInsert: { [weak self] generated in
+                guard let self, let canvas = self.canvas else { return }
+                // The click is inside the drawer, so mouse location would put
+                // the result beneath the drawer. Use the visible canvas
+                // center as a stable insertion target instead.
+                let p = CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
+                switch generated {
+                case .diagram(let diagram): canvas.insertAIDiagram(diagram, at: p)
+                case .scene(let scene): canvas.insertAIScene(scene, at: p)
+                }
+                self.toggleAIDrawer()
+            }, onClose: { [weak self] in self?.toggleAIDrawer() })
+        )
+        aiDrawer.frame = CGRect(x: -406, y: 120, width: 390, height: 520)
+        aiDrawer.appearance = ThemeManager.shared.theme.appearance
+        container.addSubview(aiDrawer)
+        aiHost = aiDrawer
+        container.aiHost = aiDrawer
+
+        return aiDrawer
+    }
+
     private func toggleAIDrawer() {
-        guard let drawer = aiHost else { return }
+        guard let drawer = aiHost ?? makeAIDrawer() else { return }
         let showing = drawer.frame.origin.x >= 0
         var frame = drawer.frame
         frame.origin.x = showing ? -frame.width - 16 : 16
@@ -460,26 +493,6 @@ private func toggleSidebar() {
         container.addSubview(sidebar)
         sidebarHost = sidebar
         container.sidebarHost = sidebar
-
-        let aiDrawer = NSHostingView(
-            rootView: AIDiagramDrawer(settings: aiSettings, onInsert: { [weak self, weak canvas] generated in
-                guard let self, let canvas else { return }
-                // The click is inside the drawer, so mouse location would put
-                // the result beneath the drawer. Use the visible canvas
-                // center as a stable insertion target instead.
-                let p = CGPoint(x: canvas.bounds.midX, y: canvas.bounds.midY)
-                switch generated {
-                case .diagram(let diagram): canvas.insertAIDiagram(diagram, at: p)
-                case .scene(let scene): canvas.insertAIScene(scene, at: p)
-                }
-                self.toggleAIDrawer()
-            }, onClose: { [weak self] in self?.toggleAIDrawer() })
-        )
-        aiDrawer.frame = CGRect(x: -406, y: 120, width: 390, height: 520)
-        aiDrawer.appearance = ThemeManager.shared.theme.appearance
-        container.addSubview(aiDrawer)
-        aiHost = aiDrawer
-        container.aiHost = aiDrawer
 
         let toolbar = NSHostingView(
             rootView: ToolbarView(
