@@ -1130,6 +1130,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         let p = convert(event.locationInWindow, from: nil)
         lastCanvasCursor = p
+        if state.pickingColor {
+            pickColor(atViewPoint: p)
+            return
+        }
         // Holding space turns any tool into a temporary pan (Figma-style).
         if spaceHeld, !isEditingText {
             NSCursor.closedHand.set()
@@ -1624,6 +1628,171 @@ final class CanvasView: NSView, NSTextViewDelegate {
         interactionChanged = false
         startBindingIsProvisional = false
         if hadWork { needsDisplay = true }
+    }
+
+    // MARK: - eyedropper
+
+    /// Samples the colour under a click and makes it the stroke colour (or
+    /// the fill, with ⌥ held).
+    ///
+    /// Prefers the pixel from the app *underneath* the overlay, which is the
+    /// point of an eyedropper in an annotation tool. Where that is not
+    /// available — macOS 13, or Screen Recording not granted — it falls back
+    /// to the colour of macdraw's own element under the cursor, so the button
+    /// always does something.
+    private func pickColor(atViewPoint point: CGPoint) {
+        let toFill = NSEvent.modifierFlags.contains(.option)
+        let screenPoint = window?.convertPoint(toScreen: point) ?? point
+
+        func apply(_ color: NSColor) {
+            if toFill {
+                state.fillColor = color
+                state.fillEnabled = true
+            } else {
+                state.strokeColor = color
+            }
+            state.pickingColor = false
+            needsDisplay = true
+            Haptics.impact()
+        }
+
+        if #available(macOS 14.0, *), ScreenColor.isAuthorized {
+            let number = window?.windowNumber ?? 0
+            Task { @MainActor in
+                if let sampled = await ScreenColor.color(atCocoaPoint: screenPoint, excludingWindow: number) {
+                    apply(sampled)
+                } else if let own = colorOfElement(atViewPoint: point) {
+                    apply(own)
+                } else {
+                    state.pickingColor = false
+                }
+            }
+            return
+        }
+        if let own = colorOfElement(atViewPoint: point) {
+            apply(own)
+        } else {
+            state.pickingColor = false
+        }
+    }
+
+    /// Stroke colour of whichever element is under a view point, used as the
+    /// eyedropper's fallback.
+    private func colorOfElement(atViewPoint point: CGPoint) -> NSColor? {
+        guard let index = hitIndex(screenToWorld(point)) else { return nil }
+        let element = annotations[index]
+        // A filled shape's fill is the colour the user is pointing at.
+        if let fill = element.fillColor, shouldFill(element) { return fill }
+        return element.strokeColor
+    }
+
+    // MARK: - align & distribute
+
+    /// Which edge or axis a multi-selection lines up on.
+    enum AlignEdge: String, CaseIterable {
+        case left, centerHorizontally, right, top, centerVertically, bottom
+
+        var label: String {
+            switch self {
+            case .left: return "Align left"
+            case .centerHorizontally: return "Align centres"
+            case .right: return "Align right"
+            case .top: return "Align top"
+            case .centerVertically: return "Align middles"
+            case .bottom: return "Align bottom"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .left: return "align.horizontal.left"
+            case .centerHorizontally: return "align.horizontal.center"
+            case .right: return "align.horizontal.right"
+            case .top: return "align.vertical.top"
+            case .centerVertically: return "align.vertical.center"
+            case .bottom: return "align.vertical.bottom"
+            }
+        }
+    }
+
+    /// Moves an element and everything that defines its geometry. Lines,
+    /// arrows and freehand strokes keep their shape in `points`, so moving
+    /// only the rect would leave the drawing behind.
+    private func translate(_ index: Int, by delta: CGPoint) {
+        guard annotations.indices.contains(index), delta != .zero else { return }
+        annotations[index].rect.origin = annotations[index].rect.origin + delta
+        if !annotations[index].points.isEmpty {
+            annotations[index].points = annotations[index].points.map { $0 + delta }
+        }
+    }
+
+    /// Indices eligible for a layout operation: the selection, minus locked
+    /// elements and transient laser strokes.
+    private func layoutTargets() -> [Int] {
+        selected
+            .filter { annotations.indices.contains($0) }
+            .filter { !annotations[$0].locked && annotations[$0].kind != .laser }
+            .sorted()
+    }
+
+    /// Lines the selection up on a shared edge or centre line.
+    func alignSelection(_ edge: AlignEdge) {
+        let targets = layoutTargets()
+        guard targets.count > 1 else { return }
+        let bounds = targets.reduce(CGRect.null) { $0.union(annotations[$1].rect) }
+        guard !bounds.isNull else { return }
+        pushUndo()
+        for index in targets {
+            let rect = annotations[index].rect
+            let delta: CGPoint
+            switch edge {
+            case .left: delta = CGPoint(x: bounds.minX - rect.minX, y: 0)
+            case .right: delta = CGPoint(x: bounds.maxX - rect.maxX, y: 0)
+            case .centerHorizontally: delta = CGPoint(x: bounds.midX - rect.midX, y: 0)
+            case .top: delta = CGPoint(x: 0, y: bounds.minY - rect.minY)
+            case .bottom: delta = CGPoint(x: 0, y: bounds.maxY - rect.maxY)
+            case .centerVertically: delta = CGPoint(x: 0, y: bounds.midY - rect.midY)
+            }
+            translate(index, by: delta)
+        }
+        refreshConnectorGeometry()
+        needsDisplay = true
+        Haptics.impact()
+    }
+
+    /// Spreads the selection so the gaps between elements are equal. The two
+    /// outermost stay put and everything between them is redistributed —
+    /// equal *gaps*, not equal centre spacing, so differently-sized elements
+    /// end up evenly separated rather than evenly centred.
+    func distributeSelection(horizontally: Bool) {
+        let targets = layoutTargets()
+        guard targets.count > 2 else { return }
+        let ordered = targets.sorted {
+            horizontally
+                ? annotations[$0].rect.minX < annotations[$1].rect.minX
+                : annotations[$0].rect.minY < annotations[$1].rect.minY
+        }
+        guard let first = ordered.first, let last = ordered.last else { return }
+        let span = horizontally
+            ? annotations[last].rect.maxX - annotations[first].rect.minX
+            : annotations[last].rect.maxY - annotations[first].rect.minY
+        let occupied = ordered.reduce(CGFloat(0)) {
+            $0 + (horizontally ? annotations[$1].rect.width : annotations[$1].rect.height)
+        }
+        let gap = (span - occupied) / CGFloat(ordered.count - 1)
+        pushUndo()
+        var cursor = horizontally ? annotations[first].rect.minX : annotations[first].rect.minY
+        for index in ordered {
+            let rect = annotations[index].rect
+            let delta = horizontally
+                ? CGPoint(x: cursor - rect.minX, y: 0)
+                : CGPoint(x: 0, y: cursor - rect.minY)
+            translate(index, by: delta)
+            cursor += (horizontally ? rect.width : rect.height) + gap
+        }
+        refreshConnectorGeometry()
+        needsDisplay = true
+        Haptics.impact()
     }
 
     func selectAll() {
@@ -2413,6 +2582,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
 
         selected = []
+        needsDisplay = true
+    }
+
+    /// Self-test hook: move one element, the way a drag would.
+    func selftestNudge(_ index: Int, by delta: CGPoint) {
+        translate(index, by: delta)
         needsDisplay = true
     }
 

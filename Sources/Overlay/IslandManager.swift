@@ -599,7 +599,10 @@ private func toggleSidebar() {
                 onDeletePage: { [weak self] id in self?.deletePage(id) },
                 onToggleSidebar: { [weak self] in self?.toggleSidebar() },
                 onToggleAI: { [weak self] in self?.toggleAIDrawer() },
-                onTogglePassthrough: { [weak self] in self?.togglePassthrough() }
+                onTogglePassthrough: { [weak self] in self?.togglePassthrough() },
+                onAlign: { [weak canvas] edge in canvas?.alignSelection(edge) },
+                onDistribute: { [weak canvas] horizontal in canvas?.distributeSelection(horizontally: horizontal) },
+                selectionCount: { [weak canvas] in canvas?.selected.count ?? 0 }
             )
         )
         toolbar.frame = CGRect(
@@ -1504,6 +1507,88 @@ private func toggleSidebar() {
                             exit(1)
                         }
                         log("mid-box dodge: connector cleared the box (maxY=\(pathPts.map(\.y).max() ?? 0))")
+
+                        log("align & distribute test: layout operations on a multi-selection")
+                        self.state.tool = .rectangle
+                        self.state.lastNonTextTool = .rectangle
+                        self.state.fillEnabled = false
+                        let layoutStart = canvas.annotations.count
+                        // Three boxes at staggered x and y, differing widths.
+                        let layoutBoxes: [(CGPoint, CGPoint)] = [
+                            (CGPoint(x: 2400, y: 200), CGPoint(x: 2480, y: 260)),
+                            (CGPoint(x: 2600, y: 300), CGPoint(x: 2760, y: 360)),
+                            (CGPoint(x: 2900, y: 240), CGPoint(x: 2980, y: 300)),
+                        ]
+                        for (tl, br) in layoutBoxes {
+                            canvas.mouseDown(with: self.mouseEvent(at: self.win(tl), type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: self.win(br), type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: self.win(br), type: .leftMouseUp))
+                        }
+                        let layoutIndices = Array(layoutStart..<canvas.annotations.count)
+                        if layoutIndices.count != 3 {
+                            log("FAIL: layout test needs 3 boxes, got \(layoutIndices.count)")
+                            exit(1)
+                        }
+                        self.state.tool = .selection
+                        canvas.selftestSelect(layoutIndices)
+
+                        canvas.alignSelection(.top)
+                        let tops = layoutIndices.map { canvas.annotations[$0].rect.minY }
+                        log("after align top: \(tops)")
+                        if let first = tops.first, tops.contains(where: { abs($0 - first) > 0.51 }) {
+                            log("FAIL: aligning top should give every element the same minY")
+                            exit(1)
+                        }
+
+                        canvas.alignSelection(.centerHorizontally)
+                        let centres = layoutIndices.map { canvas.annotations[$0].rect.midX }
+                        log("after align centres: \(centres)")
+                        if let first = centres.first, centres.contains(where: { abs($0 - first) > 0.51 }) {
+                            log("FAIL: aligning centres should give every element the same midX")
+                            exit(1)
+                        }
+
+                        // Spread them out again, then check the *gaps* match —
+                        // equal gaps, not equal centre spacing, which is what
+                        // differently-sized elements need.
+                        canvas.selftestSelect([layoutIndices[0]])
+                        canvas.alignSelection(.top)
+                        canvas.selftestSelect(layoutIndices)
+                        for (offset, index) in layoutIndices.enumerated() {
+                            canvas.selftestNudge(index, by: CGPoint(x: CGFloat(offset) * 230, y: 0))
+                        }
+                        // Capture the extremes before distributing: the
+                        // invariant is that distribute moves only what is
+                        // between them.
+                        let beforeSpread = layoutIndices.map { canvas.annotations[$0].rect }
+                        let leftmostBefore = beforeSpread.map(\.minX).min() ?? 0
+                        let rightmostBefore = beforeSpread.map(\.maxX).max() ?? 0
+                        canvas.distributeSelection(horizontally: true)
+                        let ordered = layoutIndices
+                            .map { canvas.annotations[$0].rect }
+                            .sorted { $0.minX < $1.minX }
+                        let gaps = (0..<(ordered.count - 1)).map { ordered[$0 + 1].minX - ordered[$0].maxX }
+                        log("after distribute: gaps \(gaps.map { Int($0.rounded()) })")
+                        if let first = gaps.first, gaps.contains(where: { abs($0 - first) > 1 }) {
+                            log("FAIL: distribute should equalize the gaps, got \(gaps)")
+                            exit(1)
+                        }
+                        // The outermost elements must not move.
+                        if abs(ordered.first!.minX - leftmostBefore) > 1 {
+                            log("FAIL: distribute moved the leftmost element: \(leftmostBefore) -> \(ordered.first!.minX)")
+                            exit(1)
+                        }
+                        if abs(ordered.last!.maxX - rightmostBefore) > 1 {
+                            log("FAIL: distribute moved the rightmost element: \(rightmostBefore) -> \(ordered.last!.maxX)")
+                            exit(1)
+                        }
+                        // Fewer than two selected is a no-op, not a crash.
+                        canvas.selftestSelect([layoutIndices[0]])
+                        canvas.alignSelection(.left)
+                        canvas.distributeSelection(horizontally: true)
+                        canvas.selftestSelect(layoutIndices)
+                        canvas.deleteSelected()
+                        log("align & distribute test: PASS")
 
                         log("table paste test: markdown, HTML and TSV tables become a grid")
                         let markdownTable = """

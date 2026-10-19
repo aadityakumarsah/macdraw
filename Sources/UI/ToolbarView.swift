@@ -32,6 +32,9 @@ struct ToolbarView: View {
     let onToggleSidebar: () -> Void
     let onToggleAI: () -> Void
     let onTogglePassthrough: () -> Void
+    let onAlign: (CanvasView.AlignEdge) -> Void
+    let onDistribute: (Bool) -> Void
+    let selectionCount: () -> Int
 
     @State private var showShortcuts = false
     @State private var showShapes = false
@@ -526,6 +529,9 @@ struct ToolbarView: View {
             arrowModePicker
             Divider().frame(height: 24)
             fontButton
+            Divider().frame(height: 24)
+            eyedropperButton
+            alignButton
             Spacer(minLength: 0)
             backgroundPicker
         }
@@ -751,6 +757,71 @@ struct ToolbarView: View {
             .buttonStyle(.plain)
             .help(state.zoomLocked ? "Zoom locked — click to enable zoom" : "Lock zoom")
         }
+    }
+
+    /// Samples a colour from the screen. The point of having this in an
+    /// overlay app is that it reads the pixel from whatever is *underneath*
+    /// macdraw, not just from your own drawing.
+    private var eyedropperButton: some View {
+        Button {
+            if ScreenColor.isSupported, !ScreenColor.isAuthorized {
+                ScreenColor.requestAuthorization()
+            }
+            state.pickingColor.toggle()
+        } label: {
+            Image(systemName: state.pickingColor ? "eyedropper.halffull" : "eyedropper")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(state.pickingColor ? .white : Color.primary)
+                .frame(width: 30, height: 26)
+                .background(
+                    state.pickingColor
+                        ? AnyShapeStyle(accentGradient)
+                        : AnyShapeStyle(Color.primary.opacity(0.08)),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(eyedropperHelp)
+    }
+
+    private var eyedropperHelp: String {
+        if !ScreenColor.isSupported {
+            return "Pick a colour from your drawing (sampling the app underneath needs macOS 14)"
+        }
+        if !ScreenColor.isAuthorized {
+            return "Pick a colour from the app underneath — needs Screen Recording permission"
+        }
+        return "Pick a colour from the app underneath. Hold ⌥ to set the fill instead."
+    }
+
+    /// Align and distribute, which macdraw had no equivalent of. Enabled once
+    /// more than one element is selected.
+    private var alignButton: some View {
+        let count = selectionCount()
+        return Menu {
+            Section("Align") {
+                ForEach(CanvasView.AlignEdge.allCases, id: \.self) { edge in
+                    Button(edge.label) { onAlign(edge) }
+                }
+            }
+            Section("Distribute") {
+                Button("Spread horizontally") { onDistribute(true) }
+                Button("Spread vertically") { onDistribute(false) }
+            }
+        } label: {
+            Image(systemName: "align.horizontal.left")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 30, height: 26)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(count < 2)
+        .help(count < 2
+            ? "Align and distribute — select two or more elements"
+            : "Align or evenly space \(count) selected elements")
     }
 
     /// Background mode — transparent, white, or black writing surface.

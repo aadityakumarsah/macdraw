@@ -631,6 +631,10 @@ final class CanvasState: ObservableObject {
     /// apps. When true, the canvas captures mouse events for drawing.
     @Published var drawingMode: Bool = false
 
+    /// True while the eyedropper is armed: the next canvas click samples a
+    /// colour instead of drawing. Cleared as soon as it picks.
+    @Published var pickingColor: Bool = false
+
     /// True while ⇧ is held: the overlay stops capturing input entirely, so
     /// clicks, scrolls and trackpad gestures reach whatever is underneath.
     /// Releasing ⇧ hands the canvas back.
