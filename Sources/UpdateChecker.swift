@@ -9,7 +9,7 @@ import Combine
 // 1.22.0 a freshly built app would immediately offer to "update" itself to the
 // older 1.25.0 download and replace this build. Reconcile the two before
 // cutting the next release.
-let appVersion = "1.26.2"
+let appVersion = "1.26.3"
 
 /// The GitHub repository the update check talks to. Releases should attach a
 /// `macdraw-v<version>.zip` (produced by build.sh) containing macdraw.app.

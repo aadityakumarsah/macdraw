@@ -265,59 +265,78 @@ private func toggleSidebar() {
         }
     }
 
-    // MARK: - hold-to-pass-through
+    // MARK: - pass-through
 
-    /// Polls the modifier keys while the overlay is up. Holding ⇧ hands all
-    /// input back to whatever is underneath; releasing it takes the canvas
-    /// back.
+    /// Hands input to whatever is underneath the overlay, latched from the
+    /// toolbar's Interact button.
     ///
-    /// This polls `NSEvent.modifierFlags` rather than installing a global
-    /// key monitor for two reasons: a global monitor needs Accessibility
-    /// permission, and — more importantly — once the user clicks through into
-    /// another app, macdraw is no longer frontmost, so a *local* monitor
-    /// would never see ⇧ come back up and the overlay would stay transparent
-    /// forever. The static flags property is readable regardless of which app
-    /// has focus and needs no permission.
+    /// It is a latch and not a held key on purpose. The first attempt used
+    /// ⇧, which broke typing outright: ⇧ is how you reach a capital or a
+    /// brace, so the canvas vanished every time the user wanted one. The
+    /// obvious replacement, Fn, turns out to be unusable the same way —
+    /// `NSEvent.modifierFlags` reports `.function` (and `.numericPad`) as set
+    /// when *nothing* is held, so polling it would leave the overlay
+    /// permanently transparent. Every remaining modifier either types a
+    /// character or is already bound. A latch has no such conflict, and the
+    /// toolbar keeps working while it is on so it can always be switched back.
     private var passthroughTimer: Timer?
     private var passthroughActive = false
+    private var passthroughLatched = false
+
+    /// Toolbar toggle.
+    func togglePassthrough() {
+        passthroughLatched.toggle()
+        evaluatePassthrough()
+    }
 
     private func startPassthroughWatch() {
         passthroughTimer?.invalidate()
         passthroughTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            guard self.isShowing, self.state.drawingMode, !self.isAnimating else {
-                if self.passthroughActive { self.setPassthrough(false) }
-                return
-            }
-            let flags = NSEvent.modifierFlags
-            // ⇧ *alone*. Requiring that keeps chords such as ⌘⇧F from
-            // flipping the overlay transparent mid-shortcut.
-            let held = flags.contains(.shift)
-                && !flags.contains(.command)
-                && !flags.contains(.option)
-                && !flags.contains(.control)
-            if held != self.passthroughActive { self.setPassthrough(held) }
+            self?.evaluatePassthrough()
         }
+    }
+
+    /// One decision about whether input belongs to the app underneath.
+    /// Separated from the timer so the self-test can drive it.
+    func evaluatePassthrough() {
+        guard isShowing, state.drawingMode, !isAnimating else {
+            if passthroughActive { setPassthrough(false) }
+            return
+        }
+        // Never steal input from a text box. Typing is exactly when a modifier
+        // gets held — ⇧ for a capital or a brace — and a field that loses its
+        // window mid-word was the bug this mechanism originally caused.
+        // Never take the canvas away from an open text box. Typing is
+        // exactly when modifiers get held, and a field that loses its window
+        // mid-word was the bug the ⇧ binding caused.
+        if canvas?.isEditingText == true || isEditingAField { return }
+        if passthroughLatched != passthroughActive { setPassthrough(passthroughLatched) }
     }
 
     private func stopPassthroughWatch() {
         passthroughTimer?.invalidate()
         passthroughTimer = nil
+        passthroughLatched = false
         if passthroughActive { setPassthrough(false) }
     }
 
     private func setPassthrough(_ on: Bool) {
         Diag.log("passthrough \(on ? "ON — input goes to the app underneath" : "OFF — canvas has input back")")
         passthroughActive = on
-        // The whole window stops accepting input, so clicks, scroll wheels and
-        // trackpad gestures all reach the app underneath untouched — there is
-        // no need to re-synthesize them.
-        window.ignoresMouseEvents = on
         state.passthroughActive = on
+        // Route the *canvas* away from input while leaving the toolbar live,
+        // rather than setting `ignoresMouseEvents` on the whole window — that
+        // made the Interact toggle itself unclickable, so a latched session
+        // could only be escaped by closing the overlay. The container's
+        // hit-testing already does exactly this when drawing mode is off, and
+        // that path is how the app has always let clicks reach other apps.
+        contentView()?.needsDisplay = true
         if on {
             // Commit any open text field first — it is floating above the app
             // the user is about to click into, and discarding it would throw
-            // away what they typed.
+            // away what they typed. (The watch will not engage while a field
+            // is open; this covers the latch being switched on from the
+            // toolbar.)
             canvas?.commitPendingText()
             // Drop any gesture in flight so releasing ⇧ doesn't resume a
             // stroke the user abandoned when they reached for another app.
@@ -579,7 +598,8 @@ private func toggleSidebar() {
                 },
                 onDeletePage: { [weak self] id in self?.deletePage(id) },
                 onToggleSidebar: { [weak self] in self?.toggleSidebar() },
-                onToggleAI: { [weak self] in self?.toggleAIDrawer() }
+                onToggleAI: { [weak self] in self?.toggleAIDrawer() },
+                onTogglePassthrough: { [weak self] in self?.togglePassthrough() }
             )
         )
         toolbar.frame = CGRect(
@@ -595,7 +615,13 @@ private func toggleSidebar() {
         container.addSubview(toolbar)
         toolbarHost = toolbar
         container.toolbarHost = toolbar
-        container.isDrawingMode = { [weak self] in self?.state.drawingMode ?? false }
+        // Pass-through counts as "not drawing" for hit-testing, which is what
+        // lets clicks and scrolls reach the app underneath while the toolbar
+        // stays clickable.
+        container.isDrawingMode = { [weak self] in
+            guard let self else { return false }
+            return self.state.drawingMode && !self.passthroughActive
+        }
 
         window.contentView = container
         startPassthroughWatch()
@@ -625,6 +651,9 @@ private func toggleSidebar() {
             guard let self, let canvas = self.canvas else { return event }
             guard event.window === self.window else { return event }
             guard self.state.drawingMode else { return event }
+            // While interacting with the app underneath, scrolling belongs to
+            // it, not to the canvas.
+            guard !self.passthroughActive else { return event }
             // Pinch zoom always belongs to the canvas, no matter where the
             // cursor is. The toolbar/sidebar scrollers have no use for it, and
             // swallowing it there is why two-finger zoom only "sometimes" works.
@@ -842,6 +871,20 @@ private func toggleSidebar() {
     /// Self-test hook: the watcher reads real modifier keys, which a scripted
     /// test cannot press, so the transition is driven directly.
     func selftestSetPassthrough(_ on: Bool) { setPassthrough(on) }
+
+    /// Self-test hook: latch pass-through the way the toolbar button does.
+    func selftestLatchPassthrough(_ on: Bool) {
+        passthroughLatched = on
+        evaluatePassthrough()
+    }
+
+    /// Self-test hook: whether a click in the middle of the canvas would be
+    /// delivered to the canvas, or fall through to the app underneath.
+    func selftestCanvasAcceptsClicks() -> Bool {
+        guard let container = contentView(), let canvas else { return false }
+        let middle = CGPoint(x: container.bounds.midX, y: container.bounds.midY)
+        return container.hitTest(middle) === canvas
+    }
 
     /// Dev hook (`--scene`): runs a fixture scene through the real harness
     /// path — repair, measure, insert — so the rendering can be checked
@@ -1807,29 +1850,55 @@ private func toggleSidebar() {
                         }
                         log("key detection test: PASS")
 
-                        log("pass-through test: holding shift releases the canvas")
-                        let beforeFlag = self.state.passthroughActive
-                        if beforeFlag {
+                        log("pass-through test: the canvas yields input without blocking the toolbar")
+                        if self.state.passthroughActive {
                             log("FAIL: pass-through should start off")
                             exit(1)
                         }
-                        // Drive the state transition directly: the watcher
-                        // reads real modifier keys, which a test cannot press.
+                        if !self.selftestCanvasAcceptsClicks() {
+                            log("FAIL: the canvas should take clicks while drawing")
+                            exit(1)
+                        }
+                        self.selftestLatchPassthrough(true)
+                        if !self.state.passthroughActive {
+                            log("FAIL: the toggle should latch pass-through on")
+                            exit(1)
+                        }
+                        if self.selftestCanvasAcceptsClicks() {
+                            log("FAIL: canvas clicks should fall through to the app underneath")
+                            exit(1)
+                        }
+                        // The toolbar has to stay clickable, or the toggle
+                        // that turns this off cannot be reached.
+                        if self.window.ignoresMouseEvents {
+                            log("FAIL: the window must still accept clicks so the toolbar works")
+                            exit(1)
+                        }
+                        self.selftestLatchPassthrough(false)
+                        if self.state.passthroughActive || !self.selftestCanvasAcceptsClicks() {
+                            log("FAIL: toggling off should hand the canvas back")
+                            exit(1)
+                        }
+
+                        // The regression that made typing impossible: a held
+                        // modifier must never take the canvas away while a
+                        // text box is open.
                         canvas.selftestBeginNewText(at: CGPoint(x: 400, y: 400))
-                        self.selftestSetPassthrough(true)
-                        if !self.state.passthroughActive || !self.window.ignoresMouseEvents {
-                            log("FAIL: pass-through should make the window ignore mouse events")
+                        canvas.selftestSetText("Shift{}")
+                        self.evaluatePassthrough()
+                        if self.state.passthroughActive {
+                            log("FAIL: pass-through must not engage while text is being edited")
                             exit(1)
                         }
-                        if canvas.isEditingText {
-                            log("FAIL: pass-through should abandon the in-flight text edit")
+                        if !canvas.isEditingText {
+                            log("FAIL: the text field should survive a pass-through evaluation")
                             exit(1)
                         }
-                        self.selftestSetPassthrough(false)
-                        if self.state.passthroughActive || self.window.ignoresMouseEvents {
-                            log("FAIL: releasing shift should hand the canvas back")
+                        if canvas.selftestEditingString() != "Shift{}" {
+                            log("FAIL: typed text should be intact, got \(canvas.selftestEditingString().debugDescription)")
                             exit(1)
                         }
+                        canvas.commitPendingText()
                         log("pass-through test: PASS")
 
                         log("model catalog test: every provider list shape normalizes to plain ids")

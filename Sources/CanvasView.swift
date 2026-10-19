@@ -1166,7 +1166,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                             annotations.indices.contains(s) ? (s, annotations[s]) : nil
                         })
                         beginTransformInteraction()
-                    } else if event.modifierFlags.contains(.command) {
+                    } else if event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.command) {
                         selected.insert(i)
                         movingOriginals = [i: annotations[i]]
                         beginTransformInteraction()
@@ -1177,7 +1177,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     }
                 } else {
                     // Clicking empty space starts a marquee (box) selection.
-                    if !event.modifierFlags.contains(.command) {
+                    if !event.modifierFlags.contains(.shift), !event.modifierFlags.contains(.command) {
                         selected = []
                     }
                     marqueeStart = adjustedP
@@ -1191,7 +1191,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                         annotations.indices.contains(s) ? (s, annotations[s]) : nil
                     })
                     beginTransformInteraction()
-                } else if event.modifierFlags.contains(.command) {
+                } else if event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.command) {
                     selected.insert(i)
                     movingOriginals = [i: annotations[i]]
                     beginTransformInteraction()
@@ -1202,7 +1202,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 }
             } else {
                 // Clicking empty space starts a marquee (box) selection.
-                if !event.modifierFlags.contains(.command) {
+                if !event.modifierFlags.contains(.shift), !event.modifierFlags.contains(.command) {
                     selected = []
                 }
                 marqueeStart = adjustedP
@@ -1437,13 +1437,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     let inBox = Set(annotations.indices.filter { i in
                         annotations[i].kind != .laser && annotations[i].rect.intersects(r)
                     })
-                    if event.modifierFlags.contains(.command) {
+                    if event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.command) {
                         selected.formUnion(inBox)
                     } else {
                         selected = inBox
                     }
                     needsDisplay = true
-                } else if !event.modifierFlags.contains(.command) {
+                } else if !event.modifierFlags.contains(.shift), !event.modifierFlags.contains(.command) {
                     selected = []
                     needsDisplay = true
                 }
@@ -2678,6 +2678,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if state.codeBlockMode {
             annotations[annotations.count - 1].fontFamily = "Cascadia Code"
             annotations[annotations.count - 1].fontSize = 15
+            // The rect was measured against the editing field's font, and the
+            // code font replaces it here — so without re-measuring, the block
+            // keeps a box sized for different text and draws a band of empty
+            // background around it. `drawCodeBlock` then insets by another
+            // 14pt on every side on top of that.
+            annotations[annotations.count - 1].rect = codeBlockRect(
+                for: str, origin: worldRect.origin, maxWidth: worldRect.width
+            )
         } else {
             annotations[annotations.count - 1].richTextData = rtfData(scaledRichText(tv.attributedString(), by: 1 / zoom))
         }
@@ -2696,6 +2704,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
         for idx in textIdx {
             annotations[idx].isCode.toggle()
             if annotations[idx].isCode {
+                defer {
+                    annotations[idx].rect = codeBlockRect(
+                        for: annotations[idx].text,
+                        origin: annotations[idx].rect.origin,
+                        maxWidth: max(annotations[idx].rect.width, 320)
+                    )
+                }
                 // Remember what this text looked like before it became code,
                 // so toggling back restores it exactly — never a jump to the
                 // toolbar's current font, which makes text "disappear".
@@ -4784,6 +4799,31 @@ final class CanvasView: NSView, NSTextViewDelegate {
         styled.draw(
             with: a.rect,
             options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+    }
+
+    /// The smallest rect that holds `text` set in the code font, so a code
+    /// block is exactly as large as its code. Width shrinks to the longest
+    /// line (code is rarely as wide as the field it was typed in) and height
+    /// follows from wrapping at that width.
+    private func codeBlockRect(for text: String, origin: CGPoint, maxWidth: CGFloat) -> CGRect {
+        let font = Fonts.nsFont(for: "Cascadia Code", size: 15)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let lines = text.components(separatedBy: .newlines)
+        let widest = lines.reduce(CGFloat(0)) { partial, line in
+            max(partial, (line as NSString).size(withAttributes: attributes).width)
+        }
+        // Keep a little slack for the caret and for italic overhang.
+        let width = min(max(widest + 4, 40), max(maxWidth, 40))
+        let measured = (text as NSString).boundingRect(
+            with: CGSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: attributes
+        )
+        return CGRect(
+            x: origin.x, y: origin.y,
+            width: width,
+            height: max(measured.height, font.ascender - font.descender)
         )
     }
 

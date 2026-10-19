@@ -31,6 +31,7 @@ struct ToolbarView: View {
     let onDeletePage: (String) -> Void
     let onToggleSidebar: () -> Void
     let onToggleAI: () -> Void
+    let onTogglePassthrough: () -> Void
 
     @State private var showShortcuts = false
     @State private var showShapes = false
@@ -162,6 +163,8 @@ struct ToolbarView: View {
                     Divider().frame(height: 22)
 
                     drawToggle
+
+                    passthroughToggle
 
                     pressureControl
 
@@ -323,20 +326,44 @@ struct ToolbarView: View {
         }
     }
 
-    /// Shown while ⇧ is held and the overlay is handing input to the app
-    /// underneath. The toolbar itself is click-through at that moment, so
-    /// this is the only feedback the user gets.
+    /// Latches pass-through on, so the user can work in the app underneath
+    /// without holding a key down.
+    private var passthroughToggle: some View {
+        Button(action: onTogglePassthrough) {
+            HStack(spacing: 4) {
+                Image(systemName: state.passthroughActive ? "hand.point.up.left.fill" : "hand.point.up.left")
+                Text(state.passthroughActive ? "Interacting" : "Interact")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .foregroundStyle(state.passthroughActive ? .white : Color.primary)
+            .padding(.horizontal, 8)
+            .frame(height: 28)
+            .background(
+                state.passthroughActive
+                    ? AnyShapeStyle(Color(nsColor: .systemOrange))
+                    : AnyShapeStyle(Color.primary.opacity(0.08)),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Use the app underneath — clicks and scrolling pass through to it. Click again to go back to drawing.")
+    }
+
+    /// Shown while the overlay is handing input to the app underneath. The
+    /// toolbar is click-through at that moment, so this is the only feedback
+    /// the user gets — and it has to say how to get back.
     private var passthroughBadge: some View {
         HStack(spacing: 5) {
-            Image(systemName: "hand.point.up.left")
+            Image(systemName: "hand.point.up.left.fill")
                 .font(.system(size: 11, weight: .semibold))
-            Text("⇧ pass-through — release to draw")
+            Text("Interacting with the app underneath — click Interact again to draw")
                 .font(.system(size: 10, weight: .semibold))
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 9)
         .frame(height: 24)
-        .background(Color(nsColor: .systemOrange).opacity(0.9), in: Capsule())
+        .background(Color(nsColor: .systemOrange).opacity(0.92), in: Capsule())
     }
 
     private var drawToggle: some View {
@@ -846,8 +873,8 @@ struct ShortcutsView: View {
                     }
                     Divider()
                     ForEach([
-                        ("Use the app underneath", "Hold ⇧"),
-                        ("Add to selection", "⌘-click"),
+                        ("Use the app underneath", "Interact button"),
+                        ("Add to selection", "⇧-click or ⌘-click"),
                         ("Draw on / off", "Toolbar button"),
                         ("Pause drawing", "Draw button again"),
                         ("Pan canvas", "Minimap / Space + drag / scroll"),
@@ -859,7 +886,7 @@ struct ShortcutsView: View {
                         ("Select all", "⌘A"),
                         ("Delete selection", "⌫"),
                         ("Bend a line/arrow", "Drag its middle handle"),
-                        ("Box-select more", "⌘ + drag"),
+                        ("Box-select more", "⇧ or ⌘ + drag"),
                         ("Close overlay", "⌃⌥ again"),
                         ("Quit macdraw", "Status bar menu"),
                     ], id: \.0) { name, key in
