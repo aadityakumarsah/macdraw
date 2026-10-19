@@ -591,6 +591,11 @@ final class CanvasState: ObservableObject {
     /// apps. When true, the canvas captures mouse events for drawing.
     @Published var drawingMode: Bool = false
 
+    /// True while ⇧ is held: the overlay stops capturing input entirely, so
+    /// clicks, scrolls and trackpad gestures reach whatever is underneath.
+    /// Releasing ⇧ hands the canvas back.
+    @Published var passthroughActive: Bool = false
+
     /// Controls the Excalidraw-inspired navigation panel. Keeping this in the
     /// shared canvas state lets the toolbar and the native overlay animate the
     /// same sidebar without competing sources of truth.

@@ -10,6 +10,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
     case openAI = "OpenAI / Codex"
     case anthropic = "Anthropic / Claude"
     case grok = "xAI / Grok"
+    case groq = "Groq"
     case openRouter = "OpenRouter"
     case gemini = "Google Gemini"
     case custom = "OpenAI-compatible"
@@ -20,6 +21,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .openAI: return "https://api.openai.com/v1"
         case .anthropic: return "https://api.anthropic.com/v1"
         case .grok: return "https://api.x.ai/v1"
+        case .groq: return "https://api.groq.com/openai/v1"
         case .openRouter: return "https://openrouter.ai/api/v1"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
         case .custom: return ""
@@ -35,6 +37,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .openAI: return "gpt-4.1-mini"
         case .anthropic: return "claude-opus-5-5"
         case .grok: return ""
+        case .groq: return ""
         case .openRouter: return "openai/gpt-4.1-mini"
         case .gemini: return "gemini-2.5-flash"
         case .custom: return ""
@@ -49,7 +52,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         switch self {
         case .anthropic: return .anthropicMessages
         case .gemini: return .geminiGenerateContent
-        case .openAI, .grok, .openRouter, .custom, .local: return .openAIChat
+        case .openAI, .grok, .groq, .openRouter, .custom, .local: return .openAIChat
         }
     }
 
@@ -57,12 +60,45 @@ enum AIProvider: String, CaseIterable, Identifiable {
         switch self {
         case .anthropic: return "https://platform.claude.com/settings/keys"
         case .grok: return "https://console.x.ai"
+        case .groq: return "https://console.groq.com/keys"
         case .openAI: return "https://platform.openai.com/api-keys"
         case .openRouter: return "https://openrouter.ai/keys"
         case .gemini: return "https://aistudio.google.com/app/apikey"
         case .custom, .local: return nil
         }
     }
+}
+
+extension AIProvider {
+    /// Which provider issued this API key, from its prefix.
+    ///
+    /// Every vendor prefixes its keys distinctly, so pasting one is enough to
+    /// know where it belongs — the user should not have to find the right
+    /// entry in a dropdown first. Returns nil when the prefix matches nothing
+    /// known, in which case the current selection is left alone.
+    ///
+    /// Order matters: OpenRouter and Anthropic both start with "sk-", so the
+    /// longer prefixes are tested before the bare one.
+    static func detect(fromKey key: String) -> AIProvider? {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 8 else { return nil }
+        let prefixes: [(String, AIProvider)] = [
+            ("sk-ant-", .anthropic),
+            ("sk-or-", .openRouter),
+            ("xai-", .grok),
+            ("gsk_", .groq),
+            ("AIza", .gemini),
+            ("sk-proj-", .openAI),
+            ("sk-", .openAI),
+        ]
+        for (prefix, provider) in prefixes where trimmed.hasPrefix(prefix) {
+            return provider
+        }
+        return nil
+    }
+
+    /// Human-readable note for the settings panel after a key is recognized.
+    var keyRecognizedNote: String { "Recognized a \(rawValue) key — provider switched." }
 }
 
 /// The three request/response shapes macdraw speaks.
@@ -182,6 +218,31 @@ final class AISettings: ObservableObject {
         if providerKey == nil, let legacyKey { KeychainStore.set(legacyKey, account: Self.keychainAccount(for: savedProvider)) }
     }
     func useProviderDefaults() { endpoint = provider.defaultEndpoint; model = provider.defaultModel; loadAPIKeyForCurrentProvider() }
+
+    /// Stores a key against whichever provider issued it.
+    ///
+    /// Returns the provider it was recognized as, or nil when the prefix is
+    /// unknown — in which case the key is stored against the current
+    /// selection, since a self-hosted or OpenAI-compatible endpoint can use
+    /// any format.
+    @discardableResult
+    func adopt(pastedKey raw: String) -> AIProvider? {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return nil }
+        guard let detected = AIProvider.detect(fromKey: key) else {
+            apiKey = key
+            return nil
+        }
+        if detected != provider {
+            // Switching provider reloads that provider's stored key, so the
+            // new key has to be written after the switch, not before.
+            provider = detected
+            endpoint = detected.defaultEndpoint
+            model = detected.defaultModel
+        }
+        apiKey = key
+        return detected
+    }
     private func loadAPIKeyForCurrentProvider() {
         let key = KeychainStore.get(account: Self.keychainAccount(for: provider)) ?? ""
         if apiKey != key { apiKey = key }
@@ -1002,6 +1063,7 @@ private struct AISettingsView: View {
     @StateObject private var catalog = AIModelCatalog()
     @State private var testing = false
     @State private var typingModel = false
+    @State private var keyNote = ""
     @State private var installing = false
     @State private var setupStatus = ""
     @State private var setupNeedsHelp = false
@@ -1017,8 +1079,20 @@ private struct AISettingsView: View {
         modelPicker
         if settings.provider != .local {
             HStack(spacing: 6) {
-                SecureField(settings.provider == .gemini ? "Gemini API key (stored in Keychain)" : "API key (stored in Keychain)", text: $settings.apiKey).textFieldStyle(.roundedBorder)
-                Button { pasteAPIKey() } label: { Image(systemName: "doc.on.clipboard") }.help("Paste API key from clipboard")
+                SecureField("API key (stored in Keychain)", text: $settings.apiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { adopt(settings.apiKey) }
+                    .onChange(of: settings.apiKey) { _, newValue in
+                        // A paste lands as one large change; typing arrives a
+                        // character at a time. Only react to the former, so
+                        // the provider never switches mid-keystroke.
+                        guard newValue.count > 12, AIProvider.detect(fromKey: newValue) != nil else { return }
+                        adopt(newValue)
+                    }
+                Button { pasteAPIKey() } label: { Image(systemName: "doc.on.clipboard") }.help("Paste a key — macdraw detects which provider it belongs to")
+            }
+            if !keyNote.isEmpty {
+                Text(keyNote).font(.system(size: 10)).foregroundStyle(.green)
             }
             if let keyURL = settings.provider.keyHelpURL, let url = URL(string: keyURL) {
                 Link("Get an API key for \(settings.provider.rawValue)", destination: url)
@@ -1098,8 +1172,22 @@ private struct AISettingsView: View {
 
     private func pasteAPIKey() {
         guard let value = NSPasteboard.general.string(forType: .string) else { return }
-        settings.apiKey = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        // A key is usually the thing that was blocking the list.
+        adopt(value)
+    }
+
+    /// Takes a key, points the app at whichever provider issued it, and
+    /// refreshes the model list — a key is usually the thing that was
+    /// blocking it.
+    private func adopt(_ value: String) {
+        let before = settings.provider
+        if let detected = settings.adopt(pastedKey: value) {
+            keyNote = detected == before
+                ? "Recognized a \(detected.rawValue) key."
+                : detected.keyRecognizedNote
+        } else {
+            keyNote = ""
+        }
+        catalog.reset()
         Task { await catalog.load(settings: settings, force: true) }
     }
 

@@ -44,6 +44,7 @@ struct ToolbarView: View {
     var body: some View {
         VStack(spacing: 6) {
             if state.drawingMode {
+                if state.passthroughActive { passthroughBadge }
                 topRow
                 bottomRow
             } else {
@@ -320,6 +321,22 @@ struct ToolbarView: View {
                 showUpdate = true
             }
         }
+    }
+
+    /// Shown while ⇧ is held and the overlay is handing input to the app
+    /// underneath. The toolbar itself is click-through at that moment, so
+    /// this is the only feedback the user gets.
+    private var passthroughBadge: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "hand.point.up.left")
+                .font(.system(size: 11, weight: .semibold))
+            Text("⇧ pass-through — release to draw")
+                .font(.system(size: 10, weight: .semibold))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 9)
+        .frame(height: 24)
+        .background(Color(nsColor: .systemOrange).opacity(0.9), in: Capsule())
     }
 
     private var drawToggle: some View {
@@ -803,6 +820,8 @@ struct ShortcutsView: View {
                     }
                     Divider()
                     ForEach([
+                        ("Use the app underneath", "Hold ⇧"),
+                        ("Add to selection", "⌘-click"),
                         ("Draw on / off", "Toolbar button"),
                         ("Pause drawing", "Draw button again"),
                         ("Pan canvas", "Minimap / Space + drag / scroll"),
@@ -814,6 +833,7 @@ struct ShortcutsView: View {
                         ("Select all", "⌘A"),
                         ("Delete selection", "⌫"),
                         ("Bend a line/arrow", "Drag its middle handle"),
+                        ("Box-select more", "⌘ + drag"),
                         ("Close overlay", "⌃⌥ again"),
                         ("Quit macdraw", "Status bar menu"),
                     ], id: \.0) { name, key in

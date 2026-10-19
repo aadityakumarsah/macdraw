@@ -1166,7 +1166,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                             annotations.indices.contains(s) ? (s, annotations[s]) : nil
                         })
                         beginTransformInteraction()
-                    } else if event.modifierFlags.contains(.shift) {
+                    } else if event.modifierFlags.contains(.command) {
                         selected.insert(i)
                         movingOriginals = [i: annotations[i]]
                         beginTransformInteraction()
@@ -1177,7 +1177,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     }
                 } else {
                     // Clicking empty space starts a marquee (box) selection.
-                    if !event.modifierFlags.contains(.shift) {
+                    if !event.modifierFlags.contains(.command) {
                         selected = []
                     }
                     marqueeStart = adjustedP
@@ -1191,7 +1191,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                         annotations.indices.contains(s) ? (s, annotations[s]) : nil
                     })
                     beginTransformInteraction()
-                } else if event.modifierFlags.contains(.shift) {
+                } else if event.modifierFlags.contains(.command) {
                     selected.insert(i)
                     movingOriginals = [i: annotations[i]]
                     beginTransformInteraction()
@@ -1202,7 +1202,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 }
             } else {
                 // Clicking empty space starts a marquee (box) selection.
-                if !event.modifierFlags.contains(.shift) {
+                if !event.modifierFlags.contains(.command) {
                     selected = []
                 }
                 marqueeStart = adjustedP
@@ -1437,13 +1437,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     let inBox = Set(annotations.indices.filter { i in
                         annotations[i].kind != .laser && annotations[i].rect.intersects(r)
                     })
-                    if event.modifierFlags.contains(.shift) {
+                    if event.modifierFlags.contains(.command) {
                         selected.formUnion(inBox)
                     } else {
                         selected = inBox
                     }
                     needsDisplay = true
-                } else if !event.modifierFlags.contains(.shift) {
+                } else if !event.modifierFlags.contains(.command) {
                     selected = []
                     needsDisplay = true
                 }
@@ -1563,6 +1563,30 @@ final class CanvasView: NSView, NSTextViewDelegate {
 
     /// Selects every annotation so the user can move/resize or delete them all
     /// with one ⌘A + ⌫. Transient laser strokes are excluded.
+    /// Abandons any gesture in flight without committing it. Used when the
+    /// overlay hands input to another app mid-drag (⇧ pass-through), so
+    /// releasing ⇧ doesn't resume a stroke the user walked away from.
+    func cancelActiveInteraction() {
+        let hadWork = current != nil || !movingOriginals.isEmpty
+            || resizeIndex != nil || rotateIndex != nil
+            || marqueeStart != nil || !lassoPoly.isEmpty || !eraseStroke.isEmpty
+        current = nil
+        movingOriginals = [:]
+        resizeIndex = nil
+        resizeHandle = nil
+        resizeOriginal = nil
+        rotateIndex = nil
+        marqueeStart = nil
+        marqueeRect = .zero
+        lassoPoly = []
+        eraseStroke = []
+        spacePanning = false
+        minimapPanning = false
+        interactionUndoSnapshot = nil
+        interactionChanged = false
+        if hadWork { needsDisplay = true }
+    }
+
     func selectAll() {
         guard !annotations.isEmpty else { return }
         selected = Set(annotations.indices.filter { annotations[$0].kind != .laser })

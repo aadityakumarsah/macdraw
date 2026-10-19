@@ -50,7 +50,7 @@ private final class ContainerView: NSView {
 
 /// Animates the overlay in/out from the top-center "dynamic island" pill.
 final class IslandManager {
-    private let window = OverlayWindow()
+    let window = OverlayWindow()
     private let state: CanvasState
     let pages = PagesManager()
     let updater = AppUpdater()
@@ -262,6 +262,67 @@ private func toggleSidebar() {
             nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.recoverAfterSystemEvent()
             }
+        }
+    }
+
+    // MARK: - hold-to-pass-through
+
+    /// Polls the modifier keys while the overlay is up. Holding ⇧ hands all
+    /// input back to whatever is underneath; releasing it takes the canvas
+    /// back.
+    ///
+    /// This polls `NSEvent.modifierFlags` rather than installing a global
+    /// key monitor for two reasons: a global monitor needs Accessibility
+    /// permission, and — more importantly — once the user clicks through into
+    /// another app, macdraw is no longer frontmost, so a *local* monitor
+    /// would never see ⇧ come back up and the overlay would stay transparent
+    /// forever. The static flags property is readable regardless of which app
+    /// has focus and needs no permission.
+    private var passthroughTimer: Timer?
+    private var passthroughActive = false
+
+    private func startPassthroughWatch() {
+        passthroughTimer?.invalidate()
+        passthroughTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.isShowing, self.state.drawingMode, !self.isAnimating else {
+                if self.passthroughActive { self.setPassthrough(false) }
+                return
+            }
+            let flags = NSEvent.modifierFlags
+            // ⇧ *alone*. Requiring that keeps chords such as ⌘⇧F from
+            // flipping the overlay transparent mid-shortcut.
+            let held = flags.contains(.shift)
+                && !flags.contains(.command)
+                && !flags.contains(.option)
+                && !flags.contains(.control)
+            if held != self.passthroughActive { self.setPassthrough(held) }
+        }
+    }
+
+    private func stopPassthroughWatch() {
+        passthroughTimer?.invalidate()
+        passthroughTimer = nil
+        if passthroughActive { setPassthrough(false) }
+    }
+
+    private func setPassthrough(_ on: Bool) {
+        Diag.log("passthrough \(on ? "ON — input goes to the app underneath" : "OFF — canvas has input back")")
+        passthroughActive = on
+        // The whole window stops accepting input, so clicks, scroll wheels and
+        // trackpad gestures all reach the app underneath untouched — there is
+        // no need to re-synthesize them.
+        window.ignoresMouseEvents = on
+        state.passthroughActive = on
+        if on {
+            // Commit any open text field first — it is floating above the app
+            // the user is about to click into, and discarding it would throw
+            // away what they typed.
+            canvas?.commitPendingText()
+            // Drop any gesture in flight so releasing ⇧ doesn't resume a
+            // stroke the user abandoned when they reached for another app.
+            canvas?.cancelActiveInteraction()
+            NSCursor.arrow.set()
         }
     }
 
@@ -537,6 +598,7 @@ private func toggleSidebar() {
         container.isDrawingMode = { [weak self] in self?.state.drawingMode ?? false }
 
         window.contentView = container
+        startPassthroughWatch()
         Diag.log("installContent done")
         window.setFrame(screen.frame, display: true)
         // Re-assert ordering: after a Space/display change the panel can end
@@ -589,6 +651,7 @@ private func toggleSidebar() {
 
     private func teardownContent() {
         Diag.log("teardownContent isShowing=\(isShowing) isAnimating=\(isAnimating)")
+        stopPassthroughWatch()
         if let m = undoMonitor {
             NSEvent.removeMonitor(m)
             undoMonitor = nil
@@ -775,6 +838,10 @@ private func toggleSidebar() {
             exit(0)
         }
     }
+
+    /// Self-test hook: the watcher reads real modifier keys, which a scripted
+    /// test cannot press, so the transition is driven directly.
+    func selftestSetPassthrough(_ on: Bool) { setPassthrough(on) }
 
     /// Dev hook (`--scene`): runs a fixture scene through the real harness
     /// path — repair, measure, insert — so the rendering can be checked
@@ -1658,6 +1725,60 @@ private func toggleSidebar() {
                         canvas.selftestSelect(Array(beforeInsert..<canvas.annotations.count))
                         canvas.deleteSelected()
                         log("scene harness test: PASS")
+
+                        log("key detection test: a pasted key picks its own provider")
+                        // Prefixes only — no real credentials in the test.
+                        let keySamples: [(String, AIProvider?)] = [
+                            ("sk-ant-api03-" + String(repeating: "x", count: 24), .anthropic),
+                            ("sk-or-v1-" + String(repeating: "x", count: 24), .openRouter),
+                            ("xai-" + String(repeating: "x", count: 24), .grok),
+                            ("gsk_" + String(repeating: "x", count: 24), .groq),
+                            ("AIza" + String(repeating: "x", count: 24), .gemini),
+                            ("sk-proj-" + String(repeating: "x", count: 24), .openAI),
+                            ("sk-" + String(repeating: "x", count: 24), .openAI),
+                            ("ollama-local", nil),
+                            ("short", nil),
+                            ("", nil),
+                        ]
+                        for (key, expected) in keySamples {
+                            let detected = AIProvider.detect(fromKey: key)
+                            if detected != expected {
+                                log("FAIL: \(key.prefix(8))… should detect \(expected.map(\.rawValue) ?? "nothing"), got \(detected.map(\.rawValue) ?? "nothing")")
+                                exit(1)
+                            }
+                        }
+                        // "sk-ant-" and "sk-or-" both start with "sk-", so the
+                        // longer prefixes have to win over the bare one.
+                        if AIProvider.detect(fromKey: "sk-ant-" + String(repeating: "x", count: 24)) == .openAI {
+                            log("FAIL: an Anthropic key must not be read as OpenAI")
+                            exit(1)
+                        }
+                        log("key detection test: PASS")
+
+                        log("pass-through test: holding shift releases the canvas")
+                        let beforeFlag = self.state.passthroughActive
+                        if beforeFlag {
+                            log("FAIL: pass-through should start off")
+                            exit(1)
+                        }
+                        // Drive the state transition directly: the watcher
+                        // reads real modifier keys, which a test cannot press.
+                        canvas.selftestBeginNewText(at: CGPoint(x: 400, y: 400))
+                        self.selftestSetPassthrough(true)
+                        if !self.state.passthroughActive || !self.window.ignoresMouseEvents {
+                            log("FAIL: pass-through should make the window ignore mouse events")
+                            exit(1)
+                        }
+                        if canvas.isEditingText {
+                            log("FAIL: pass-through should abandon the in-flight text edit")
+                            exit(1)
+                        }
+                        self.selftestSetPassthrough(false)
+                        if self.state.passthroughActive || self.window.ignoresMouseEvents {
+                            log("FAIL: releasing shift should hand the canvas back")
+                            exit(1)
+                        }
+                        log("pass-through test: PASS")
 
                         log("model catalog test: every provider list shape normalizes to plain ids")
                         let anthropicList = Data("""

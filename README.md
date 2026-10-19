@@ -26,6 +26,7 @@ macdraw is a full-screen transparent overlay that captures your clicks so you ca
 - **Images & emoji** — drop pictures, or press `/` for a quick emoji palette
 - **Selection editing** — move, resize, rotate, lasso-select, delete, undo
 - **Autosave that keeps up** — pages are written one file at a time, off the main thread, and images are stored once on disk instead of being re-encoded into the page on every save
+- **Hold ⇧ to use the app underneath** — the overlay stops capturing input, so you can scroll a doc, click buttons and use trackpad gestures without closing it. Let go and you are drawing again.
 - **Keyboard-first** — every tool has a one-key shortcut
 
 ## Where your drawings live
@@ -48,7 +49,19 @@ somewhere else (the self-test uses this so a test run can't touch real work).
 
 Open the sparkle button and choose a provider. API keys are stored in the macOS
 Keychain separately for each provider. Supported providers are OpenAI/Codex,
-Anthropic, OpenRouter, Google Gemini, and OpenAI-compatible endpoints.
+Anthropic/Claude, xAI/Grok, Groq, OpenRouter, Google Gemini, and any
+OpenAI-compatible endpoint.
+
+You do not have to pick the provider first: paste a key and macdraw works out
+which service issued it from its prefix (`sk-ant-`, `xai-`, `gsk_`, `sk-or-`,
+`AIza`, `sk-`) and switches for you. The model field is a dropdown fetched from
+whichever provider you are on, so there is no model id to type by hand.
+
+**Drawing mode** composes with macdraw's full vocabulary — any shape, the
+Excalidraw palette, hachure and cross-hatch fills, sloppiness — and runs a
+harness that measures each draft (overlaps, labels that do not fit, dangling
+connectors, contrast) and feeds the specific problems back for another pass.
+**Diagram mode** produces the node-and-connector flowcharts.
 
 Google Gemini uses the native Gemini API; create a key in [Google AI Studio](https://aistudio.google.com/app/apikey), choose **Google Gemini**, and paste it into the Gemini key field. For local diagrams, choose **Local (Ollama)** and use the setup button—macdraw finds an existing Ollama installation, starts its local server when needed, and downloads the selected model.
 
