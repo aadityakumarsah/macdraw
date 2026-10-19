@@ -206,6 +206,11 @@ final class AISettings: ObservableObject {
     }
     @Published var testStatus = "Not tested"
 
+    /// Output ceiling the provider reports for the selected model, when it
+    /// reports one. Groq rejects a `max_tokens` above the model's own limit
+    /// with a 400, so the request clamps to this.
+    @Published var modelMaxOutput: Int?
+
     /// When true nothing is written to the Keychain or UserDefaults. Used by
     /// `--aitest`, so running a live provider check never leaves a test key
     /// or a changed provider behind in the real settings.
@@ -332,9 +337,13 @@ final class AIModelCatalog: ObservableObject {
     private func selectModelIfNeeded(settings: AISettings, options: [ModelOption]) {
         guard !options.isEmpty else { return }
         let current = settings.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty, options.contains(where: { $0.id == current }) { return }
+        if !current.isEmpty, options.contains(where: { $0.id == current }) {
+            settings.modelMaxOutput = Self.maxOutput(for: current, in: options)
+            return
+        }
         guard let preferred = Self.preferredModel(from: options) else { return }
         settings.model = preferred
+        settings.modelMaxOutput = Self.maxOutput(for: preferred, in: options)
     }
 
     /// Clears the list when the provider changes, so a stale list is never
@@ -420,11 +429,26 @@ final class AIModelCatalog: ObservableObject {
         // Drop anything that physically cannot hold a diagram: Groq lists
         // 512-token prompt-guard classifiers as text-to-text models.
         let roomy = chat.filter { ($0.maxOutput ?? Int.max) >= 2048 }
-        // Then take the provider's own first choice. List order is meaningful
-        // — Anthropic and OpenRouter return newest-first — and picking by
-        // "largest output ceiling" instead would both be arbitrary between
-        // ties and silently opt the user into the priciest model.
-        return (roomy.first ?? chat.first)?.id
+        let pool = roomy.isEmpty ? chat : roomy
+
+        // Where the provider reports output ceilings, rank by them — Groq
+        // returns its list in a *different order on every request*, so
+        // "take the first" picks a different model each time (and picked a
+        // 4096-token 7B model on one run). Ties break on id so the result is
+        // stable. Where no ceiling is reported (Anthropic, OpenRouter) list
+        // order is both meaningful and stable, so it wins.
+        let measured = pool.filter { $0.maxOutput != nil }
+        if !measured.isEmpty {
+            return measured.sorted {
+                ($0.maxOutput ?? 0, $1.id) > ($1.maxOutput ?? 0, $0.id)
+            }.first?.id
+        }
+        return pool.first?.id
+    }
+
+    /// Reported output ceiling for a model id, when the provider gave one.
+    static func maxOutput(for model: String, in options: [ModelOption]) -> Int? {
+        options.first { $0.id == model }?.maxOutput
     }
 
     /// Normalizes every known list shape:
@@ -907,9 +931,16 @@ enum KeychainStore {
         system: String? = nil,
         settings: AISettings,
         maxTokens: Int = maxOutputTokens,
-        effort: String = defaultEffort
+        effort: String = defaultEffort,
+        retriesLeft: Int = 1
     ) async throws -> String {
         let systemPrompt = system ?? Self.systemPrompt
+        // Respect the model's own output ceiling. Groq rejects anything above
+        // it with a 400 rather than clamping, and small models cap at 4096.
+        var maxTokens = maxTokens
+        if let ceiling = settings.modelMaxOutput, ceiling > 0 {
+            maxTokens = min(maxTokens, ceiling)
+        }
         let endpoint = settings.endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let urlString: String
         var body: [String: Any]
@@ -971,6 +1002,32 @@ enum KeychainStore {
                 throw NSError(domain: "MacdrawAI", code: 404, userInfo: [NSLocalizedDescriptionKey:
                     "\(named). Open Settings and pick one from the Model dropdown."])
             }
+            // Rate limiting: the harness makes several calls per run, which
+            // on a free tier can exhaust a per-minute token budget mid-run.
+            // The provider tells us how long to wait, so wait rather than
+            // throwing away the work already done.
+            if http.statusCode == 429, retriesLeft > 0 {
+                let headerDelay = (http.value(forHTTPHeaderField: "retry-after")).flatMap(Double.init)
+                let delay = min(headerDelay ?? Self.parseRetryAfter(from: text) ?? 20, 60)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                return try await request(
+                    prompt: prompt, system: system, settings: settings,
+                    maxTokens: maxTokens, effort: effort, retriesLeft: retriesLeft - 1
+                )
+            }
+            if http.statusCode == 429 {
+                throw NSError(domain: "MacdrawAI", code: 429, userInfo: [NSLocalizedDescriptionKey:
+                    "\(settings.provider.rawValue) rate limit reached for \(settings.model). Wait a minute and try again, or pick a model with a higher quota."])
+            }
+            // Some providers report no output ceiling in their model list and
+            // then reject the request for exceeding it. Retry once, smaller,
+            // rather than making the user discover the number by hand.
+            if http.statusCode == 400, text.contains("max_tokens"), maxTokens > 4096 {
+                return try await request(
+                    prompt: prompt, system: system, settings: settings,
+                    maxTokens: 4096, effort: effort, retriesLeft: retriesLeft
+                )
+            }
             throw NSError(domain: "MacdrawAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Provider returned \(http.statusCode): \(text.prefix(240))"])
         }
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -1008,6 +1065,15 @@ enum KeychainStore {
         if let choices = json?["choices"] as? [[String: Any]], let message = choices.first?["message"] as? [String: Any], let text = message["content"] as? String { return text }
         throw NSError(domain: "MacdrawAI", code: 6, userInfo: [NSLocalizedDescriptionKey: "Provider did not return chat text."])
     }
+    /// Seconds from a provider's prose hint ("Please try again in 36.48s").
+    /// Used when there is no `retry-after` header.
+    static func parseRetryAfter(from body: String) -> Double? {
+        guard let range = body.range(of: "try again in ") else { return nil }
+        let tail = body[range.upperBound...]
+        let number = tail.prefix { $0.isNumber || $0 == "." }
+        return Double(number)
+    }
+
     static func decode(_ text: String) throws -> DiagramSpec {
         let cleaned = text.replacingOccurrences(of: "```json", with: "").replacingOccurrences(of: "```", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard let start = cleaned.firstIndex(of: "{"), let end = cleaned.lastIndex(of: "}") else { throw NSError(domain: "MacdrawAI", code: 7, userInfo: [NSLocalizedDescriptionKey: "The model did not return a diagram JSON object."]) }

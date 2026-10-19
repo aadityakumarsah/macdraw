@@ -1849,6 +1849,55 @@ private func toggleSidebar() {
                             log("FAIL: should pick the provider's first roomy chat model, got \(picked ?? "nothing")")
                             exit(1)
                         }
+                        // Ranking must not depend on list order: Groq returns
+                        // its models in a different order on every request, so
+                        // "take the first" picked a different model each launch
+                        // — including a 4096-token 7B model whose ceiling then
+                        // rejected the request outright.
+                        let shuffled = Data("""
+                        {"data":[
+                          {"id":"chat-small","output_modalities":["text"],"max_completion_tokens":65536},
+                          {"id":"tiny-7b","output_modalities":["text"],"max_completion_tokens":4096},
+                          {"id":"chat-big","output_modalities":["text"],"max_completion_tokens":65536}
+                        ]}
+                        """.utf8)
+                        let shuffledPick = AIModelCatalog.preferredModel(from: AIModelCatalog.parseOptions(shuffled, provider: .groq))
+                        if shuffledPick != "chat-big" {
+                            log("FAIL: ranking must be order-independent and tie-break stably, got \(shuffledPick ?? "nothing")")
+                            exit(1)
+                        }
+                        // Same listing, different order, same answer.
+                        let reordered = Data("""
+                        {"data":[
+                          {"id":"tiny-7b","output_modalities":["text"],"max_completion_tokens":4096},
+                          {"id":"chat-big","output_modalities":["text"],"max_completion_tokens":65536},
+                          {"id":"chat-small","output_modalities":["text"],"max_completion_tokens":65536}
+                        ]}
+                        """.utf8)
+                        if AIModelCatalog.preferredModel(from: AIModelCatalog.parseOptions(reordered, provider: .groq)) != shuffledPick {
+                            log("FAIL: the same listing in a different order must select the same model")
+                            exit(1)
+                        }
+                        // The ceiling has to be readable, because the request
+                        // clamps max_tokens to it.
+                        let ceilingOptions = AIModelCatalog.parseOptions(shuffled, provider: .groq)
+                        if AIModelCatalog.maxOutput(for: "tiny-7b", in: ceilingOptions) != 4096 {
+                            log("FAIL: the reported output ceiling should be readable per model")
+                            exit(1)
+                        }
+                        if AIModelCatalog.maxOutput(for: "nonexistent", in: ceilingOptions) != nil {
+                            log("FAIL: an unknown model has no ceiling")
+                            exit(1)
+                        }
+                        // Retry-after parsing, for the rate-limit path.
+                        if DiagramAI.parseRetryAfter(from: "Please try again in 36.48s.") != 36.48 {
+                            log("FAIL: should read the retry delay out of the provider's message")
+                            exit(1)
+                        }
+                        if DiagramAI.parseRetryAfter(from: "no hint here") != nil {
+                            log("FAIL: a message with no delay should yield none")
+                            exit(1)
+                        }
                         // A listing of only tiny classifiers still has to
                         // yield something rather than leaving the model empty,
                         // which is what produced the 404.

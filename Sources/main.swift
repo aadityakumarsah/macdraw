@@ -91,10 +91,33 @@ func runAITest() async {
         for element in scene.elements.prefix(8) {
             print("[aitest]   \(element.id) \(element.kind) at (\(Int(element.x)),\(Int(element.y))) \(Int(element.w))x\(Int(element.h)) text=\(element.text ?? "")")
         }
+    } catch {
+        print("[aitest] FAIL generating a scene: \(error.localizedDescription)")
+        exit(1)
+    }
+
+    // Diagram mode goes through a different generator and a different
+    // system prompt, so passing on scenes says nothing about it.
+    print("[aitest] generating a diagram for the same prompt")
+    do {
+        let diagram = try await DiagramAI.generate(prompt: prompt, settings: settings) { step in
+            print("[aitest]   \(step)")
+        }
+        print("[aitest] diagram: \(diagram.nodes.count) nodes, \(diagram.edges.count) connectors, valid=\(DiagramAI.isValid(diagram))")
+        for node in diagram.nodes.prefix(6) {
+            print("[aitest]   node \(node.id) [\(node.kind)] \(node.label)")
+        }
+        for edge in diagram.edges.prefix(6) {
+            print("[aitest]   edge \(edge.from) -> \(edge.to) \(edge.label ?? "")")
+        }
+        guard DiagramAI.isValid(diagram) else {
+            print("[aitest] FAIL: the diagram is structurally invalid")
+            exit(1)
+        }
         print("[aitest] AITEST PASS")
         exit(0)
     } catch {
-        print("[aitest] FAIL generating: \(error.localizedDescription)")
+        print("[aitest] FAIL generating a diagram: \(error.localizedDescription)")
         exit(1)
     }
 }
