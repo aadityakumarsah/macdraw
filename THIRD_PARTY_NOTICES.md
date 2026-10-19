@@ -1,11 +1,28 @@
 # Third-party notices
 
-## Excalidraw text-to-diagram interaction reference
+## Excalidraw
 
-Macdraw's native text-to-diagram drawer was designed with the interaction flow
-of Excalidraw's text-to-diagram dialog as a reference (prompt/chat, preview,
-then explicit insertion into the canvas). It is a Swift/AppKit implementation
-that creates Macdraw annotations; it does not include Excalidraw's React code.
+Macdraw contains no Excalidraw code — it is a Swift/AppKit application and
+Excalidraw is React/TypeScript. Three things are nonetheless derived from it
+and are acknowledged here.
+
+**The colour palette.** The hex values in `Sources/Canvas/Colors.swift` are
+`COLOR_PALETTE` from `packages/common/src/colors.ts`, value for value: open-color
+at weights 50/200/400/600/800, plus the radix bronze shades, plus Excalidraw's
+default stroke/background quick picks and its 5x3 picker ordering.
+
+**Render parameters.** Several constants are taken from
+`packages/element/src/shape.ts` and `packages/common/src/constants.ts` so that
+shapes drawn in Macdraw match what the same settings produce in Excalidraw:
+the dashed and dotted dash arrays (`[8, 8 + strokeWidth]` and a 1.5pt dot every
+`6 + strokeWidth`), the hachure spacing and pen weight (`strokeWidth * 4` and
+`strokeWidth / 2`), the `ROUGHNESS` levels behind Architect/Artist/Cartoonist,
+and the `STROKE_WIDTH` and `FONT_SIZES` presets. The hand-drawn geometry itself
+is an independent implementation of the Rough.js approach, not a port.
+
+**The text-to-diagram interaction flow.** Macdraw's drawer follows the shape of
+Excalidraw's text-to-diagram dialog — prompt/chat, preview, then explicit
+insertion into the canvas.
 
 Excalidraw is licensed under the MIT License.
 

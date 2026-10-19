@@ -27,7 +27,11 @@ extension NSColor {
     }
 }
 
-/// Excalidraw color palette (copied from copy-here/colors/colors.ts)
+/// Excalidraw's colour palette, value for value.
+///
+/// Source: `packages/common/src/colors.ts` in excalidraw/excalidraw (MIT) —
+/// `COLOR_PALETTE`, which is open-color at weights 50/200/400/600/800 plus
+/// radix bronze. See THIRD_PARTY_NOTICES.md.
 enum Palette {
     static let black = NSColor(hex: 0x1E1E1E)
     static let white = NSColor(hex: 0xFFFFFF)

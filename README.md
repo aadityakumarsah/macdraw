@@ -10,23 +10,25 @@ Draw, annotate and laser-point directly on your screen — over any app, in seco
 ![Demo 1](app-ss/demo1.png)
 ![Demo 2](app-ss/demo2.png)
 ![Demo 3](app-ss/demo3.png)
-![Demo 4](app-ss/demo4.png)
-![Demo 5](app-ss/demo5.png)
 
 ## What it does
 
 macdraw is a full-screen transparent overlay that captures your clicks so you can write on top of whatever is on screen — presentations, videos, code, anything.
 
-- **17 drawing tools** — rectangle, diamond, ellipse, arrow, line, freehand sketch, magic shape, frame, text, image, eraser, lasso, laser, fill and more
+- **50 tools** — rectangle, diamond, ellipse, arrow, line, freehand sketch, magic shape, frame, text, image, eraser, lasso, laser and fill, plus a 38-shape palette of polygons, flowchart symbols, architecture blocks, connectors and data structures
+- **Arrows that stay attached** — drag one from one box to another and it glues to both, routes around whatever is in between, and follows them when they move
+- **Tables** — paste one from a chat answer, a spreadsheet or Notion and it arrives as a real grid with an emphasised header; double-click any cell to edit it
+- **Align and distribute** — six alignments plus even spreading across a multi-selection
+- **Eyedropper** — samples the colour of the app *underneath* the overlay, not just your own drawing (macOS 14+ with Screen Recording permission; otherwise it picks from your drawing). Hold ⌥ to set the fill
 - **Glowing laser pointer** — neon glow that fades tail-first, leaves no marks
 - **White / black screen** — flip the whole display to a clean writing surface
 - **The full Excalidraw palette** — the 5x3 colour grid with five shades each, quick picks and a hex field, for both stroke and background
-- **Hand-drawn fills and strokes** — hachure, cross-hatch, zigzag or solid fill; solid / dashed / dotted strokes; Architect, Artist or Cartoonist sloppiness; sharp or round edges
+- **Hand-drawn fills and strokes** — hachure, cross-hatch, zigzag or solid fill; solid / dashed / dotted strokes; Architect, Artist or Cartoonist sloppiness; sharp, round or continuous-curvature corners with an adjustable radius
 - **Real text** — type anywhere, pick a font family and size, re-edit anytime. The font list is set in the fonts themselves, so you can see what you are choosing
 - **Images & emoji** — drop pictures, or press `/` for a quick emoji palette
 - **Selection editing** — move, resize, rotate, lasso-select, delete, undo
 - **Autosave that keeps up** — pages are written one file at a time, off the main thread, and images are stored once on disk instead of being re-encoded into the page on every save
-- **Hold ⇧ to use the app underneath** — the overlay stops capturing input, so you can scroll a doc, click buttons and use trackpad gestures without closing it. Let go and you are drawing again.
+- **Interact with the app underneath** — click **Interact** and the canvas stops capturing input, so you can scroll a doc, click buttons and use trackpad gestures without closing the overlay. Click it again to draw. The toolbar stays live throughout, so the button is always reachable.
 - **Keyboard-first** — every tool has a one-key shortcut
 
 ## Source layout
@@ -96,3 +98,27 @@ bash build.sh           # builds build/macdraw.app
 bash dist.sh            # signs it + packages DMG & zip into dist/
 open build/macdraw.app
 ```
+
+### Checking a change
+
+```bash
+./build/macdraw.app/Contents/MacOS/macdraw --selftest   # full scripted suite, exits 0 on pass
+./build/macdraw.app/Contents/MacOS/macdraw --show       # open the overlay without the hotkey
+./build/macdraw.app/Contents/MacOS/macdraw --show --sample   # lay out one shape per fill style, corner and stroke
+./build/macdraw.app/Contents/MacOS/macdraw --show --ai   # open the AI drawer with its settings expanded
+```
+
+Set `MACDRAW_DATA_DIR` on any of these to keep a run away from your real
+drawings — `--selftest` wipes the pages in whatever store it is pointed at.
+
+To check a provider end to end without clicking through the UI:
+
+```bash
+MACDRAW_AI_KEY=... ./build/macdraw.app/Contents/MacOS/macdraw --aitest "a flow with three steps"
+```
+
+It detects which provider the key belongs to, lists and selects a model, tests
+the connection and generates, printing each step so a connection problem, a
+model problem and a generation problem can be told apart. Its settings are
+in-memory only, so it never writes a key to the Keychain.
+`MACDRAW_AI_MODE=scene|diagram` runs one generator instead of both.
