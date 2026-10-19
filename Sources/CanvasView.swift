@@ -545,6 +545,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private func invalidateElementCaches() {
         elementCache.removeAll(keepingCapacity: true)
         pathCache.removeAll(keepingCapacity: true)
+        elementCacheBytes = 0
     }
 
     /// Marks just the screen area a world rectangle covers as needing a
@@ -3320,7 +3321,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
         var fingerprint: Int
         var renderZoom: CGFloat
         var lastUsed: Int
+        /// Decoded size, so the cache can be bounded by memory and not just
+        /// by entry count — one full-screen element costs as much as a
+        /// thousand small ones.
+        var bytes: Int
     }
+
+    /// Pixel budget for the rasterized element cache. Past this the
+    /// least-recently-drawn entries are dropped and re-rendered when they
+    /// next scroll into view.
+    private let elementCacheBudget = 192 * 1024 * 1024
+    private var elementCacheBytes = 0
     /// Path cache — skips rebuilding NSBezierPaths (and connector routing
     /// inputs) on every frame for elements that haven't changed.
     private var pathCache: [String: PathCacheEntry] = [:]
@@ -3533,7 +3544,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
         let img = NSImage(cgImage: image, size: NSSize(width: local.width * zoom, height: local.height * zoom))
         return ElementCacheEntry(
             image: img, pad: pad, fingerprint: fingerprint,
-            renderZoom: zoom, lastUsed: frameCounter
+            renderZoom: zoom, lastUsed: frameCounter,
+            bytes: bw * bh * 4
         )
     }
 
@@ -3550,8 +3562,20 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     private func evictCaches() {
-        if elementCache.count > 1024 {
-            elementCache = elementCache.filter { $0.value.lastUsed > frameCounter - 2 }
+        if elementCache.count > 1024 || elementCacheBytes > elementCacheBudget {
+            // Drop the least recently drawn entries until both limits are met
+            // again. Sorting only happens on the frames that overflow.
+            let ordered = elementCache.sorted { $0.value.lastUsed > $1.value.lastUsed }
+            var kept: [String: ElementCacheEntry] = [:]
+            kept.reserveCapacity(min(ordered.count, 1024))
+            var bytes = 0
+            for (key, entry) in ordered {
+                guard kept.count < 1024, bytes + entry.bytes <= elementCacheBudget else { break }
+                kept[key] = entry
+                bytes += entry.bytes
+            }
+            elementCache = kept
+            elementCacheBytes = bytes
         }
         if pathCache.count > max(512, annotations.count * 2) {
             pathCache.removeAll(keepingCapacity: true)
@@ -3563,7 +3587,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
             let live = Set(annotations.map(\.id))
             elementCache = elementCache.filter { live.contains($0.key) }
             pathCache = pathCache.filter { live.contains($0.key) }
+            elementCacheBytes = elementCache.values.reduce(0) { $0 + $1.bytes }
         }
+    }
+
+    /// Stores a freshly rasterized element, keeping the byte total in step.
+    private func storeElementCache(_ entry: ElementCacheEntry, for id: String) {
+        if let old = elementCache[id] { elementCacheBytes -= old.bytes }
+        elementCache[id] = entry
+        elementCacheBytes += entry.bytes
     }
 
     // MARK: - drawing
@@ -3622,7 +3654,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             } else {
                 sceneChanged = true
                 if let entry = renderElementBitmap(a, fingerprint: fp) {
-                    elementCache[a.id] = entry
+                    storeElementCache(entry, for: a.id)
                     entry.image.draw(in: worldToScreen(a.rect.insetBy(dx: -entry.pad, dy: -entry.pad)))
                     if selected.contains(i) {
                         drawTransformed { drawSelectionBox(a, index: i) }
