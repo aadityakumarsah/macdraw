@@ -1505,6 +1505,97 @@ private func toggleSidebar() {
                         }
                         log("mid-box dodge: connector cleared the box (maxY=\(pathPts.map(\.y).max() ?? 0))")
 
+                        log("auto-bind test: a plain arrow drawn box-to-box glues itself and follows")
+                        self.state.tool = .rectangle
+                        self.state.lastNonTextTool = .rectangle
+                        self.state.fillEnabled = false
+                        // Two boxes with a third between them to route around.
+                        let boxes: [(CGPoint, CGPoint)] = [
+                            (CGPoint(x: 1400, y: 760), CGPoint(x: 1520, y: 860)),   // left
+                            (CGPoint(x: 1800, y: 760), CGPoint(x: 1920, y: 860)),   // right
+                            (CGPoint(x: 1600, y: 700), CGPoint(x: 1700, y: 920)),   // obstacle
+                        ]
+                        var boxIndices: [Int] = []
+                        for (tl, br) in boxes {
+                            canvas.mouseDown(with: self.mouseEvent(at: self.win(tl), type: .leftMouseDown))
+                            canvas.mouseDragged(with: self.mouseEvent(at: self.win(br), type: .leftMouseDragged))
+                            canvas.mouseUp(with: self.mouseEvent(at: self.win(br), type: .leftMouseUp))
+                            boxIndices.append(canvas.annotations.count - 1)
+                        }
+                        // A plain arrow, dragged from the middle of one box to
+                        // the middle of the other — no edge dots aimed at.
+                        self.state.tool = .arrow
+                        self.state.lastNonTextTool = .arrow
+                        let fromMiddle = self.win(CGPoint(x: 1460, y: 810))
+                        let toMiddle = self.win(CGPoint(x: 1860, y: 810))
+                        canvas.mouseDown(with: self.mouseEvent(at: fromMiddle, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: toMiddle, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: toMiddle, type: .leftMouseUp))
+                        guard let bound = canvas.annotations.last, bound.kind == .arrow else {
+                            log("FAIL: the arrow was not created, got \(canvas.annotations.last?.kind.rawValue ?? "nil")")
+                            exit(1)
+                        }
+                        let leftID = canvas.annotations[boxIndices[0]].id
+                        let rightID = canvas.annotations[boxIndices[1]].id
+                        log("auto-bind: start=\(bound.connectionStart?.elementID ?? "nil") end=\(bound.connectionEnd?.elementID ?? "nil") routes=\(bound.routesAroundObstacles)")
+                        guard bound.connectionStart?.elementID == leftID,
+                              bound.connectionEnd?.elementID == rightID else {
+                            log("FAIL: a plain arrow drawn between two boxes should glue to both")
+                            exit(1)
+                        }
+                        guard bound.routesAroundObstacles else {
+                            log("FAIL: an arrow glued at both ends should route around obstacles")
+                            exit(1)
+                        }
+                        // It must dodge the box standing between them.
+                        let routed = canvas.selftestPathPoints(bound)
+                        let obstacle = canvas.annotations[boxIndices[2]].rect
+                        var cuts = false
+                        for k in 0..<max(routed.count - 1, 0) {
+                            let a0 = routed[k], a1 = routed[k + 1]
+                            let steps = 24
+                            for t in 0...steps {
+                                let f = CGFloat(t) / CGFloat(steps)
+                                let p = CGPoint(x: a0.x + (a1.x - a0.x) * f, y: a0.y + (a1.y - a0.y) * f)
+                                if obstacle.insetBy(dx: 2, dy: 2).contains(p) { cuts = true }
+                            }
+                        }
+                        log("auto-bind: route has \(routed.count) points, cuts the middle box: \(cuts)")
+                        if cuts {
+                            log("FAIL: the routed arrow should bend around the box between its ends")
+                            exit(1)
+                        }
+                        // Moving a box must drag the glued end with it.
+                        let arrowIndex = canvas.annotations.count - 1
+                        let startBefore = canvas.selftestPathStart(canvas.annotations[arrowIndex])
+                        self.state.tool = .selection
+                        canvas.selftestSelect([boxIndices[0]])
+                        let boxGrab = self.win(CGPoint(x: 1460, y: 810))
+                        let boxDrop = self.win(CGPoint(x: 1460, y: 600))
+                        canvas.mouseDown(with: self.mouseEvent(at: boxGrab, type: .leftMouseDown))
+                        canvas.mouseDragged(with: self.mouseEvent(at: boxDrop, type: .leftMouseDragged))
+                        canvas.mouseUp(with: self.mouseEvent(at: boxDrop, type: .leftMouseUp))
+                        let startAfter = canvas.selftestPathStart(canvas.annotations[arrowIndex])
+                        log("auto-bind: arrow start \(startBefore.map { "\($0)" } ?? "nil") -> \(startAfter.map { "\($0)" } ?? "nil")")
+                        guard let before = startBefore, let after = startAfter else {
+                            log("FAIL: the arrow lost its path after the box moved")
+                            exit(1)
+                        }
+                        if abs(after.y - before.y) < 40 {
+                            log("FAIL: the glued end should have followed the box upward")
+                            exit(1)
+                        }
+                        let movedBox = canvas.annotations[boxIndices[0]].rect
+                        if !movedBox.insetBy(dx: -24, dy: -24).contains(after) {
+                            log("FAIL: the glued end should sit on the moved box, box=\(movedBox) end=\(after)")
+                            exit(1)
+                        }
+                        // Clean up so later steps see the canvas they expect.
+                        canvas.selftestSelect(Array(boxIndices[0]...arrowIndex))
+                        canvas.deleteSelected()
+                        self.state.tool = .selection
+                        log("auto-bind test: PASS")
+
                         log("connector identity test: deleting an earlier element must not re-point a glued connector")
                         if let before = canvas.selftestPathStart(link2), canvas.annotations.count > 3 {
                             // Element 0 belongs to an earlier test and nothing

@@ -369,6 +369,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var marqueeStart: CGPoint?
     private var marqueeRect: CGRect = .zero
     private var eraseStroke: [CGPoint] = []
+    /// True when the in-progress connector's start was glued by proximity
+    /// rather than by hitting an edge dot. Its side is a guess until the
+    /// other end is known, so `autoBindConnector` is free to re-pick it; a
+    /// deliberate dot hit is left exactly where the user aimed.
+    private var startBindingIsProvisional = false
     /// Shape whose edge connection dots are shown (connector tools only).
     private var hoverShapeIndex: Int?
     private var hoverSide: Int?
@@ -1283,9 +1288,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
             current?.routesAroundObstacles = state.tool == .bendingArrow
             // Connector tools grab the connection dot under the cursor, so
             // the line starts glued to that box's edge.
-            if isConnectorTool(state.tool), let (i, s) = connectionDot(at: adjustedP) {
-                current?.connectionStart = makeConnection(index: i, side: s)
-                if var c = current {
+            startBindingIsProvisional = false
+            if isConnectorTool(state.tool) {
+                if let (i, s) = connectionDot(at: adjustedP) {
+                    current?.connectionStart = makeConnection(index: i, side: s)
+                } else if let i = bindableShape(at: adjustedP) {
+                    // Side is a guess: re-chosen to face the other end once
+                    // the drag finishes and that end is known.
+                    current?.connectionStart = makeConnection(index: i, side: 1)
+                    startBindingIsProvisional = true
+                }
+                if current?.connectionStart != nil, var c = current {
                     c.points = [connectionPoint(for: c.connectionStart, fallback: adjustedP)]
                     current = c
                 }
@@ -1386,6 +1399,19 @@ final class CanvasView: NSView, NSTextViewDelegate {
                     c.connectionEnd = makeConnection(index: i, side: s)
                     endP = connectionPoint(for: c.connectionEnd, fallback: adjustedP)
                     Haptics.impact()
+                } else if let i = bindableShape(at: adjustedP),
+                          connectedIndex(c.connectionStart) != i {
+                    // Dragging onto a box previews the glue, so the snap is
+                    // visible before the mouse is released rather than the
+                    // arrow jumping on commit.
+                    let origin = connectedIndex(c.connectionStart)
+                        .map { CGPoint(x: annotations[$0].rect.midX, y: annotations[$0].rect.midY) } ?? startP
+                    let side = facingSide(
+                        from: CGPoint(x: annotations[i].rect.midX, y: annotations[i].rect.midY),
+                        toward: origin
+                    )
+                    c.connectionEnd = makeConnection(index: i, side: side)
+                    endP = connectionPoint(for: c.connectionEnd, fallback: adjustedP)
                 } else {
                     c.connectionEnd = nil
                     endP = snappedBoundaryPoint(adjustedP)
@@ -1584,6 +1610,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         minimapPanning = false
         interactionUndoSnapshot = nil
         interactionChanged = false
+        startBindingIsProvisional = false
         if hadWork { needsDisplay = true }
     }
 
@@ -1620,7 +1647,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     // MARK: - tools
 
     private func finalizeCurrent() {
-        defer { current = nil }
+        defer { current = nil; startBindingIsProvisional = false }
         guard var c = current else { return }
 
         switch c.kind {
@@ -1639,7 +1666,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             // Bounding box of every point (a bend can stick out past the
             // start/end line, and the rect drives selection + rotation).
             c.rect = boundingRect(of: c.points)
-            // Re-check the release point: glued only if it landed on a dot.
+            // Re-check the release point: an exact dot hit wins, because the
+            // user aimed at it.
             if let end = c.points.last, let (i, s) = connectionDot(at: end) {
                 c.connectionEnd = makeConnection(index: i, side: s)
                 c.points[c.points.count - 1] = connectionPoint(for: c.connectionEnd, fallback: end)
@@ -1647,6 +1675,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 c.connectionEnd = nil
             }
             guard distance(c.points.first ?? .zero, c.points.last ?? .zero) * zoom > 2 else { return }
+            // Then glue whichever ends simply landed on a shape.
+            autoBindConnector(&c)
         case .freedraw:
             // Trackpad signature support: smooth the points for better handwriting
             c.points = smooth(c.points)
@@ -6248,6 +6278,71 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     /// The connection dot under `p`, if any (connector tools snap to these).
+    /// The shape a connector endpoint should glue itself to.
+    ///
+    /// Unlike `connectionDot`, this does not ask the user to hit one of the
+    /// four 9pt edge dots — anywhere on or just outside a box counts. Drawing
+    /// an arrow from one box to another is the common case and it should not
+    /// require aiming.
+    private func bindableShape(at p: CGPoint) -> Int? {
+        rebuildDerivedOrderIfNeeded()
+        for i in zOrder.reversed() {
+            let a = annotations[i]
+            guard isClosed(a.kind), a.kind != .laser,
+                  a.rect.width > 1, a.rect.height > 1 else { continue }
+            let center = CGPoint(x: a.rect.midX, y: a.rect.midY)
+            let local = rotatedPoint(p, around: center, by: -a.rotation)
+            if a.rect.insetBy(dx: -snapThreshold, dy: -snapThreshold).contains(local) {
+                return i
+            }
+        }
+        return nil
+    }
+
+    /// Glues a freshly drawn connector to the shapes under its endpoints and,
+    /// when both ends landed on something, turns on obstacle routing so it
+    /// bends around whatever is in the way.
+    ///
+    /// The side each end binds to is chosen to face the other end, so the
+    /// arrow leaves and arrives on sensible edges rather than cutting across
+    /// its own boxes.
+    private func autoBindConnector(_ c: inout Annotation) {
+        guard c.points.count >= 2,
+              let first = c.points.first, let last = c.points.last else { return }
+
+        let startIndex = connectedIndex(c.connectionStart) ?? bindableShape(at: first)
+        let endIndex = connectedIndex(c.connectionEnd) ?? bindableShape(at: last)
+        // An arrow that starts and ends on the same box is a self-loop, which
+        // this connector model cannot express — leave it as a free line.
+        guard startIndex == nil || endIndex == nil || startIndex != endIndex else { return }
+
+        func center(_ index: Int) -> CGPoint {
+            CGPoint(x: annotations[index].rect.midX, y: annotations[index].rect.midY)
+        }
+
+        if c.connectionStart == nil || startBindingIsProvisional, let i = startIndex {
+            let target = endIndex.map(center) ?? last
+            c.connectionStart = makeConnection(index: i, side: facingSide(from: center(i), toward: target))
+        }
+        if c.connectionEnd == nil, let i = endIndex {
+            let source = startIndex.map(center) ?? first
+            c.connectionEnd = makeConnection(index: i, side: facingSide(from: center(i), toward: source))
+        }
+
+        // Both ends anchored means the path is now the app's problem, not the
+        // user's: route it around anything between the two boxes.
+        if c.connectionStart != nil, c.connectionEnd != nil {
+            c.routesAroundObstacles = true
+        }
+        if c.connectionStart != nil {
+            c.points[0] = connectionPoint(for: c.connectionStart, fallback: first)
+        }
+        if c.connectionEnd != nil {
+            c.points[c.points.count - 1] = connectionPoint(for: c.connectionEnd, fallback: last)
+        }
+        c.rect = boundingRect(of: c.points)
+    }
+
     private func connectionDot(at p: CGPoint) -> (index: Int, side: Int)? {
         let threshold: CGFloat = 9
         for (i, a) in annotations.enumerated() {
