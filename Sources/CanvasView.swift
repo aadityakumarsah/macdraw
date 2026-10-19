@@ -129,6 +129,15 @@ struct PersistedAnnotation: Codable {
     var normalFontSize: CGFloat?
     var richTextData: Data?
     var nodeTexts: [String]?
+    // Every field below is Optional on purpose: Swift's synthesized decoder
+    // ignores property defaults, so a non-optional addition would make every
+    // drawing saved by an older build fail to load.
+    /// Stable element id (see `Annotation.id`).
+    var id: String?
+    /// Blob id of the image in `FileStore`. Replaces `imagePNG`, which is
+    /// still read so pre-1.22 pages (and pasted scenes) keep their images.
+    var imageFileID: String?
+    var fillStyle: String?
 }
 
 private func colorComponents(_ c: NSColor) -> [CGFloat] {
@@ -143,30 +152,31 @@ private func color(fromComponents v: [CGFloat]) -> NSColor {
     return NSColor(srgbRed: v[0], green: v[1], blue: v[2], alpha: v[3])
 }
 
-private func pngBase64(of img: NSImage) -> String? {
-    guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
-    return rep.representation(using: .png, properties: [:])?.base64EncodedString()
-}
-
-private func imageFromPNG(_ s: String) -> NSImage? {
-    guard let d = Data(base64Encoded: s) else { return nil }
-    return NSImage(data: d)
-}
-
 private extension Annotation {
     /// Independent copy for the clipboard: fresh creation time (so hand-drawn
     /// wobble re-seeds), no glued connections (indices would dangle), and the
     /// image is shared by reference — it's immutable after creation.
     func copied() -> Annotation {
         var c = self
+        c.id = UUID().uuidString
         c.createdAt = Date()
         c.connectionStart = nil
         c.connectionEnd = nil
         return c
     }
 
+    /// Snapshot for disk. Images are *not* inlined: the bytes go to
+    /// `FileStore` once (keyed by their own hash) and only the id is written
+    /// here. Re-encoding every image to base64 PNG on every autosave is what
+    /// made image-heavy pages stutter and balloon in memory.
     func persisted() -> PersistedAnnotation {
-        PersistedAnnotation(
+        var fileID = imageFileID
+        // Symbol annotations are re-rendered from `symbol` at draw time, so
+        // their bitmap is pure dead weight — never store it.
+        if fileID == nil, symbol == nil, let img = image {
+            fileID = FileStore.shared.store(image: img)
+        }
+        return PersistedAnnotation(
             kind: kind.rawValue,
             x: rect.minX, y: rect.minY, w: rect.width, h: rect.height,
             stroke: colorComponents(strokeColor),
@@ -178,7 +188,7 @@ private extension Annotation {
             text: text,
             fontFamily: fontFamily,
             fontSize: fontSize,
-            imagePNG: image.flatMap { pngBase64(of: $0) },
+            imagePNG: nil,
             rounded: rounded,
             dashed: dashed,
             rotation: rotation,
@@ -202,7 +212,10 @@ private extension Annotation {
             normalFontFamily: normalFontFamily,
             normalFontSize: normalFontSize,
             richTextData: richTextData,
-            nodeTexts: nodeTexts.isEmpty ? nil : nodeTexts
+            nodeTexts: nodeTexts.isEmpty ? nil : nodeTexts,
+            id: id,
+            imageFileID: fileID,
+            fillStyle: fillStyle.rawValue
         )
     }
 
@@ -223,6 +236,14 @@ private extension Annotation {
             ry = 12
         }
 
+        // Pages written before the blob store inlined images as base64.
+        // Move those bytes into `FileStore` on first load and keep only the
+        // id from then on.
+        var fileID = p.imageFileID
+        if fileID == nil, let legacy = p.imagePNG, let data = Data(base64Encoded: legacy) {
+            fileID = FileStore.shared.store(data: data, ext: "png")
+        }
+
         return Annotation(
             kind: ShapeKind(rawValue: p.kind) ?? .rect,
             rect: CGRect(x: p.x, y: p.y, width: p.w, height: p.h),
@@ -237,7 +258,7 @@ private extension Annotation {
             text: p.text,
             fontFamily: p.fontFamily,
             fontSize: p.fontSize,
-            image: p.imagePNG.flatMap { imageFromPNG($0) },
+            image: nil,
             rounded: p.rounded,
             dashed: p.dashed,
             rotation: p.rotation,
@@ -260,7 +281,10 @@ private extension Annotation {
             isCode: p.isCode ?? false,
             normalFontFamily: p.normalFontFamily,
             normalFontSize: p.normalFontSize,
-            nodeTexts: p.nodeTexts ?? []
+            nodeTexts: p.nodeTexts ?? [],
+            id: p.id ?? UUID().uuidString,
+            imageFileID: fileID,
+            fillStyle: FillStyle(rawValue: p.fillStyle ?? "") ?? .solid
         )
     }
 }
@@ -274,19 +298,38 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private let pages: PagesManager
     private(set) var annotations: [Annotation] = [] {
         didSet {
-            // Transient laser strokes are pruned every timer tick — they must
-            // not invalidate the (laser-less) minimap. Geometry/style changes
-            // to real content do, including moves and rotations (not merely
-            // insertions/removals as before).
-            if minimapFingerprint(oldValue) != minimapFingerprint(annotations) {
-                minimapDirty = true
+            // This runs on *every* mutation — including each point appended
+            // to a freehand stroke — so it has to stay O(1). It used to hash
+            // every element (and every point of every element) twice here
+            // just to decide whether the minimap had changed, which is what
+            // made drawing on a dense page feel heavy.
+            annotationsGeneration += 1
+            derivedOrderGeneration = -1
+            if mutatingLasersOnly {
+                // Laser strokes are transient: never saved, never on the
+                // minimap. Pruning a faded one invalidates nothing.
+                return
             }
+            minimapDirty = true
             scheduleSave()
         }
     }
+
+    /// Set while the laser timer prunes faded strokes, so `annotations`'
+    /// observer can skip the work a real edit needs.
+    private var mutatingLasersOnly = false
+
+    /// Runs `body` as a laser-only mutation (see `mutatingLasersOnly`).
+    private func mutateLasers(_ body: () -> Void) {
+        mutatingLasersOnly = true
+        body()
+        mutatingLasersOnly = false
+    }
     private var undoStack: [[Annotation]] = []
     private var saveWorkItem: DispatchWorkItem?
-    private var lastSavedData: Data?
+    /// Hash of the last persisted scene. Keeping the encoded JSON here (as
+    /// this used to) meant a second full copy of every page in memory.
+    private var lastSavedHash: Int?
 
     private var canvasOffset: CGPoint = .zero
     /// Zoom factor of the infinite canvas (1 = 100%). Pinch to zoom, or
@@ -443,6 +486,140 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     var isEditingText: Bool { editingView != nil }
+
+    // MARK: - element identity
+
+    /// `id -> index` map, rebuilt only when the annotations array actually
+    /// changes. Connectors and caches address elements by id, so this is the
+    /// one place that translates back to an array position.
+    private var idIndexCache: [String: Int] = [:]
+    private var idIndexGeneration = -1
+    private var annotationsGeneration = 0
+
+    /// True while at least one laser stroke exists. Maintained by the laser
+    /// tool and the fade timer so the timer can bail in O(1).
+    private var hasLaserStrokes = false
+
+    /// Cached draw order and per-element render bounds, rebuilt once per
+    /// scene change instead of once per frame.
+    private var derivedOrderGeneration = -1
+    private var zOrder: [Int] = []
+    private var renderBounds: [CGRect] = []
+
+    private func rebuildDerivedOrderIfNeeded() {
+        guard derivedOrderGeneration != annotationsGeneration else { return }
+        derivedOrderGeneration = annotationsGeneration
+        renderBounds = annotations.map { a in
+            let pad = 32 + a.strokeWidth + rotationPad(for: a)
+            return a.rect.insetBy(dx: -pad, dy: -pad)
+        }
+        // Elements are appended with an increasing zIndex, so the array is
+        // almost always already in draw order — check for that in O(n) and
+        // skip the sort entirely.
+        var ordered = true
+        for i in 1..<max(annotations.count, 1) where annotations[i].zIndex < annotations[i - 1].zIndex {
+            ordered = false
+            break
+        }
+        let all = Array(annotations.indices)
+        zOrder = ordered ? all : all.sorted { annotations[$0].zIndex < annotations[$1].zIndex }
+    }
+
+    /// Drops the rasterized element bitmaps (e.g. once a stored image has
+    /// finished loading, so the placeholder frame is replaced).
+    private func invalidateElementCaches() {
+        elementCache.removeAll(keepingCapacity: true)
+        pathCache.removeAll(keepingCapacity: true)
+    }
+
+    /// Marks just the screen area a world rectangle covers as needing a
+    /// repaint. Redrawing the whole full-screen overlay for a few pixels of
+    /// pen movement is the single biggest cost while drawing, so the hot
+    /// paths (live stroke, laser fade, marquee, hover) all come through here.
+    private func invalidate(worldRect: CGRect?) {
+        guard let w = worldRect, w.width.isFinite, w.height.isFinite else {
+            needsDisplay = true
+            return
+        }
+        let r = worldToScreen(w).insetBy(dx: -6, dy: -6)
+        guard r.intersects(bounds) else { return }
+        setNeedsDisplay(r.intersection(bounds))
+    }
+
+    /// Screen-space area the in-progress shape covers, padded for its
+    /// stroke, arrowheads and (for the laser) its glow.
+    private func currentWorldBounds() -> CGRect? {
+        guard let c = current else { return nil }
+        var r = c.points.count > 1 ? boundingRect(of: c.points) : c.rect
+        if c.points.count == 1, let p = c.points.first {
+            r = r.union(CGRect(x: p.x, y: p.y, width: 0, height: 0))
+        }
+        let glow: CGFloat = c.kind == .laser ? 8 : 3
+        let pad = max(12, c.strokeWidth * glow)
+        return r.insetBy(dx: -pad, dy: -pad)
+    }
+
+    /// Union of every live laser stroke, in world points.
+    private func laserWorldBounds() -> CGRect? {
+        var out: CGRect?
+        for a in annotations where a.kind == .laser {
+            let r = a.rect.insetBy(dx: -a.strokeWidth * 6, dy: -a.strokeWidth * 6)
+            out = out.map { $0.union(r) } ?? r
+        }
+        return out
+    }
+
+    private func index(ofElement id: String) -> Int? {
+        if idIndexGeneration != annotationsGeneration {
+            var map: [String: Int] = [:]
+            map.reserveCapacity(annotations.count)
+            for (i, a) in annotations.enumerated() { map[a.id] = i }
+            idIndexCache = map
+            idIndexGeneration = annotationsGeneration
+        }
+        return idIndexCache[id]
+    }
+
+    /// Array position a connector end is glued to. Resolves by stable id and
+    /// only falls back to the legacy stored index for drawings saved before
+    /// ids existed.
+    private func connectedIndex(_ c: ShapeConnection?) -> Int? {
+        guard let c else { return nil }
+        if let id = c.elementID, !id.isEmpty {
+            return index(ofElement: id)
+        }
+        return annotations.indices.contains(c.annotationIndex) ? c.annotationIndex : nil
+    }
+
+    /// Builds a connection to the element at `index`, recording both its id
+    /// (authoritative) and its current position (legacy readers).
+    private func makeConnection(index i: Int, side: Int, fraction: CGFloat = 0.5) -> ShapeConnection? {
+        guard annotations.indices.contains(i) else { return nil }
+        return ShapeConnection(
+            annotationIndex: i, elementID: annotations[i].id, side: side, fraction: fraction
+        )
+    }
+
+    /// Set while rendering to a bitmap destined for the clipboard or an
+    /// export, where waiting on a disk read is correct.
+    private var forcesSynchronousImageLoads = false
+
+    /// The pixels for an image element. Images live in `FileStore`, keyed by
+    /// the hash of their bytes; the first draw after a page loads kicks off an
+    /// off-main-thread read and repaints when it lands.
+    private func resolvedImage(_ a: Annotation) -> NSImage? {
+        if let img = a.image { return img }
+        guard let id = a.imageFileID else { return nil }
+        if forcesSynchronousImageLoads {
+            // Export / clipboard renders have to have the pixels now; they
+            // are already off the drawing hot path.
+            return FileStore.shared.imageNow(for: id)
+        }
+        return FileStore.shared.image(for: id) { [weak self] in
+            self?.invalidateElementCaches()
+            self?.needsDisplay = true
+        }
+    }
 
     // MARK: - world <-> screen coordinates
 
@@ -647,20 +824,32 @@ final class CanvasView: NSView, NSTextViewDelegate {
             .store(in: &cancellables)
         laserTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            guard self.annotations.contains(where: { $0.kind == .laser }) else { return }
+            // `hasLaserStrokes` is a flag, not a scan: this fires 30x a
+            // second forever, and scanning the whole drawing each tick taxed
+            // every large page even when no laser was ever used.
+            guard self.hasLaserStrokes else { return }
             let gone = Date().addingTimeInterval(-(self.laserFadeStart + self.laserFadeDuration))
-            let expired = self.annotations.contains { laser in
-                laser.kind == .laser
-                    && (laser.pointTimes.last ?? laser.createdAt) < gone
+            var remaining = false
+            var expired = false
+            for a in self.annotations where a.kind == .laser {
+                if (a.pointTimes.last ?? a.createdAt) < gone { expired = true } else { remaining = true }
             }
             if expired {
-                self.annotations.removeAll { laser in
-                    laser.kind == .laser
-                        && (laser.pointTimes.last ?? laser.createdAt) < gone
+                self.mutateLasers {
+                    self.annotations.removeAll { laser in
+                        laser.kind == .laser
+                            && (laser.pointTimes.last ?? laser.createdAt) < gone
+                    }
                 }
             }
-            // Redraw every tick while a laser exists so the fade animates.
-            self.needsDisplay = true
+            self.hasLaserStrokes = remaining
+            // Redraw every tick while a laser exists so the fade animates —
+            // but only over the strokes themselves, not the whole screen.
+            if remaining {
+                self.invalidate(worldRect: self.laserWorldBounds())
+            } else {
+                self.needsDisplay = true
+            }
         }
         loadAnnotations()
     }
@@ -981,11 +1170,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 strokeStyle: state.tool == .frame ? .dashed : state.strokeStyle,
                 arrowStart: state.tool == .doubleArrow ? .arrow : state.arrowStart,
                 arrowEnd: state.tool == .line ? .none : state.arrowEnd,
-                sloppiness: 0,
-                edgeRoughness: 0,
-                rx: state.cornerRadius,
-                ry: state.cornerRadiusY,
-                dynamicWidth: state.pressureMode == .dynamic
+                sloppiness: state.sloppiness.roughness,
+                edgeRoughness: state.sloppiness.edgeRoughness,
+                rx: state.edgeStyle == .round ? state.cornerRadius : 0,
+                ry: state.edgeStyle == .round ? state.cornerRadiusY : 0,
+                dynamicWidth: state.pressureMode == .dynamic,
+                fillStyle: state.fillStyle
             )
             // Straight arrows are predictable by default. The explicit
             // Bending arrow tool is reserved for box-avoiding diagram links.
@@ -993,7 +1183,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             // Connector tools grab the connection dot under the cursor, so
             // the line starts glued to that box's edge.
             if isConnectorTool(state.tool), let (i, s) = connectionDot(at: adjustedP) {
-                current?.connectionStart = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
+                current?.connectionStart = makeConnection(index: i, side: s)
                 if var c = current {
                     c.points = [connectionPoint(for: c.connectionStart, fallback: adjustedP)]
                     current = c
@@ -1056,6 +1246,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
             break
         default:
             guard var c = current else { return }
+            // The area the shape covered before this move has to be repainted
+            // too, otherwise the previous frame's ink stays on screen.
+            let previousBounds = currentWorldBounds()
             // Adjust point by canvas offset for drawing tools
             let adjustedP = screenToWorld(p)
             switch c.kind {
@@ -1069,14 +1262,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 c.rect = normalizedRect(from: dragStart, to: adjustedP)
             case .arrow, .line, .doubleArrow, .curvedConnector, .orthogonal, .connector:
                 var startP: CGPoint
-                if let cs = c.connectionStart, annotations.indices.contains(cs.annotationIndex) {
+                if let cs = c.connectionStart, connectedIndex(cs) != nil {
                     startP = connectionPoint(for: cs, fallback: dragStart)
                 } else {
                     startP = snappedBoundaryPoint(dragStart)
                 }
                 var endP: CGPoint
                 if let (i, s) = connectionDot(at: adjustedP) {
-                    c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
+                    c.connectionEnd = makeConnection(index: i, side: s)
                     endP = connectionPoint(for: c.connectionEnd, fallback: adjustedP)
                     Haptics.impact()
                 } else {
@@ -1091,6 +1284,19 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 break
             }
             current = c
+            // Repaint just the ink, not the whole screen. Routed connectors
+            // are the exception: their path bends around other boxes and can
+            // land far outside the span between its two ends.
+            if isRoutedElement(c) {
+                needsDisplay = true
+                return
+            }
+            if let now = currentWorldBounds() {
+                invalidate(worldRect: previousBounds.map { $0.union(now) } ?? now)
+            } else {
+                needsDisplay = true
+            }
+            return
         }
         needsDisplay = true
     }
@@ -1297,7 +1503,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             c.rect = boundingRect(of: c.points)
             // Re-check the release point: glued only if it landed on a dot.
             if let end = c.points.last, let (i, s) = connectionDot(at: end) {
-                c.connectionEnd = ShapeConnection(annotationIndex: i, side: s, fraction: 0.5)
+                c.connectionEnd = makeConnection(index: i, side: s)
                 c.points[c.points.count - 1] = connectionPoint(for: c.connectionEnd, fallback: end)
             } else {
                 c.connectionEnd = nil
@@ -1327,11 +1533,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
             c.strokeWidth = 3
             c.rect = boundingRect(of: c.points)
             guard c.points.count > 1 else { return }
+            hasLaserStrokes = true
         default:
             return
         }
 
-        c.zIndex = (annotations.map(\.zIndex).max() ?? 0) + 1
+        c.zIndex = nextZIndex()
         pushUndo()
         annotations.append(c)
         Haptics.tick()
@@ -1446,7 +1653,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 rotation: 0,
                 createdAt: Date(),
                 locked: false,
-                zIndex: (annotations.map(\.zIndex).max() ?? 0) + 1,
+                zIndex: nextZIndex(),
                 strokeStyle: .solid,
                 sloppiness: 0,
                 edgeRoughness: 0,
@@ -2252,7 +2459,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             rotation: 0,
             createdAt: Date(),
             locked: false,
-            zIndex: (annotations.map(\.zIndex).max() ?? 0) + 1,
+            zIndex: nextZIndex(),
             strokeStyle: .solid,
             sloppiness: 0,
             edgeRoughness: 0,
@@ -2342,7 +2549,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             rotation: 0,
             createdAt: Date(),
             locked: false,
-            zIndex: annotations.count,
+            zIndex: nextZIndex(),
             strokeStyle: .solid,
             sloppiness: 0,
             edgeRoughness: 0,
@@ -2356,6 +2563,68 @@ final class CanvasView: NSView, NSTextViewDelegate {
         ))
         selected = [annotations.count - 1]
         needsDisplay = true
+    }
+
+    /// Places an image on the canvas at a world point.
+    ///
+    /// The bytes go straight into the blob store and the element keeps only
+    /// the id, so the drawing in memory stays small however many (or however
+    /// large) the images are.
+    @discardableResult
+    private func placeImage(_ img: NSImage, centeredAt world: CGPoint?, topLeftAt corner: CGPoint? = nil) -> Int? {
+        let maxW: CGFloat = 360
+        var size = img.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        if size.width > maxW {
+            let k = maxW / size.width
+            size = CGSize(width: maxW, height: size.height * k)
+        }
+        let origin: CGPoint
+        if let corner {
+            origin = corner
+        } else if let world {
+            origin = CGPoint(x: world.x - size.width / 2, y: world.y - size.height / 2)
+        } else {
+            origin = .zero
+        }
+        let fileID = FileStore.shared.store(image: img)
+        pushUndo()
+        var a = Annotation(
+            kind: .image,
+            rect: CGRect(origin: origin, size: size),
+            strokeColor: state.strokeColor,
+            fillColor: nil,
+            fillOpacity: state.fillOpacity,
+            strokeWidth: 2,
+            opacity: state.elementOpacity,
+            points: [],
+            pointTimes: [],
+            text: "",
+            fontFamily: "Virgil",
+            fontSize: 24,
+            image: fileID == nil ? img : nil,
+            rounded: false,
+            dashed: false,
+            rotation: 0,
+            createdAt: Date(),
+            locked: false,
+            zIndex: nextZIndex()
+        )
+        a.imageFileID = fileID
+        annotations.append(a)
+        selected = [annotations.count - 1]
+        needsDisplay = true
+        return annotations.count - 1
+    }
+
+    /// One above the current top of the stack. Elements used to be appended
+    /// with `annotations.count` in some places and `max(zIndex) + 1` in
+    /// others, which made a symbol inserted after a few deletions slide
+    /// underneath existing shapes.
+    private func nextZIndex() -> Int {
+        var top = 0
+        for a in annotations { top = max(top, a.zIndex) }
+        return top + 1
     }
 
     private func pickImage(at p: CGPoint) {
@@ -2375,74 +2644,20 @@ final class CanvasView: NSView, NSTextViewDelegate {
             panel.beginSheetModal(for: window) { [weak self] response in
                 guard let self, response == .OK, let url = panel.url,
                       let img = NSImage(contentsOf: url) else { return }
-                let maxW: CGFloat = 360
-                var s = img.size
-                if s.width > maxW {
-                    let k = maxW / s.width
-                    s = CGSize(width: maxW, height: s.height * k)
-                }
                 // Convert window point to canvas coordinates at placement time
                 let canvasPoint = self.convert(windowPoint, from: nil)
                 let adjustedPoint = self.screenToWorld(canvasPoint)
-                self.pushUndo()
-                self.annotations.append(Annotation(
-                    kind: .image,
-                    rect: CGRect(origin: adjustedPoint, size: s),
-                    strokeColor: .black,
-                    fillColor: nil,
-                    fillOpacity: state.fillOpacity,
-                    strokeWidth: 2,
-                    points: [],
-                    pointTimes: [],
-                    text: "",
-                    fontFamily: "Virgil",
-                    fontSize: 24,
-                    image: img,
-                    rounded: false,
-                    dashed: false,
-                    rotation: 0,
-                    createdAt: Date(),
-                    locked: false,
-                    zIndex: (self.annotations.map(\.zIndex).max() ?? 0) + 1
-                ))
-                self.needsDisplay = true
+                self.placeImage(img, centeredAt: nil, topLeftAt: adjustedPoint)
             }
         } else {
             // Fallback to non-sheet if no window
             panel.begin { [weak self] response in
                 guard let self, response == .OK, let url = panel.url,
                       let img = NSImage(contentsOf: url) else { return }
-                let maxW: CGFloat = 360
-                var s = img.size
-                if s.width > maxW {
-                    let k = maxW / s.width
-                    s = CGSize(width: maxW, height: s.height * k)
-                }
                 // Convert window point to canvas coordinates at placement time
                 let canvasPoint = self.convert(windowPoint, from: nil)
                 let adjustedPoint = self.screenToWorld(canvasPoint)
-                self.pushUndo()
-                self.annotations.append(Annotation(
-                    kind: .image,
-                    rect: CGRect(origin: adjustedPoint, size: s),
-                    strokeColor: .black,
-                    fillColor: nil,
-                    fillOpacity: state.fillOpacity,
-                    strokeWidth: 2,
-                    points: [],
-                    pointTimes: [],
-                    text: "",
-                    fontFamily: "Virgil",
-                    fontSize: 24,
-                    image: img,
-                    rounded: false,
-                    dashed: false,
-                    rotation: 0,
-                    createdAt: Date(),
-                    locked: false,
-                    zIndex: (self.annotations.map(\.zIndex).max() ?? 0) + 1
-                ))
-                self.needsDisplay = true
+                self.placeImage(img, centeredAt: nil, topLeftAt: adjustedPoint)
             }
         }
     }
@@ -2558,8 +2773,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
                                        strokeWidth: state.strokeWidth, opacity: state.elementOpacity,
                                        points: [start, end], strokeStyle: state.strokeStyle,
                                        arrowStart: .none, arrowEnd: .arrow)
-            connector.connectionStart = ShapeConnection(annotationIndex: fromIndex, side: facingSide(from: start, toward: end), fraction: 0.5)
-            connector.connectionEnd = ShapeConnection(annotationIndex: toIndex, side: facingSide(from: end, toward: start), fraction: 0.5)
+            connector.connectionStart = makeConnection(index: fromIndex, side: facingSide(from: start, toward: end))
+            connector.connectionEnd = makeConnection(index: toIndex, side: facingSide(from: end, toward: start))
             annotations.append(connector)
             if let label = edge.label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
@@ -2585,12 +2800,46 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// transient, so they are never persisted). Skips the write when nothing
     /// changed.
     private func saveAnnotations() {
+        let hash = persistHash()
+        if hash == lastSavedHash {
+            // Nothing in the drawing changed; the view may still have moved.
+            pages.setViewState(pan: canvasOffset, zoom: zoom)
+            return
+        }
+        lastSavedHash = hash
         let items = annotations.filter { $0.kind != .laser }.map { $0.persisted() }
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        if data == lastSavedData { return }
-        lastSavedData = data
         pages.updateCurrentAnnotations(items)
         pages.setViewState(pan: canvasOffset, zoom: zoom)
+    }
+
+    /// Cheap content hash of everything that gets written to disk. Compared
+    /// against the last save so an edit that ends where it started (drag and
+    /// drop back, open and close a text field) doesn't rewrite the file.
+    private func persistHash() -> Int {
+        var h = Hasher()
+        h.combine(annotations.count)
+        for a in annotations where a.kind != .laser {
+            h.combine(a.id)
+            h.combine(renderFingerprint(a))
+            h.combine(a.locked)
+            h.combine(a.zIndex)
+            h.combine(a.routesAroundObstacles)
+            h.combine(a.connectionStart?.elementID)
+            h.combine(a.connectionStart?.side)
+            h.combine(a.connectionEnd?.elementID)
+            h.combine(a.connectionEnd?.side)
+        }
+        return h.finalize()
+    }
+
+    /// Writes any pending edit right now — used when the app is about to quit
+    /// or the overlay closes, so the debounce window can never swallow the
+    /// last stroke.
+    func flushPendingSave() {
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        commitPendingText()
+        saveAnnotations()
     }
 
     /// Coalesces bursts of edits (e.g. drag frames) into a single disk write.
@@ -2637,7 +2886,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
         annotations = pages.currentAnnotations().map { .restored(from: $0) }
         selected = []
         undoStack = []
-        lastSavedData = nil
+        lastSavedHash = persistHash()
+        hasLaserStrokes = false
+        invalidateElementCaches()
+        idIndexGeneration = -1
+        derivedOrderGeneration = -1
         let (pan, z) = pages.viewState()
         canvasOffset = pan
         zoom = min(8, max(0.15, z))
@@ -2755,7 +3008,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         selftestLastPasteContext = (cursor: lastCanvasCursor, point: pastePoint, zoom: zoom, offset: canvasOffset, bounds: bounds, anchor: anchor, incomingKinds: incoming.map(\.kind.rawValue), incomingRects: incoming.map(\.rect))
         let dx = worldPaste.x - anchor.midX
         let dy = worldPaste.y - anchor.midY
-        let topZ = (annotations.map(\.zIndex).max() ?? 0) + 1
+        let topZ = nextZIndex()
         var added: [Int] = []
         for var c in incoming {
             c.rect = c.rect.offsetBy(dx: dx, dy: dy)
@@ -2807,45 +3060,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// annotation at the cursor.
     private func pasteSystemImage() -> Bool {
         guard let img = NSImage(pasteboard: NSPasteboard.general) else { return false }
-        pushUndo()
         var p = lastCanvasCursor ?? CGPoint(x: bounds.midX, y: bounds.midY)
         if !bounds.contains(p) {
             p = CGPoint(x: bounds.midX, y: bounds.midY)
         }
         let adjusted = screenToWorld(p)
-        var size = img.size
-        let maxW: CGFloat = 360
-        if size.width > maxW {
-            let k = maxW / size.width
-            size = CGSize(width: maxW, height: size.height * k)
-        }
-        annotations.append(Annotation(
-            kind: .image,
-            rect: CGRect(
-                x: adjusted.x - size.width / 2,
-                y: adjusted.y - size.height / 2,
-                width: size.width,
-                height: size.height
-            ),
-            strokeColor: state.strokeColor,
-            fillColor: nil,
-            fillOpacity: state.fillOpacity,
-            strokeWidth: 2,
-            points: [],
-            pointTimes: [],
-            text: "",
-            fontFamily: "Virgil",
-            fontSize: 24,
-            image: img,
-            rounded: false,
-            dashed: false,
-            rotation: 0,
-            createdAt: Date(),
-            locked: false,
-            zIndex: (annotations.map(\.zIndex).max() ?? 0) + 1
-        ))
-        selected = [annotations.count - 1]
-        needsDisplay = true
+        guard placeImage(img, centeredAt: adjusted) != nil else { return false }
         scheduleSave()
         return true
     }
@@ -2869,6 +3089,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
                   space: CGColorSpaceCreateDeviceRGB(),
                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else { return nil }
+        forcesSynchronousImageLoads = true
+        defer { forcesSynchronousImageLoads = false }
         NSGraphicsContext.saveGraphicsState()
         // `isFlipped` is as important as the CTM below: AppKit uses it when
         // laying out glyphs. A y-flipped bitmap context marked unflipped
@@ -2896,7 +3118,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Per-element bitmap cache — each annotation is rasterized once (at the
     /// current zoom) and then blitted on later frames, so panning, zooming,
     /// the laser fade and live strokes never re-paint the static scene.
-    private var elementCache: [Int: ElementCacheEntry] = [:]
+    private var elementCache: [String: ElementCacheEntry] = [:]
     private struct ElementCacheEntry {
         var image: NSImage
         var pad: CGFloat
@@ -2906,7 +3128,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
     /// Path cache — skips rebuilding NSBezierPaths (and connector routing
     /// inputs) on every frame for elements that haven't changed.
-    private var pathCache: [Int: PathCacheEntry] = [:]
+    private var pathCache: [String: PathCacheEntry] = [:]
     private struct PathCacheEntry {
         var path: NSBezierPath
         var fingerprint: Int
@@ -2964,12 +3186,17 @@ final class CanvasView: NSView, NSTextViewDelegate {
         h.combine(a.textAnchor.rawValue)
         h.combine(a.textAutoResize)
         h.combine(a.symbol)
-        h.combine(a.richTextData)
+        h.combine(a.fillStyle.rawValue)
+        // Length only: the rich text is always derived from `text`, which is
+        // hashed above, and hashing tens of kilobytes of RTF on every frame
+        // is pure overhead.
+        h.combine(a.richTextData?.count ?? 0)
         h.combine(a.nodeTexts)
         h.combine(a.createdAt)
         h.combine(state.canvasBackground.rawValue)
         h.combine(colorHash(a.strokeColor))
         h.combine(a.fillColor.map { colorHash($0) } ?? -1)
+        h.combine(a.imageFileID)
         if let img = a.image { h.combine(ObjectIdentifier(img).hashValue) } else { h.combine(0) }
         h.combine(a.points.count)
         // Long freehand strokes are only ever transformed as a whole after
@@ -2983,13 +3210,27 @@ final class CanvasView: NSView, NSTextViewDelegate {
         return h.finalize()
     }
 
+    /// Hash of a color, memoized per NSColor instance.
+    ///
+    /// This is called for every visible element on every frame, and
+    /// `usingColorSpace` allocates a fresh NSColor each time — which showed
+    /// up as steady per-frame churn on dense pages. Elements hold on to the
+    /// same color object for their lifetime, so caching by object identity
+    /// hits essentially always.
+    private var colorHashCache: [ObjectIdentifier: Int] = [:]
+
     private func colorHash(_ c: NSColor) -> Int {
+        let key = ObjectIdentifier(c)
+        if let hit = colorHashCache[key] { return hit }
         let s = c.usingColorSpace(.sRGB) ?? c
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 1
         s.getRed(&r, green: &g, blue: &b, alpha: &a)
         var h = Hasher()
         h.combine(r); h.combine(g); h.combine(b); h.combine(a)
-        return h.finalize()
+        let out = h.finalize()
+        if colorHashCache.count > 4096 { colorHashCache.removeAll(keepingCapacity: true) }
+        colorHashCache[key] = out
+        return out
     }
 
     /// Extra world-space room a rotated shape needs so its corners (which can
@@ -3030,30 +3271,31 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private func cachedPath(for a: Annotation, index: Int) -> NSBezierPath {
         if isRoutedElement(a) { return bezierPath(for: a) }
         let fp = renderFingerprint(a)
-        if var e = pathCache[index], e.fingerprint == fp {
+        if var e = pathCache[a.id], e.fingerprint == fp {
             e.lastUsed = frameCounter
-            pathCache[index] = e
+            pathCache[a.id] = e
             return e.path
         }
         let p = bezierPath(for: a)
-        pathCache[index] = PathCacheEntry(path: p, fingerprint: fp, lastUsed: frameCounter)
+        pathCache[a.id] = PathCacheEntry(path: p, fingerprint: fp, lastUsed: frameCounter)
         return p
     }
 
     /// Visible annotations in z-order (viewport culling — off-screen elements
     /// are skipped entirely, which is the big win with dense canvases).
     private func visibleAnnotations(in worldVisible: CGRect) -> [Int] {
+        rebuildDerivedOrderIfNeeded()
         var indices: [Int] = []
-        for (i, a) in annotations.enumerated() {
+        indices.reserveCapacity(min(annotations.count, 512))
+        for i in zOrder {
+            let a = annotations[i]
             // Only fully degenerate (zero-area, zero-dimension) rects are
             // skipped. A horizontal/vertical line's rect has one zero
             // dimension and must still be drawn.
             guard a.rect.width > 0 || a.rect.height > 0 else { continue }
-            let pad = 32 + a.strokeWidth + rotationPad(for: a)
-            let inflated = worldVisible.insetBy(dx: -pad, dy: -pad)
-            if inflated.intersects(a.rect) { indices.append(i) }
+            if renderBounds[i].intersects(worldVisible) { indices.append(i) }
         }
-        return indices.sorted { annotations[$0].zIndex < annotations[$1].zIndex }
+        return indices
     }
 
     /// Rasterizes one annotation into its own bitmap at the current zoom and
@@ -3117,7 +3359,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
             elementCache = elementCache.filter { $0.value.lastUsed > frameCounter - 2 }
         }
         if pathCache.count > max(512, annotations.count * 2) {
-            pathCache.removeAll()
+            pathCache.removeAll(keepingCapacity: true)
+        }
+        // Entries for elements that no longer exist would otherwise sit in
+        // these dictionaries for the rest of the session now that they are
+        // keyed by a stable id rather than an array slot.
+        if elementCache.count > annotations.count + 256 || pathCache.count > annotations.count + 256 {
+            let live = Set(annotations.map(\.id))
+            elementCache = elementCache.filter { live.contains($0.key) }
+            pathCache = pathCache.filter { live.contains($0.key) }
         }
     }
 
@@ -3129,14 +3379,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
         guard NSGraphicsContext.current != nil else { return }
         frameCounter += 1
 
+        // Repaint only what AppKit asked for. The overlay covers the whole
+        // screen, so honouring the dirty rect is what keeps a pen stroke at
+        // 120 Hz: a frame costs the few hundred pixels the nib moved over,
+        // not five million.
+        let paintRect = dirtyRect.isEmpty ? bounds : dirtyRect.intersection(bounds)
+        guard !paintRect.isEmpty else { return }
+
         // Solid backdrop — "writing on a white/black/colored screen" mode.
         if let bgColor = state.canvasBackground.environmentColor {
             bgColor.setFill()
-            bounds.fill()
+            paintRect.fill()
         }
 
-        // Only elements that actually intersect the viewport are painted.
-        let sortedVisible = visibleAnnotations(in: screenToWorld(bounds))
+        // Only elements that actually intersect the repainted area are drawn.
+        let sortedVisible = visibleAnnotations(in: screenToWorld(paintRect))
         var sceneChanged = editingView != nil
 
         for i in sortedVisible {
@@ -3158,11 +3415,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 continue
             }
             let fp = renderFingerprint(a)
-            if var e = elementCache[i],
+            if var e = elementCache[a.id],
                e.fingerprint == fp,
                isZoomCached(e.renderZoom, current: zoom) {
                 e.lastUsed = frameCounter
-                elementCache[i] = e
+                elementCache[a.id] = e
                 e.image.draw(in: worldToScreen(a.rect.insetBy(dx: -e.pad, dy: -e.pad)))
                 if selected.contains(i) {
                     drawTransformed { drawSelectionBox(a, index: i) }
@@ -3170,7 +3427,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             } else {
                 sceneChanged = true
                 if let entry = renderElementBitmap(a, fingerprint: fp) {
-                    elementCache[i] = entry
+                    elementCache[a.id] = entry
                     entry.image.draw(in: worldToScreen(a.rect.insetBy(dx: -entry.pad, dy: -entry.pad)))
                     if selected.contains(i) {
                         drawTransformed { drawSelectionBox(a, index: i) }
@@ -3225,12 +3482,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if isConnectorTool(state.tool) {
                 var dotShapes: Set<Int> = []
                 if let i = hoverShapeIndex { dotShapes.insert(i) }
-                if let c = current, let cs = c.connectionStart { dotShapes.insert(cs.annotationIndex) }
+                if let c = current, let i = connectedIndex(c.connectionStart) { dotShapes.insert(i) }
                 for i in dotShapes where annotations.indices.contains(i) {
                     let a = annotations[i]
                     guard isClosed(a.kind), a.kind != .laser else { continue }
                     for (side, p) in connectionDots(for: a) {
-                        let isSource = current?.connectionStart?.annotationIndex == i && current?.connectionStart?.side == side
+                        let isSource = connectedIndex(current?.connectionStart) == i
+                            && current?.connectionStart?.side == side
                         let isTarget = hoverShapeIndex == i && hoverSide == side && current != nil
                         if isSource || isTarget {
                             NSColor(calibratedRed: 0.42, green: 0.4, blue: 0.86, alpha: 1).setFill()
@@ -3251,7 +3509,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if sceneChanged { minimapDirty = true }
         evictCaches()
 
-        if state.drawingMode {
+        if state.drawingMode, paintRect.intersects(minimapRect()) {
             drawMinimap()
         }
     }
@@ -4109,7 +4367,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// baked into the covered area so tilted icons never crop.
     private func drawImageAnnotation(_ a: Annotation) {
         guard let symbol = a.symbol else {
-            a.image?.draw(in: a.rect)
+            if let img = resolvedImage(a) {
+                img.draw(in: a.rect)
+            } else if a.imageFileID != nil {
+                // The bitmap is still being read off disk — hold the slot
+                // with a faint frame so the layout doesn't jump when it
+                // lands a frame later.
+                NSColor(calibratedWhite: 0.5, alpha: 0.18).setFill()
+                NSBezierPath(roundedRect: a.rect, xRadius: 6, yRadius: 6).fill()
+            }
             return
         }
         let screen = worldToScreen(a.rect)
@@ -5420,8 +5686,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// Resolves a glued connector end against the shape's *current* rect, so
     /// the line follows the box when it moves, resizes or rotates.
     private func connectionPoint(for c: ShapeConnection?, fallback: CGPoint) -> CGPoint {
-        guard let c, annotations.indices.contains(c.annotationIndex) else { return fallback }
-        let a = annotations[c.annotationIndex]
+        guard let c, let idx = connectedIndex(c) else { return fallback }
+        let a = annotations[idx]
         let r = a.rect
         let fx = r.minX + r.width * c.fraction
         let fy = r.minY + r.height * c.fraction
@@ -5438,8 +5704,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// The outward edge normal at a glued connector end — the connector must
     /// leave / enter the shape perpendicular to that edge.
     private func connectionNormal(for c: ShapeConnection?) -> CGPoint? {
-        guard let c, annotations.indices.contains(c.annotationIndex) else { return nil }
-        let a = annotations[c.annotationIndex]
+        guard let c, let idx = connectedIndex(c) else { return nil }
+        let a = annotations[idx]
         let base: CGPoint
         switch c.side {
         case 0: base = CGPoint(x: 0, y: 1)
@@ -5505,8 +5771,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     /// itself is never its own obstacle.
     private func connectorObstacles(for a: Annotation, margin: CGFloat) -> [CGRect] {
         var out: [CGRect] = []
-        let startIdx = a.connectionStart?.annotationIndex
-        let endIdx = a.connectionEnd?.annotationIndex
+        let startIdx = connectedIndex(a.connectionStart)
+        let endIdx = connectedIndex(a.connectionEnd)
         for (i, other) in annotations.enumerated() {
             // The connector's glued owner shapes are not obstacles — their
             // inflated rects would swallow the connector's own endpoints.

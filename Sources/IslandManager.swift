@@ -72,6 +72,33 @@ final class IslandManager {
     /// If a transition has been in flight longer than this, force a clean reset
     /// instead of queueing another pending toggle.
     private let transitionTimeout: TimeInterval = 4.0
+
+    /// Identifies the current show/hide transition.
+    ///
+    /// Every animation completion handler and every watchdog captures the
+    /// token it was scheduled under and does nothing once a newer transition
+    /// has started. Guarding only on `isAnimating` (which is shared by all
+    /// transitions) let a watchdog left over from an earlier *open* re-install
+    /// the overlay while it was closing, and an *old* collapse handler then
+    /// tore down the overlay the user had just reopened — leaving a visible
+    /// window with no canvas in it and a hotkey that appeared dead until the
+    /// app was relaunched.
+    private var transitionToken = 0
+
+    /// Starts a new transition and returns its token.
+    private func beginTransition() -> Int {
+        transitionToken += 1
+        isAnimating = true
+        animatingSince = Date()
+        return transitionToken
+    }
+
+    /// Invalidates everything still scheduled from earlier transitions.
+    private func cancelPendingTransitions() {
+        transitionToken += 1
+        isAnimating = false
+        animatingSince = nil
+    }
     /// A show/hide intent queued while a transition animation was running.
     private var pendingToggle: Bool?
     private var logoPalette: LogoPaletteView?
@@ -234,13 +261,13 @@ private func toggleSidebar() {
     /// Drops the overlay to a clean, fully-hidden state (no animation, no
     /// monitors, nothing queued). Safe to call at any time and from any state.
     func recoverStuckTransition() {
+        Diag.log("recoverStuckTransition")
+        cancelPendingTransitions()
         teardownContent()
         window.orderOut(nil)
         window.alphaValue = 1
         isShowing = false
-        isAnimating = false
         pendingToggle = nil
-        animatingSince = nil
         state.drawingMode = false
     }
 
@@ -264,8 +291,9 @@ private func toggleSidebar() {
     /// bundle is replaced underneath during a self-update. Called from
     /// AppUpdater.onInstallStarting *on the main thread* before the swap.
     func prepareForInstall() {
+        Diag.log("prepareForInstall")
         pendingToggle = nil
-        isAnimating = false
+        cancelPendingTransitions()
         isShowing = false
         teardownContent()
         window.orderOut(nil)
@@ -285,10 +313,10 @@ private func toggleSidebar() {
     }
 
     func show() {
+        Diag.log("show isShowing=\(isShowing) isAnimating=\(isAnimating)")
         guard !isShowing, !isAnimating else { return }
         isShowing = true
-        isAnimating = true
-        animatingSince = Date()
+        let token = beginTransition()
 
         let screen = screenForMouse() ?? NSScreen.main ?? NSScreen.screens[0]
         let pill = pillRect(on: screen)
@@ -311,19 +339,21 @@ private func toggleSidebar() {
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             window.animator().setFrame(screen.frame, display: true)
         } completionHandler: { [weak self] in
-            self?.finishShow(on: screen)
+            self?.finishShow(on: screen, token: token)
         }
 
         // Watchdog: if the frame animation never completes for any reason,
         // install the content anyway so the overlay can't get stuck.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, self.isAnimating else { return }
-            self.finishShow(on: screen)
+            self?.finishShow(on: screen, token: token)
         }
     }
 
-    private func finishShow(on screen: NSScreen) {
-        guard isAnimating else { return }
+    private func finishShow(on screen: NSScreen, token: Int) {
+        Diag.log("finishShow token=\(token)/\(transitionToken) isAnimating=\(isAnimating) isShowing=\(isShowing)")
+        // `isShowing` is part of the guard as well as the token: a watchdog
+        // must never install the overlay's content while it is on its way out.
+        guard token == transitionToken, isAnimating, isShowing else { return }
         installContent(on: screen)
         isAnimating = false
         animatingSince = nil
@@ -331,10 +361,10 @@ private func toggleSidebar() {
     }
 
     func hide() {
+        Diag.log("hide isShowing=\(isShowing) isAnimating=\(isAnimating)")
         guard isShowing, !isAnimating else { return }
         isShowing = false
-        isAnimating = true
-        animatingSince = Date()
+        let token = beginTransition()
 
         let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
 
@@ -343,17 +373,28 @@ private func toggleSidebar() {
                 ctx.duration = 0.15
                 cv.animator().alphaValue = 0
             } completionHandler: { [weak self] in
-                guard let self else { return }
-                self.canvas?.commitPendingText()
+                guard let self, token == self.transitionToken, !self.isShowing else { return }
+                // Flush the drawing before the canvas goes away, not after.
+                self.canvas?.flushPendingSave()
                 self.teardownContent()
-                self.collapseToPill(on: screen)
+                self.collapseToPill(on: screen, token: token)
+            }
+            // Fade watchdog: AppKit drops this completion handler if the
+            // window's content is swapped under it, which used to leave the
+            // overlay half-closed with its monitors still installed.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, token == self.transitionToken, !self.isShowing,
+                      self.isAnimating, self.contentView() is ContainerView else { return }
+                self.canvas?.flushPendingSave()
+                self.teardownContent()
+                self.collapseToPill(on: screen, token: token)
             }
         } else {
-            collapseToPill(on: screen)
+            collapseToPill(on: screen, token: token)
         }
     }
 
-    private func collapseToPill(on screen: NSScreen) {
+    private func collapseToPill(on screen: NSScreen, token: Int) {
         let pill = pillRect(on: screen)
         window.contentView = makePillView(frame: pill)
         window.alphaValue = 1
@@ -363,19 +404,19 @@ private func toggleSidebar() {
             ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             window.animator().setFrame(pill, display: true)
         } completionHandler: { [weak self] in
-            self?.finishCollapse()
+            self?.finishCollapse(token: token)
         }
         // Watchdog: if the collapse animation never completes for any reason,
         // drop the window anyway so a stuck transition can't dead-lock the
         // Control+Option shortcut forever.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, self.isAnimating else { return }
-            self.finishCollapse()
+            self?.finishCollapse(token: token)
         }
     }
 
-    private func finishCollapse() {
-        guard isAnimating else { return }
+    private func finishCollapse(token: Int) {
+        Diag.log("finishCollapse token=\(token)/\(transitionToken) isAnimating=\(isAnimating) isShowing=\(isShowing)")
+        guard token == transitionToken, isAnimating, !isShowing else { return }
         window.orderOut(nil)
         window.alphaValue = 1
         isAnimating = false
@@ -480,6 +521,7 @@ private func toggleSidebar() {
         container.isDrawingMode = { [weak self] in self?.state.drawingMode ?? false }
 
         window.contentView = container
+        Diag.log("installContent done")
         window.setFrame(screen.frame, display: true)
         // Re-assert ordering: after a Space/display change the panel can end
         // up behind other windows even though its level is screenSaver.
@@ -494,75 +536,7 @@ private func toggleSidebar() {
         updater.checkNow()
 
         undoMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, let canvas = self.canvas else { return event }
-            let mods = event.modifierFlags.intersection([.command, .control, .option])
-
-            // While the "/" palette is open, every key belongs to its search
-            // field (including Esc, which closes it).
-            if self.isLogoPaletteVisible { return event }
-
-            // While a text block is being edited every key belongs to it —
-            // Esc commits it, Cmd+A selects all its text (this app has no
-            // menu bar, so the ⌘A key equivalent never reaches the field),
-            // and everything else goes to the editor.
-            if canvas.isEditingText {
-                if self.handleEditingKey(event, canvas: canvas) { return nil }
-                return event
-            }
-
-            // While a search field is focused (the "/" palette or the shapes
-            // palette search), keys belong to it — never trigger tools from
-            // typing a shortcut letter into a search box.
-            // SwiftUI TextField/SecureField bridge to NSTextField, while
-            // TextEditor/search fields bridge to NSTextView. Let both classes
-            // receive standard editing commands such as Cmd+V instead of
-            // routing them to the canvas paste handler.
-            if let responder = NSApp.keyWindow?.firstResponder,
-               responder is NSTextView || responder is NSTextField {
-                return event
-            }
-
-            if event.keyCode == 53 { // Esc — the canvas clears its selection
-                return event
-            }
-            if !mods.isEmpty {
-                let key = event.charactersIgnoringModifiers?.lowercased()
-                if mods.contains(.command), key == "z" {
-                    canvas.undo()
-                    return nil
-                }
-                if mods.contains(.command), key == "c" {
-                    canvas.copySelection()
-                    return nil
-                }
-                if mods.contains(.command), key == "x" {
-                    canvas.cutSelection()
-                    return nil
-                }
-                if mods.contains(.command), key == "v" {
-                    canvas.paste()
-                    return nil
-                }
-                return event
-            }
-            if event.charactersIgnoringModifiers == "/", !mods.contains(.command) {
-                if self.state.drawingMode { self.showLogoPalette() }
-                return nil
-            }
-            if !self.state.drawingMode { return event }
-            if event.keyCode == 51 { // delete
-                canvas.deleteSelected()
-                return nil
-            }
-            if let key = event.charactersIgnoringModifiers?.lowercased(),
-               let tool = Shortcuts.tool(for: key) {
-                if tool != .text {
-                    self.state.lastNonTextTool = tool
-                }
-                self.state.tool = tool
-                return nil
-            }
-            return event
+            self?.handleMonitoredKey(event) ?? event
         }
 
         // Two-finger scroll + pinch can be eaten by SwiftUI scroll views in
@@ -598,6 +572,7 @@ private func toggleSidebar() {
     }
 
     private func teardownContent() {
+        Diag.log("teardownContent isShowing=\(isShowing) isAnimating=\(isAnimating)")
         if let m = undoMonitor {
             NSEvent.removeMonitor(m)
             undoMonitor = nil
@@ -684,7 +659,7 @@ private func toggleSidebar() {
                         log("reopen: visible=\(self.isOverlayVisible) drawingMode=\(self.state.drawingMode)")
                         self.pollIdle(log: log, until: .now() + 3.0) {
                             guard self.isOverlayVisible, self.state.drawingMode, self.canvas != nil else {
-                                log("FAIL: overlay did not reopen in drawing mode")
+                                log("FAIL: overlay did not reopen in drawing mode (visible=\(self.isOverlayVisible) drawingMode=\(self.state.drawingMode) canvas=\(self.canvas != nil))")
                                 exit(1)
                             }
                             self.textEditingTest(log: log)
@@ -1942,14 +1917,133 @@ private func toggleSidebar() {
         ev.post(tap: .cghidEventTap)
     }
 
-    private func postKeyDown(keyCode: CGKeyCode, flags: CGEventFlags = []) {
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else { return }
-        down.flags = flags
-        down.post(tap: .cghidEventTap)
-        if let up = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false) {
-            up.flags = flags
-            up.post(tap: .cghidEventTap)
+    /// Feeds a key press through the overlay's real keyboard routing.
+    ///
+    /// Synthesizing an NSEvent and calling `handleMonitoredKey` exercises the
+    /// same code the local monitor runs, without depending on the OS letting
+    /// this process post HID events (posting silently no-ops unless the
+    /// binary is trusted for Accessibility, which made every keyboard step of
+    /// the self-test unrunnable outside a granted build).
+    @discardableResult
+    private func postKeyDown(keyCode: CGKeyCode, flags: CGEventFlags = []) -> Bool {
+        var mods: NSEvent.ModifierFlags = []
+        if flags.contains(.maskCommand) { mods.insert(.command) }
+        if flags.contains(.maskAlternate) { mods.insert(.option) }
+        if flags.contains(.maskControl) { mods.insert(.control) }
+        if flags.contains(.maskShift) { mods.insert(.shift) }
+        let chars = Self.characters(forKeyCode: keyCode)
+        guard let event = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: mods,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: chars,
+            charactersIgnoringModifiers: chars,
+            isARepeat: false,
+            keyCode: UInt16(keyCode)
+        ) else { return false }
+        return handleMonitoredKey(event) == nil
+    }
+
+    /// The characters a few virtual key codes produce — enough for the keys
+    /// the self-test drives.
+    private static func characters(forKeyCode code: CGKeyCode) -> String {
+        switch code {
+        case 53: return "\u{1b}"   // Esc
+        case 51: return "\u{8}"    // Delete
+        case 36: return "\r"       // Return
+        case 0: return "a"
+        case 8: return "c"
+        case 7: return "x"
+        case 9: return "v"
+        case 6: return "z"
+        case 11: return "b"
+        case 44: return "/"
+        default: return ""
         }
+    }
+
+    /// Every key press that reaches the overlay, in one place.
+    ///
+    /// The local event monitor is a one-line forwarder to this, so the whole
+    /// keyboard routing (text editing, the "/" palette, tool shortcuts,
+    /// clipboard commands) can be exercised directly — the self-test used to
+    /// drive it through `CGEvent.post`, which the OS silently drops unless
+    /// the running binary happens to be trusted for Accessibility.
+    ///
+    /// Returns nil when the event was consumed.
+    func handleMonitoredKey(_ event: NSEvent) -> NSEvent? {
+        guard let canvas = self.canvas else { return event }
+        let mods = event.modifierFlags.intersection([.command, .control, .option])
+
+        // While the "/" palette is open, every key belongs to its search
+        // field (including Esc, which closes it).
+        if self.isLogoPaletteVisible { return event }
+
+        // While a text block is being edited every key belongs to it —
+        // Esc commits it, Cmd+A selects all its text (this app has no
+        // menu bar, so the ⌘A key equivalent never reaches the field),
+        // and everything else goes to the editor.
+        if canvas.isEditingText {
+            if self.handleEditingKey(event, canvas: canvas) { return nil }
+            return event
+        }
+
+        // While a search field is focused (the "/" palette or the shapes
+        // palette search), keys belong to it — never trigger tools from
+        // typing a shortcut letter into a search box.
+        // SwiftUI TextField/SecureField bridge to NSTextField, while
+        // TextEditor/search fields bridge to NSTextView. Let both classes
+        // receive standard editing commands such as Cmd+V instead of
+        // routing them to the canvas paste handler.
+        if let responder = NSApp.keyWindow?.firstResponder,
+           responder is NSTextView || responder is NSTextField {
+            return event
+        }
+
+        if event.keyCode == 53 { // Esc — the canvas clears its selection
+            return event
+        }
+        if !mods.isEmpty {
+            let key = event.charactersIgnoringModifiers?.lowercased()
+            if mods.contains(.command), key == "z" {
+                canvas.undo()
+                return nil
+            }
+            if mods.contains(.command), key == "c" {
+                canvas.copySelection()
+                return nil
+            }
+            if mods.contains(.command), key == "x" {
+                canvas.cutSelection()
+                return nil
+            }
+            if mods.contains(.command), key == "v" {
+                canvas.paste()
+                return nil
+            }
+            return event
+        }
+        if event.charactersIgnoringModifiers == "/", !mods.contains(.command) {
+            if self.state.drawingMode { self.showLogoPalette() }
+            return nil
+        }
+        if !self.state.drawingMode { return event }
+        if event.keyCode == 51 { // delete
+            canvas.deleteSelected()
+            return nil
+        }
+        if let key = event.charactersIgnoringModifiers?.lowercased(),
+           let tool = Shortcuts.tool(for: key) {
+            if tool != .text {
+                self.state.lastNonTextTool = tool
+            }
+            self.state.tool = tool
+            return nil
+        }
+        return event
     }
 
     /// Handles a key while a text block is being edited. The overlay does not

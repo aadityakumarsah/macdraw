@@ -16,6 +16,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// sync updates can refresh the visible page immediately.
     weak var activeCanvas: CanvasView?
 
+    /// Last chance to get the drawing onto disk. Autosave is debounced, so a
+    /// quit a fraction of a second after the final stroke would otherwise
+    /// drop it.
+    func applicationWillTerminate(_ notification: Notification) {
+        activeCanvas?.flushPendingSave()
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // macdraw is a menu-bar background agent (LSUIElement); the overlay is
         // never "closed", only hidden, but some system teardown paths close it
@@ -39,6 +46,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SyncService.shared.pageSink = island.pages
         island.pages.syncHook = SyncService.shared
         SyncService.shared.start()
+
+        // Reclaim images left behind by deleted elements. Runs once, after
+        // the page index is in place, and does its file work off the main
+        // thread. Everything any page still references is kept.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.island.pages.collectStorageGarbage()
+        }
 
         hotkey = HotkeyManager()
         hotkey.onTrigger = { [weak self] in

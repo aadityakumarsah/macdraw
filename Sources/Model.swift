@@ -59,6 +59,75 @@ enum StrokeStyle: String, CaseIterable, Codable {
     case dotted
 }
 
+/// How the inside of a shape is painted. Excalidraw's three fill styles
+/// (plus zigzag) — hachure draws parallel pen strokes at an angle, cross-hatch
+/// adds the opposite diagonal, zigzag joins the hachure lines end to end.
+enum FillStyle: String, CaseIterable, Codable {
+    case hachure
+    case crossHatch
+    case zigzag
+    case solid
+
+    var label: String {
+        switch self {
+        case .hachure: return "Hachure"
+        case .crossHatch: return "Cross-hatch"
+        case .zigzag: return "Zigzag"
+        case .solid: return "Solid"
+        }
+    }
+}
+
+/// How hand-drawn the outline looks. The three presets are Excalidraw's
+/// (`ROUGHNESS` in packages/common/src/constants.ts): architect is a precise
+/// vector line, artist is the default sketchy double-stroke, cartoonist
+/// overshoots its corners.
+enum Sloppiness: String, CaseIterable, Codable {
+    case architect
+    case artist
+    case cartoonist
+
+    var label: String {
+        switch self {
+        case .architect: return "Architect"
+        case .artist: return "Artist"
+        case .cartoonist: return "Cartoonist"
+        }
+    }
+
+    /// Wobble amount fed to the rough-path builders.
+    var roughness: CGFloat {
+        switch self {
+        case .architect: return 0
+        case .artist: return 1
+        case .cartoonist: return 2
+        }
+    }
+
+    /// How far corners over-shoot.
+    var edgeRoughness: CGFloat {
+        switch self {
+        case .architect: return 0
+        case .artist: return 0.35
+        case .cartoonist: return 1
+        }
+    }
+
+    static func nearest(roughness: CGFloat) -> Sloppiness {
+        if roughness < 0.5 { return .architect }
+        if roughness < 1.5 { return .artist }
+        return .cartoonist
+    }
+}
+
+/// Corner treatment of rectangular shapes — Excalidraw's "Edges" control.
+enum EdgeStyle: String, CaseIterable, Codable {
+    case sharp
+    case round
+
+    var label: String { self == .sharp ? "Sharp" : "Round" }
+}
+
 enum ArrowheadStyle: String, CaseIterable, Codable {
     case none
     case arrow
@@ -404,6 +473,26 @@ struct Annotation {
     /// heap, graph, set). One entry per node; missing entries render empty.
     var nodeTexts: [String] = []
 
+    // NOTE: every property below is appended at the end on purpose — the
+    // memberwise initializer is called positionally-by-label all over
+    // CanvasView, so new fields have to carry defaults and come last.
+
+    /// Stable identity, independent of this element's position in the
+    /// annotations array. Connectors, render caches and the undo history key
+    /// off this instead of an array index, so deleting or reordering an
+    /// element can never re-point a connector at the wrong shape or blit a
+    /// stale bitmap. (Excalidraw's `element.id`.)
+    var id: String = UUID().uuidString
+
+    /// Blob id of this element's image in `FileStore`. Images live on disk
+    /// under the hash of their bytes; the page JSON stores only this id, and
+    /// the decoded bitmap is held in a bounded LRU cache. `image` above stays
+    /// non-nil only for the instant between placing an image and storing it.
+    var imageFileID: String? = nil
+
+    /// How the interior is painted (hachure / cross-hatch / zigzag / solid).
+    var fillStyle: FillStyle = .solid
+
     /// The stored rich text, or nil when the annotation is plain.
     func richText() -> NSAttributedString? {
         guard let data = richTextData else { return nil }
@@ -415,7 +504,14 @@ struct Annotation {
 /// the box: moving, resizing or rotating the shape moves the connector end
 /// with it (side/fraction are in the shape's local, pre-rotation space).
 struct ShapeConnection: Codable, Equatable {
+    /// Legacy array index. Kept so drawings saved before stable ids still
+    /// load, but `elementID` wins whenever it resolves — an index silently
+    /// re-points at a different shape as soon as anything before it is
+    /// deleted, which is exactly what used to make connectors jump to the
+    /// wrong box.
     var annotationIndex: Int
+    /// Stable id of the shape this end is glued to.
+    var elementID: String? = nil
     /// 0 = top, 1 = right, 2 = bottom, 3 = left edge.
     var side: Int
     /// Position along the side, 0...1 (0 = start of the side, 1 = end).
@@ -466,6 +562,12 @@ final class CanvasState: ObservableObject {
     @Published var fillOpacity: CGFloat = 0.5
     @Published var strokeWidth: CGFloat = 3
     @Published var strokeStyle: StrokeStyle = .solid
+    /// Fill style of new shapes — Excalidraw's Fill control.
+    @Published var fillStyle: FillStyle = .hachure
+    /// How hand-drawn new outlines look (Excalidraw's Sloppiness control).
+    @Published var sloppiness: Sloppiness = .artist
+    /// Corner treatment of new rectangular shapes (Excalidraw's Edges).
+    @Published var edgeStyle: EdgeStyle = .round
     @Published var elementOpacity: CGFloat = 1
     @Published var arrowStart: ArrowheadStyle = .none
     @Published var arrowEnd: ArrowheadStyle = .arrow
